@@ -33,7 +33,6 @@ def _headers() -> dict[str, str]:
     h = {
         "Authorization": f"Bearer {_auth.get_token()}",
         "Accept": "application/json",
-        "Content-Type": "application/json",
     }
     if FIWARE_SERVICE:
         h["Fiware-Service"] = FIWARE_SERVICE

@@ -166,7 +166,6 @@ def test_get_history_gets_attribute_history_with_query_params_and_headers() -> N
     assert call["headers"] == {
         "Authorization": "Bearer token",
         "Accept": "application/json",
-        "Content-Type": "application/json",
         "Fiware-Service": "sendai",
         "Fiware-ServicePath": "/",
     }
@@ -300,7 +299,6 @@ def test_delete_attribute_history_sends_headers() -> None:
     assert session.calls[0]["headers"] == {
         "Authorization": "Bearer token",
         "Accept": "application/json",
-        "Content-Type": "application/json",
         "Fiware-Service": "sendai",
         "Fiware-ServicePath": "/city",
     }
@@ -397,7 +395,6 @@ def test_delete_entity_history_sends_headers() -> None:
     assert session.calls[0]["headers"] == {
         "Authorization": "Bearer token",
         "Accept": "application/json",
-        "Content-Type": "application/json",
         "Fiware-Service": "sendai",
         "Fiware-ServicePath": "/city",
     }

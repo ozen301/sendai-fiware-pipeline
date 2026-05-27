@@ -94,7 +94,7 @@ class CometClient:
         response = self.session.get(
             self._history_url(entity_type, entity_id, attr),
             params=_query_params(query or HistoryQuery()),
-            headers=self._headers(),
+            headers=self._headers(include_content_type=False),
             timeout=self.settings.timeout,
             verify=self.settings.verify_tls,
         )
@@ -102,7 +102,10 @@ class CometClient:
             response = self.session.get(
                 self._history_url(entity_type, entity_id, attr),
                 params=_query_params(query or HistoryQuery()),
-                headers=self._headers(force_refresh=True),
+                headers=self._headers(
+                    force_refresh=True,
+                    include_content_type=False,
+                ),
                 timeout=self.settings.timeout,
                 verify=self.settings.verify_tls,
             )
@@ -124,14 +127,17 @@ class CometClient:
         """
         response = self.session.delete(
             self._history_url(entity_type, entity_id, attr),
-            headers=self._headers(),
+            headers=self._headers(include_content_type=False),
             timeout=self.settings.timeout,
             verify=self.settings.verify_tls,
         )
         if response.status_code == 401:
             response = self.session.delete(
                 self._history_url(entity_type, entity_id, attr),
-                headers=self._headers(force_refresh=True),
+                headers=self._headers(
+                    force_refresh=True,
+                    include_content_type=False,
+                ),
                 timeout=self.settings.timeout,
                 verify=self.settings.verify_tls,
             )
@@ -159,14 +165,17 @@ class CometClient:
         """
         response = self.session.delete(
             self._entity_history_url(entity_type, entity_id),
-            headers=self._headers(),
+            headers=self._headers(include_content_type=False),
             timeout=self.settings.timeout,
             verify=self.settings.verify_tls,
         )
         if response.status_code == 401:
             response = self.session.delete(
                 self._entity_history_url(entity_type, entity_id),
-                headers=self._headers(force_refresh=True),
+                headers=self._headers(
+                    force_refresh=True,
+                    include_content_type=False,
+                ),
                 timeout=self.settings.timeout,
                 verify=self.settings.verify_tls,
             )
@@ -195,15 +204,21 @@ class CometClient:
             f"{entity_type}/id/{entity_id}"
         )
 
-    def _headers(self, *, force_refresh: bool = False) -> dict[str, str]:
+    def _headers(
+        self,
+        *,
+        force_refresh: bool = False,
+        include_content_type: bool = True,
+    ) -> dict[str, str]:
         """Build headers for authenticated STH-Comet requests."""
         token = self.auth.get_token(force_refresh=force_refresh)
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "Content-Type": "application/json",
             "Fiware-ServicePath": self.settings.service_path,
         }
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
         if self.settings.service:
             headers["Fiware-Service"] = self.settings.service
         return headers
