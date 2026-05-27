@@ -1,0 +1,6 @@
+place_number,batch,expected_device_type,interval_min,entity_type,entity_id,identifcation,active
+10,2023,Pixel3aUT,60,Blesensor.per3600,jp.sendai.Blesensor.per3600.10,10,true
+10,2023,Pixel3aUT,5,Blesensor.per300,jp.sendai.Blesensor.per300.10,10,true
+105,2026,M5Stack,60,Blesensor.per3600,jp.sendai.Blesensor.per3600.105,  105  ,true
+105,2026,M5Stack,5,Blesensor.per300,jp.sendai.Blesensor.per300.105,105,true
+999,2026,M5Stack,60,Blesensor.per3600,jp.sendai.Blesensor.per3600.999,999,false

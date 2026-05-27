@@ -1,0 +1,62 @@
+[project]
+name = "sendai-fiware"
+version = "0.1.0"
+description = "A Python package that provides tools for working with the FIWARE platform of Sendai."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "pymysql>=1.1.2",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sendai_pipeline"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "pytest>=9.0.3",
+    "ruff>=0.9",
+]
+notebook = [
+    "jupyter>=1.1.1",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "basic"
+include = ["sendai_pipeline", "scripts", "tests"]
+exclude = [".venv", "logs", "metadata", "ref_docs", "state", "**/node_modules", "**/__pycache__", "**/.*"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes
+    "I",       # isort
+    "UP",      # pyupgrade
+    "D",       # pydocstyle (Google convention, configured below)
+]
+extend-ignore = [
+    "D105",  # magic methods are documented through the class docstring
+    "D107",  # __init__ is documented through the class docstring
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+"scripts/dev/*" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
