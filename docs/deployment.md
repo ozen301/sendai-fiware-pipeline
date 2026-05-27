@@ -10,7 +10,7 @@ Install [`uv`](https://docs.astral.sh/uv/). It manages the Python environment an
 ## 2. Install
 
 ```sh
-git clone <repo-url> sendai-fiware-pipeline
+git clone https://github.com/ozen301/sendai-fiware-pipeline.git
 cd sendai-fiware-pipeline
 uv sync
 ```

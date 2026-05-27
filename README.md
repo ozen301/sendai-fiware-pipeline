@@ -30,7 +30,7 @@ the docs index below.
 ## Quick start
 
 ```sh
-git clone <repo-url> sendai-fiware-pipeline
+git clone https://github.com/ozen301/sendai-fiware-pipeline.git
 cd sendai-fiware-pipeline
 uv sync
 cp .env.example .env
