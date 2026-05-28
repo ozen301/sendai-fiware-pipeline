@@ -256,9 +256,13 @@ The five stages in plain words:
       batch (derived from the `sendai2023.` / `sendai202603.` prefix)
       required to match the metadata batch — drop if either side fails
       to resolve;
-   4. drop self-loops (`from == to`) and cross-batch pairs;
-   5. drop if either device-type field disagrees with the expected
-      target's `expected_device_type`.
+   4. drop self-loops (`from == to`), while keeping cross-batch pairs
+      when both sides resolve;
+   5. choose the Product B device type from the oldest active batch for
+      the interval, then drop if either device-type field disagrees with
+      that selected type. With active 2023 and 2026 targets, the
+      selected type is `Pixel3aUT`; with only 2026 active targets, it is
+      `M5Stack`.
 
    Survivors are paired with their metadata row, which provides the
    destination entity id, entity type, and `identifcation` text (the
@@ -377,11 +381,8 @@ differences from Product A:
 
 - **Each row has two place keys** (`from_group_place_id`,
   `to_group_place_id`) — a movement is from one place to another. Both
-  sides must pass the batch and device-type filter; cross-batch pairs
-  (a 2023 place paired with a 2026 place) are dropped for now because
-  the upstream aggregation is not ready for mixed-batch direction rows.
-  This exclusion is expected to be removed once upstream aggregation is
-  corrected.
+  sides must pass metadata resolution. Cross-batch pairs (a 2023 place
+  paired with a 2026 place) are sent when both sides resolve.
 - **The literal string `ALL` is a real aggregation key**, not a noise
   prefix. Rows with `from_group_place_id = 'ALL'` populate the
   destination entity's `peopleCount_flow.from.all` (meaning "total
@@ -391,9 +392,11 @@ differences from Product A:
   unique-BLEID total.
 - **The source table stores parallel rows** under both
   `(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every per-place
-  target. The device-type filter is therefore a required disambiguator,
-  not just a cross-batch exclusion — omitting it would double-count
-  every movement.
+  target. Product B selects one device type per interval from the oldest
+  active target batch and applies it to both `ALL` and pairwise rows, so
+  the nested inter-place values and the deduplicated totals use the same
+  source population. The device-type filter is therefore a required
+  disambiguator — omitting it would double-count every movement.
 - **Targets with no observations still receive a payload** with sentinel
   `peopleCount_flow = {"from": {"all": null}, "to": {"all": null}}`.
   This keeps Comet history continuous even when a place was silent for

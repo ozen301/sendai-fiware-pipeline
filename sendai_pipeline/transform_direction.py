@@ -32,8 +32,8 @@ class TransformDirectionResult:
             observations.
         rows_dropped: Source rows the transform filtered out before they
             could contribute to any payload (unsupported interval, noise
-            prefix, metadata miss, batch mismatch, device-type mismatch, or
-            self-loop).
+            prefix, metadata miss including source-prefix/metadata-batch
+            mismatch, device-type mismatch, or self-loop).
     """
 
     payloads: list[dict[str, Any]]
@@ -75,6 +75,7 @@ def transform_direction_rows(
     """
     active_index = {key: place for key, place in metadata_index.items() if place.active}
     active_places_by_interval = _active_places_by_interval(active_index.values())
+    selected_device_types = _selected_device_types_by_interval(active_index.values())
     windows: dict[tuple[str, int], _Window] = {}
     rows_dropped = 0
 
@@ -141,29 +142,20 @@ def transform_direction_rows(
             if from_place.place_number == to_place.place_number:
                 rows_dropped += 1
                 continue
-            if from_place.batch != to_place.batch:
-                if from_device_type == to_device_type:
-                    logger.warning(
-                        "direction metric row crosses metadata batches",
-                        extra={
-                            "event": "cross_batch_pair",
-                            "from_group_place_id": from_group_place_id,
-                            "to_group_place_id": to_group_place_id,
-                            "from_device_type": from_device_type,
-                            "to_device_type": to_device_type,
-                            "interval_min": interval_min,
-                        },
-                    )
-                rows_dropped += 1
-                continue
 
         expected_place = from_place if to_place is None else to_place
         if expected_place is None:
             rows_dropped += 1
             continue
 
+        expected_device_type = selected_device_types.get(interval_min)
+        if expected_device_type is None:
+            rows_dropped += 1
+            continue
+
         if not _device_types_match(
             expected_place,
+            expected_device_type=expected_device_type,
             from_device_type=from_device_type,
             to_device_type=to_device_type,
             from_group_place_id=from_group_place_id,
@@ -221,6 +213,63 @@ def _active_places_by_interval(
         if place.interval_min in _ALLOWED_INTERVALS:
             places_by_interval.setdefault(place.interval_min, []).append(place)
     return places_by_interval
+
+
+def _selected_device_types_by_interval(
+    places: Iterable[SensorPlace],
+) -> dict[int, str]:
+    """Pick Product B's device population from the oldest active batch.
+
+    The metadata ``batch`` value is the installation year label in current
+    deployments (for example ``"2023"`` and ``"2026"``). Product B must use
+    the expected device type from the smallest chronological batch per
+    interval, so a mixed 2023/2026 run selects ``Pixel3aUT`` for both
+    pairwise rows and ``ALL`` rows.
+
+    For each interval, ``selected`` stores the best candidate seen so far as
+    ``(batch_order_key, expected_device_type)``. The ``batch_order_key`` is
+    produced by :func:`_batch_sort_key`; lower keys are older batches. The
+    comparison happens in this function: each row's ``batch_order_key`` is
+    compared with the currently selected row's key for the same interval.
+    """
+    selected: dict[int, tuple[tuple[int, str], str]] = {}
+    for place in places:
+        if place.interval_min not in _ALLOWED_INTERVALS:
+            continue
+        batch_order_key = _batch_sort_key(place.batch)
+        current = selected.get(place.interval_min)
+        current_batch_order_key = current[0] if current is not None else None
+        # Lower order keys represent older batches, e.g. 2023 before 2026.
+        if current_batch_order_key is None or batch_order_key < current_batch_order_key:
+            selected[place.interval_min] = (
+                batch_order_key,
+                place.expected_device_type,
+            )
+    return {
+        interval_min: expected_device_type
+        for interval_min, (_batch_key, expected_device_type) in selected.items()
+    }
+
+
+def _batch_sort_key(batch: str) -> tuple[int, str]:
+    """Return a stable chronological key for metadata batch labels.
+
+    The returned tuple is a sortable representation of one metadata batch
+    label. Callers compare these returned keys to decide which batch is older.
+
+    Examples:
+        ``_batch_sort_key("2023")`` returns ``(2023, "2023")``.
+        ``_batch_sort_key("2026")`` returns ``(2026, "2026")``.
+        ``_batch_sort_key("legacy")`` returns ``(1000000000, "legacy")``.
+
+    Numeric year-like labels sort by integer value. The original string is
+    kept as a tie-breaker to make ordering deterministic. Non-numeric labels
+    sort after numeric labels.
+    """
+    try:
+        return (int(batch), batch)
+    except ValueError:
+        return (10**9, batch)
 
 
 def _matched_row_prefix(
@@ -317,21 +366,22 @@ def _resolution_failed(group_place_id: str, place: SensorPlace | None) -> bool:
 def _device_types_match(
     place: SensorPlace,
     *,
+    expected_device_type: str,
     from_device_type: str,
     to_device_type: str,
     from_group_place_id: str,
     to_group_place_id: str,
     interval_min: int,
 ) -> bool:
-    """True when both row sides report the metadata target's expected device type.
+    """True when both row sides report Product B's selected device type.
 
     The source table emits parallel rows under both ``(Pixel3aUT, Pixel3aUT)``
     and ``(M5Stack, M5Stack)`` for every per-place target, so this filter is a
     required disambiguator — without it every count would be double-counted.
     """
     if (
-        from_device_type == place.expected_device_type
-        and to_device_type == place.expected_device_type
+        from_device_type == expected_device_type
+        and to_device_type == expected_device_type
     ):
         return True
 
@@ -345,7 +395,7 @@ def _device_types_match(
             "to_device_type": to_device_type,
             "place_number": place.place_number,
             "interval_min": interval_min,
-            "expected_device_type": place.expected_device_type,
+            "expected_device_type": expected_device_type,
         },
     )
     return False

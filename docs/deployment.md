@@ -150,8 +150,7 @@ safe.
 In `.env`, set:
 
 - `TARGET_FLOW_BATCHES=2023,2026`.
-- `TARGET_DIRECTION_BATCHES=2026` — keep direction on 2026 until the
-  upstream aggregation issue is resolved.
+- `TARGET_DIRECTION_BATCHES=2023,2026`.
 - `FLOW_SEND_MODE=send`.
 - `DIRECTION_SEND_MODE=send`.
 

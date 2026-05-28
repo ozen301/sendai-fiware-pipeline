@@ -21,7 +21,6 @@ TRANSFORM_EVENTS = frozenset(
         "ignored_place_prefix",
         "unknown_place_interval",
         "device_mismatch",
-        "cross_batch_pair",
     }
 )
 
@@ -531,7 +530,7 @@ def test_transform_direction_drops_mixed_device_type_rows() -> None:
     }
 
 
-def test_transform_direction_warns_and_drops_same_device_cross_batch_pair(
+def test_transform_direction_keeps_cross_batch_pair_with_oldest_batch_device_type(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     metadata_index = {
@@ -555,9 +554,16 @@ def test_transform_direction_warns_and_drops_same_device_cross_batch_pair(
                 direction_row(
                     from_group_place_id="sendai2023.10",
                     to_group_place_id="sendai202603.105",
+                    from_device_type="Pixel3aUT",
+                    to_device_type="Pixel3aUT",
+                    count=3,
+                ),
+                direction_row(
+                    from_group_place_id="sendai2023.10",
+                    to_group_place_id="sendai202603.105",
                     from_device_type="M5Stack",
                     to_device_type="M5Stack",
-                    count=3,
+                    count=99,
                 ),
             ],
             metadata_index,
@@ -565,17 +571,93 @@ def test_transform_direction_warns_and_drops_same_device_cross_batch_pair(
         )
 
     by_entity = payloads_by_entity(result)
-    for entity_id in (
-        "jp.sendai.Blesensor.per3600.10",
-        "jp.sendai.Blesensor.per3600.105",
-    ):
-        assert by_entity[entity_id]["attrs"]["peopleCount_flow"]["value"] == {
-            "from": {"all": None},
-            "to": {"all": None},
-        }
-    warns = records(caplog, "cross_batch_pair")
-    assert len(warns) == 1
-    assert warns[0].levelname == "WARNING"
+    assert by_entity["jp.sendai.Blesensor.per3600.10"]["attrs"]["peopleCount_flow"][
+        "value"
+    ] == {
+        "from": {"all": None},
+        "to": {"all": None, "105": 3},
+    }
+    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
+        "value"
+    ] == {
+        "from": {"all": None, "10": 3},
+        "to": {"all": None},
+    }
+    assert result.rows_dropped == 1
+    assert records(caplog, "device_mismatch")
+
+
+def test_transform_direction_uses_oldest_batch_device_type_for_mixed_targets() -> None:
+    metadata_index = {
+        (10, 60): place(
+            place_number=10,
+            entity_id="jp.sendai.Blesensor.per3600.10",
+            batch="2023",
+            expected_device_type="Pixel3aUT",
+        ),
+        (105, 60): place(
+            place_number=105,
+            entity_id="jp.sendai.Blesensor.per3600.105",
+            batch="2026",
+            expected_device_type="M5Stack",
+        ),
+        (106, 60): place(
+            place_number=106,
+            entity_id="jp.sendai.Blesensor.per3600.106",
+            batch="2026",
+            expected_device_type="M5Stack",
+        ),
+    }
+
+    result = transform_direction_rows(
+        [
+            direction_row(
+                from_group_place_id="ALL",
+                to_group_place_id="sendai202603.105",
+                from_device_type="Pixel3aUT",
+                to_device_type="Pixel3aUT",
+                count=85,
+            ),
+            direction_row(
+                from_group_place_id="ALL",
+                to_group_place_id="sendai202603.105",
+                from_device_type="M5Stack",
+                to_device_type="M5Stack",
+                count=99,
+            ),
+            direction_row(
+                from_group_place_id="sendai202603.105",
+                to_group_place_id="sendai202603.106",
+                from_device_type="Pixel3aUT",
+                to_device_type="Pixel3aUT",
+                count=7,
+            ),
+            direction_row(
+                from_group_place_id="sendai202603.105",
+                to_group_place_id="sendai202603.106",
+                from_device_type="M5Stack",
+                to_device_type="M5Stack",
+                count=13,
+            ),
+        ],
+        metadata_index,
+        now=fixed_clock,
+    )
+    by_entity = payloads_by_entity(result)
+
+    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
+        "value"
+    ] == {
+        "from": {"all": 85},
+        "to": {"all": None, "106": 7},
+    }
+    assert by_entity["jp.sendai.Blesensor.per3600.106"]["attrs"]["peopleCount_flow"][
+        "value"
+    ] == {
+        "from": {"all": None, "105": 7},
+        "to": {"all": None},
+    }
+    assert result.rows_dropped == 2
 
 
 def test_transform_direction_does_not_sum_pairwise_to_approximate_all() -> None:
@@ -796,6 +878,8 @@ def test_transform_direction_builds_payload_against_csv_loaded_metadata_index() 
             direction_row(
                 from_group_place_id="ALL",
                 to_group_place_id="sendai202603.105",
+                from_device_type="Pixel3aUT",
+                to_device_type="Pixel3aUT",
                 count=85,
             ),
             direction_row(

@@ -218,8 +218,7 @@ update path.
 
 Use product-specific batch gates to control deployment scope. The
 current target configuration is `TARGET_FLOW_BATCHES=2023,2026` and
-`TARGET_DIRECTION_BATCHES=2026`. Direction remains 2026-only until the
-upstream aggregation supports mixed 2023/2026 direction pairs.
+`TARGET_DIRECTION_BATCHES=2023,2026`.
 
 ---
 
@@ -304,7 +303,7 @@ Load-bearing columns:
 |---|---|
 | `startdate` | Source window, format `YYYYMMDD_HHMM`. |
 | `from_group_place_id`, `to_group_place_id` | Source place keys; may also be literal `'ALL'` for aggregate rows. |
-| `from_device_type`, `to_device_type` | Batch filter; both sides must match the target batch. |
+| `from_device_type`, `to_device_type` | Product B device-population filter; both sides must match the selected device type for the interval. |
 | `interval_min` | See §2.1. |
 | `count` | Movement count used inside `peopleCount_flow`. |
 
@@ -319,15 +318,18 @@ Per-row order (matches `transform_direction.py`):
 3. Resolve each non-`ALL` side via metadata. The source-side batch
    (derived from the `sendai2023.` / `sendai202603.` prefix) must
    match the metadata batch. Drop if either side fails to resolve.
-4. Drop self-loops (`from == to`) and cross-batch pairs.
-5. Drop if either of `from_device_type` / `to_device_type` disagrees
-   with the expected target's `expected_device_type` (§2.4).
+4. Drop self-loops (`from == to`). Keep cross-batch pairs when both
+   sides resolve.
+5. Select the Product B device type from the oldest active target batch
+   for the interval, then drop if either of `from_device_type` /
+   `to_device_type` disagrees with that selected type. With active 2023
+   and 2026 targets, the selected type is `Pixel3aUT`; with only 2026
+   active targets, it is `M5Stack`.
 
-Cross-batch direction pairs are currently excluded because the upstream
-aggregation is not ready for mixed 2023/2026 source-side pairs. This is
-intended to be temporary: once the upstream aggregation is corrected, the
-pipeline should allow valid cross-batch direction records while retaining
-metadata resolution, self-loop exclusion, and device-type disambiguation.
+Cross-batch direction pairs are valid Product B observations. The same
+selected device type is used for pairwise rows and `'ALL'` rows so the
+inter-place values and the pre-computed deduplicated totals come from
+the same source device population.
 
 The source table stores parallel pairwise and `'ALL'` rows under both
 `(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every per-place
@@ -369,11 +371,11 @@ The `peopleCount_flow` value, for the entity's own place `N`:
   - `peopleCount_flow.from.all` = `count` from rows matching this window
     and interval where `from_group_place_id = 'ALL'` and
     `to_group_place_id` resolves to place `N`, with both device-type
-    fields equal to `N`'s metadata `expected_device_type`.
+    fields equal to the interval's selected Product B device type.
   - `peopleCount_flow.to.all` = `count` from rows matching this window
     and interval where `from_group_place_id` resolves to place `N` and
     `to_group_place_id = 'ALL'`, with both device-type fields equal to
-    `N`'s metadata `expected_device_type`.
+    the interval's selected Product B device type.
 
 Targets with no surviving observations still receive a payload with
 sentinel `peopleCount_flow = {"from": {"all": null}, "to": {"all":
