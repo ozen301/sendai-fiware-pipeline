@@ -312,13 +312,22 @@ Read-only diagnostic. Lists every open window (`pending` or
 
 ```
 uv run python scripts/state_doctor.py {flow|direction}
+uv run python scripts/state_doctor.py {flow|direction} --pretty
 ```
 
 | Arg | Purpose |
 |---|---|
 | `flow` / `direction` (positional, required) | Which product's state to inspect. |
+| `--pretty` | Render a human-readable dashboard with status bars and tables instead of JSON. |
+| `--top N` | Limit ranked missing/failed target tables in `--pretty` output. Default: `20`. |
+| `--window-limit N` | Limit open-window rows in `--pretty` output. Default: `30`. |
+| `--window-sensor-limit N` | Limit missing target labels shown per open window in `--pretty` output. Default: `8`. |
+| `--ascii` | Keep `--pretty` output ASCII-only. |
+| `--all` | Show all `--pretty` dashboard table rows. |
 
-Output is a JSON array, one entry per open window, with fields
+Default output is JSON for scripts. It includes retained-window status
+counts, open-window diagnostics, ranked missing/failed target summaries,
+and failed HTTP status counts. Each open-window row includes fields
 including:
 
 - `window` — the window key, e.g. `per3600/20260524_1000`.
@@ -328,11 +337,18 @@ including:
 - `expected_target_source` — `stored` when the v2 expected-target snapshot is present, `derived` for legacy rows that fell back to currently-recorded target keys (treat `derived` as diagnostic only).
 - `target_count` / `ok_count` / `failed_count` / `missing_count` — aggregate counts across the window's expected targets.
 - `failed_http_statuses` — distinct HTTP status codes seen on `failed` targets.
+- `missing_target_ids` — expected target IDs with no retained target record for this window.
+- `failed_target_ids` — expected target IDs whose retained target record is `failed`.
 - `retry_reachable` — whether the window is still inside the configured retry horizon (`MAX_LOOKBACK_HOURS_*`).
 
-The doctor reports aggregate counts rather than per-target records;
-inspect `state/{flow,direction}.json` directly (read-only) if you
-need the per-target details.
+In `--pretty` mode, the status overview is one stacked bar using
+distinct symbols: `█` = `complete`, `▒` = `partial`, `◆` = `pending`,
+`×` = `dead_letter`, and `?` = `unknown`. The doctor also tries to load
+current sensor metadata from `SENSOR_METADATA_PATH` (default
+`metadata/sensors.csv`) so tables can show place number, batch, and
+interval. Missing or stale metadata does not fail the command; the
+output falls back to entity IDs. Large tables are truncated by default
+and print a hint to rerun with `--all` when rows are hidden.
 
 The doctor never mutates state and emits a warning to stderr if the
 state file changes during the read (race with a concurrent runner).

@@ -5,12 +5,13 @@ import json
 import logging
 import os
 import shutil
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from sendai_pipeline.metadata import MetadataLoadError, SensorPlace, load_metadata
 from sendai_pipeline.state import JST, StateValidationError, WindowStateStore
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,42 @@ class WindowDiagnosis:
     failed_count: int
     missing_count: int
     failed_http_statuses: tuple[int, ...]
+    missing_target_ids: tuple[str, ...]
+    failed_target_ids: tuple[str, ...]
+    failed_target_http_statuses: tuple[int | None, ...]
     retry_reachable: bool
+
+
+@dataclass(frozen=True)
+class TargetIssueSummary:
+    """Aggregate issue count for one target across open windows."""
+
+    entity_id: str
+    count: int
+    oldest_window: str
+    newest_window: str
+
+
+@dataclass(frozen=True)
+class StateDoctorReport:
+    """Read-only report for retained state and open-window issues."""
+
+    product: ProductName
+    status_counts: dict[str, int]
+    open_windows: tuple[WindowDiagnosis, ...]
+    missing_targets: tuple[TargetIssueSummary, ...]
+    failed_targets: tuple[TargetIssueSummary, ...]
+    failed_http_status_counts: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class SensorLabel:
+    """Display label for a target from current sensor metadata."""
+
+    entity_id: str
+    place_number: int
+    batch: str
+    interval_min: int
 
 
 @dataclass(frozen=True)
@@ -110,6 +146,60 @@ def diagnose_state(
         },
     )
     return diagnoses
+
+
+def build_state_report(
+    store: WindowStateStore,
+    *,
+    product: ProductName,
+    now: datetime | None = None,
+    max_lookback_hours_by_interval: Mapping[int, int] | None = None,
+) -> StateDoctorReport:
+    """Return retained-window summary and open-window diagnostics."""
+    open_windows = tuple(
+        diagnose_state(
+            store,
+            product=product,
+            now=now,
+            max_lookback_hours_by_interval=max_lookback_hours_by_interval,
+        )
+    )
+    return StateDoctorReport(
+        product=product,
+        status_counts=retained_status_counts(store),
+        open_windows=open_windows,
+        missing_targets=_summarize_target_issues(
+            open_windows,
+            target_ids=lambda item: item.missing_target_ids,
+        ),
+        failed_targets=_summarize_target_issues(
+            open_windows,
+            target_ids=lambda item: item.failed_target_ids,
+        ),
+        failed_http_status_counts=_failed_http_status_counts(open_windows),
+    )
+
+
+def retained_status_counts(store: WindowStateStore) -> dict[str, int]:
+    """Return retained window counts by aggregate status."""
+    counts = {
+        "complete": 0,
+        "partial": 0,
+        "pending": 0,
+        "dead_letter": 0,
+        "unknown": 0,
+    }
+    windows = store.as_dict().get("windows", {})
+    if not isinstance(windows, Mapping):
+        counts["unknown"] += 1
+        return counts
+    for window in windows.values():
+        status = window.get("status") if isinstance(window, Mapping) else None
+        if status in counts and status != "unknown":
+            counts[str(status)] += 1
+        else:
+            counts["unknown"] += 1
+    return counts
 
 
 def repair_state(
@@ -219,19 +309,27 @@ def _diagnose_window(
     failed_count = 0
     missing_count = 0
     failed_http_statuses: set[int] = set()
+    missing_target_ids: list[str] = []
+    failed_target_ids: list[str] = []
+    failed_target_http_statuses: list[int | None] = []
     for entity_id in expected:
         target = targets.get(entity_id)
         if not isinstance(target, dict):
             missing_count += 1
+            missing_target_ids.append(entity_id)
             continue
         status = target.get("status")
         if status == "ok":
             ok_count += 1
         elif status == "failed":
             failed_count += 1
+            failed_target_ids.append(entity_id)
             http_status = target.get("last_http_status")
             if isinstance(http_status, int):
                 failed_http_statuses.add(http_status)
+                failed_target_http_statuses.append(http_status)
+            else:
+                failed_target_http_statuses.append(None)
     if expected and ok_count == len(expected):
         category = "all_ok"
     elif expected and failed_count == len(expected):
@@ -260,6 +358,9 @@ def _diagnose_window(
         failed_count=failed_count,
         missing_count=missing_count,
         failed_http_statuses=tuple(sorted(failed_http_statuses)),
+        missing_target_ids=tuple(missing_target_ids),
+        failed_target_ids=tuple(failed_target_ids),
+        failed_target_http_statuses=tuple(failed_target_http_statuses),
         retry_reachable=(now - retry_anchor) <= timedelta(hours=max_lookback_hours),
     )
 
@@ -484,25 +585,427 @@ def _positive_int_env(
     return value
 
 
+def _summarize_target_issues(
+    diagnoses: Iterable[WindowDiagnosis],
+    *,
+    target_ids: Callable[[WindowDiagnosis], Iterable[str]],
+) -> tuple[TargetIssueSummary, ...]:
+    windows_by_entity: dict[str, list[WindowDiagnosis]] = {}
+    for diagnosis in diagnoses:
+        for entity_id in target_ids(diagnosis):
+            windows_by_entity.setdefault(entity_id, []).append(diagnosis)
+
+    summaries = [
+        TargetIssueSummary(
+            entity_id=entity_id,
+            count=len(windows),
+            oldest_window=min(
+                windows,
+                key=lambda item: (item.source_window_start, item.window_key),
+            ).window_key,
+            newest_window=max(
+                windows,
+                key=lambda item: (item.source_window_start, item.window_key),
+            ).window_key,
+        )
+        for entity_id, windows in windows_by_entity.items()
+    ]
+    summaries.sort(key=lambda item: (-item.count, item.entity_id))
+    return tuple(summaries)
+
+
+def _failed_http_status_counts(
+    diagnoses: Iterable[WindowDiagnosis],
+) -> tuple[tuple[int, int], ...]:
+    counts: dict[int, int] = {}
+    for diagnosis in diagnoses:
+        for http_status in diagnosis.failed_target_http_statuses:
+            if http_status is not None:
+                counts[http_status] = counts.get(http_status, 0) + 1
+    return tuple(sorted(counts.items()))
+
+
+def load_sensor_labels(path: Path) -> dict[str, SensorLabel]:
+    """Load current sensor metadata for display enrichment."""
+    return _sensor_labels(load_metadata(path))
+
+
+def try_load_sensor_labels(path: Path) -> dict[str, SensorLabel]:
+    """Best-effort metadata loader for read-only pretty output."""
+    try:
+        return load_sensor_labels(path)
+    except (FileNotFoundError, MetadataLoadError, OSError, ValueError):
+        return {}
+
+
+def _sensor_labels(places: Iterable[SensorPlace]) -> dict[str, SensorLabel]:
+    return {
+        place.entity_id: SensorLabel(
+            entity_id=place.entity_id,
+            place_number=place.place_number,
+            batch=place.batch,
+            interval_min=place.interval_min,
+        )
+        for place in places
+    }
+
+
 def diagnoses_to_json(diagnoses: Iterable[WindowDiagnosis]) -> str:
     """Serialize diagnoses for CLI output."""
-    rows = [
-        {
-            "window": item.window_key,
-            "status": item.status,
-            "interval_min": item.interval_min,
-            "first_seen": item.first_seen.isoformat(),
-            "source_window_start": item.source_window_start.isoformat(),
-            "source_window_end": item.source_window_end.isoformat(),
-            "expected_target_source": item.expected_target_source,
-            "target_status_category": item.target_status_category,
-            "target_count": item.target_count,
-            "ok_count": item.ok_count,
-            "failed_count": item.failed_count,
-            "missing_count": item.missing_count,
-            "failed_http_statuses": item.failed_http_statuses,
-            "retry_reachable": item.retry_reachable,
-        }
-        for item in diagnoses
-    ]
+    rows = [_diagnosis_to_row(item) for item in diagnoses]
     return json.dumps(rows, indent=2, sort_keys=True)
+
+
+def state_report_to_json(report: StateDoctorReport) -> str:
+    """Serialize the full doctor report for CLI output."""
+    data = {
+        "product": report.product,
+        "status_counts": report.status_counts,
+        "total_windows": sum(report.status_counts.values()),
+        "open_window_count": len(report.open_windows),
+        "open_windows": [_diagnosis_to_row(item) for item in report.open_windows],
+        "missing_targets": [
+            _target_issue_to_row(item) for item in report.missing_targets
+        ],
+        "failed_targets": [
+            _target_issue_to_row(item) for item in report.failed_targets
+        ],
+        "failed_http_status_counts": [
+            {"http_status": http_status, "count": count}
+            for http_status, count in report.failed_http_status_counts
+        ],
+    }
+    return json.dumps(data, indent=2, sort_keys=True)
+
+
+def state_report_to_pretty(
+    report: StateDoctorReport,
+    *,
+    state_path: Path,
+    state_size_bytes: int | None,
+    sensor_labels: Mapping[str, SensorLabel],
+    top: int | None,
+    window_limit: int | None,
+    window_sensor_limit: int,
+    ascii_only: bool,
+) -> str:
+    """Render a human-readable state doctor dashboard."""
+    lines: list[str] = [
+        f"State doctor: {report.product}",
+        f"State file: {state_path} ({_format_size(state_size_bytes)})",
+        f"Windows: {sum(report.status_counts.values())} retained, "
+        f"{len(report.open_windows)} open",
+        "",
+        "Status overview",
+    ]
+    lines.extend(_status_overview_lines(report.status_counts, ascii_only=ascii_only))
+    open_windows = _limited(report.open_windows, window_limit)
+    lines.extend(["", "Open windows"])
+    lines.extend(
+        _table_lines(
+            (
+                "window",
+                "status",
+                "int",
+                "ok",
+                "fail",
+                "miss",
+                "retry",
+                "missing targets",
+            ),
+            [
+                (
+                    item.window_key,
+                    item.status,
+                    str(item.interval_min),
+                    str(item.ok_count),
+                    str(item.failed_count),
+                    str(item.missing_count),
+                    "yes" if item.retry_reachable else "no",
+                    _format_target_list(
+                        item.missing_target_ids,
+                        sensor_labels=sensor_labels,
+                        limit=window_sensor_limit,
+                    ),
+                )
+                for item in open_windows
+            ],
+        )
+    )
+    lines.extend(
+        _hidden_hint(
+            label="open windows",
+            total=len(report.open_windows),
+            shown=len(open_windows),
+        )
+    )
+
+    missing_targets = _limited(report.missing_targets, top)
+    lines.extend(["", _target_section_heading("missing", top)])
+    lines.extend(
+        _target_issue_table_lines(
+            missing_targets,
+            sensor_labels=sensor_labels,
+        )
+    )
+    lines.extend(
+        _hidden_hint(
+            label="missing targets",
+            total=len(report.missing_targets),
+            shown=len(missing_targets),
+        )
+    )
+
+    failed_targets = _limited(report.failed_targets, top)
+    lines.extend(["", _target_section_heading("failed", top)])
+    lines.extend(
+        _target_issue_table_lines(
+            failed_targets,
+            sensor_labels=sensor_labels,
+        )
+    )
+    lines.extend(
+        _hidden_hint(
+            label="failed targets",
+            total=len(report.failed_targets),
+            shown=len(failed_targets),
+        )
+    )
+    lines.extend(["", "Failed HTTP statuses"])
+    lines.extend(_http_status_table_lines(report.failed_http_status_counts))
+    return "\n".join(lines)
+
+
+def _diagnosis_to_row(item: WindowDiagnosis) -> dict[str, object]:
+    return {
+        "window": item.window_key,
+        "status": item.status,
+        "interval_min": item.interval_min,
+        "first_seen": item.first_seen.isoformat(),
+        "source_window_start": item.source_window_start.isoformat(),
+        "source_window_end": item.source_window_end.isoformat(),
+        "expected_target_source": item.expected_target_source,
+        "target_status_category": item.target_status_category,
+        "target_count": item.target_count,
+        "ok_count": item.ok_count,
+        "failed_count": item.failed_count,
+        "missing_count": item.missing_count,
+        "failed_http_statuses": item.failed_http_statuses,
+        "missing_target_ids": item.missing_target_ids,
+        "failed_target_ids": item.failed_target_ids,
+        "failed_target_http_statuses": item.failed_target_http_statuses,
+        "retry_reachable": item.retry_reachable,
+    }
+
+
+def _target_issue_to_row(item: TargetIssueSummary) -> dict[str, object]:
+    return {
+        "entity_id": item.entity_id,
+        "count": item.count,
+        "oldest_window": item.oldest_window,
+        "newest_window": item.newest_window,
+    }
+
+
+def _status_overview_lines(
+    status_counts: Mapping[str, int],
+    *,
+    ascii_only: bool,
+) -> list[str]:
+    total = sum(status_counts.values())
+    lines = [_stacked_bar(status_counts, ascii_only=ascii_only)]
+    lines.extend(
+        f"{_status_marker(status, ascii_only=ascii_only)} {status:<11} "
+        f"{count:>5} {_percentage(count, total):>6}"
+        for status, count in status_counts.items()
+    )
+    return lines
+
+
+def _stacked_bar(
+    status_counts: Mapping[str, int],
+    *,
+    ascii_only: bool,
+    width: int = 64,
+) -> str:
+    total = sum(status_counts.values())
+    segments = _stacked_segments(status_counts, total=total, width=width)
+    chars = _status_markers(ascii_only=ascii_only)
+    return "[" + "".join(chars[status] * count for status, count in segments) + "]"
+
+
+def _stacked_segments(
+    status_counts: Mapping[str, int],
+    *,
+    total: int,
+    width: int,
+) -> list[tuple[str, int]]:
+    if total <= 0:
+        return [(status, 0) for status in status_counts]
+
+    raw_segments = [
+        (status, width * count / total) for status, count in status_counts.items()
+    ]
+    segments = [(status, int(raw_count)) for status, raw_count in raw_segments]
+    allocated = sum(count for _status, count in segments)
+    remainder = width - allocated
+    fractions = sorted(
+        (
+            (raw_count - int(raw_count), status)
+            for status, raw_count in raw_segments
+            if status_counts[status] > 0
+        ),
+        reverse=True,
+    )
+    counts_by_status = dict(segments)
+    for _fraction, status in fractions[:remainder]:
+        counts_by_status[status] += 1
+    return [(status, counts_by_status[status]) for status in status_counts]
+
+
+def _status_marker(status: str, *, ascii_only: bool) -> str:
+    return _status_markers(ascii_only=ascii_only).get(status, "U")
+
+
+def _status_markers(*, ascii_only: bool) -> dict[str, str]:
+    if ascii_only:
+        return {
+            "complete": "C",
+            "partial": "P",
+            "pending": "N",
+            "dead_letter": "D",
+            "unknown": "U",
+        }
+    return {
+        "complete": "█",
+        "partial": "▒",
+        "pending": "◆",
+        "dead_letter": "×",
+        "unknown": "?",
+    }
+
+
+def _percentage(count: int, total: int) -> str:
+    if total <= 0:
+        return "0.0%"
+    return f"{count / total * 100:.1f}%"
+
+
+def _table_lines(
+    headers: tuple[str, ...],
+    rows: Iterable[tuple[str, ...]],
+) -> list[str]:
+    materialized = list(rows)
+    if not materialized:
+        return ["(none)"]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in materialized))
+        for index in range(len(headers))
+    ]
+    lines = [_format_table_row(headers, widths)]
+    lines.append(_format_table_row(tuple("-" * width for width in widths), widths))
+    lines.extend(_format_table_row(row, widths) for row in materialized)
+    return lines
+
+
+def _format_table_row(row: tuple[str, ...], widths: list[int]) -> str:
+    return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
+
+
+def _target_issue_table_lines(
+    issues: Iterable[TargetIssueSummary],
+    *,
+    sensor_labels: Mapping[str, SensorLabel],
+) -> list[str]:
+    return _table_lines(
+        ("target", "place", "batch", "int", "count", "oldest", "newest"),
+        [
+            (
+                item.entity_id,
+                _label_field(item.entity_id, sensor_labels, "place_number"),
+                _label_field(item.entity_id, sensor_labels, "batch"),
+                _label_field(item.entity_id, sensor_labels, "interval_min"),
+                str(item.count),
+                item.oldest_window,
+                item.newest_window,
+            )
+            for item in issues
+        ],
+    )
+
+
+def _http_status_table_lines(status_counts: Iterable[tuple[int, int]]) -> list[str]:
+    return _table_lines(
+        ("http_status", "count"),
+        [(str(http_status), str(count)) for http_status, count in status_counts],
+    )
+
+
+def _limited[T](items: tuple[T, ...], limit: int | None) -> tuple[T, ...]:
+    if limit is None:
+        return items
+    return items[:limit]
+
+
+def _target_section_heading(issue_name: str, limit: int | None) -> str:
+    if limit is None:
+        return f"{issue_name.title()} targets"
+    return f"Top {issue_name} targets (limit {limit})"
+
+
+def _hidden_hint(*, label: str, total: int, shown: int) -> list[str]:
+    hidden = total - shown
+    if hidden <= 0:
+        return []
+    return [f"... {hidden} more {label} hidden; rerun with --all to show all rows."]
+
+
+def _format_target_list(
+    entity_ids: Iterable[str],
+    *,
+    sensor_labels: Mapping[str, SensorLabel],
+    limit: int,
+) -> str:
+    targets = list(entity_ids)
+    if not targets:
+        return "-"
+    shown = [
+        _compact_target_label(entity_id, sensor_labels) for entity_id in targets[:limit]
+    ]
+    if len(targets) > limit:
+        shown.append(f"+{len(targets) - limit} more")
+    return ", ".join(shown)
+
+
+def _compact_target_label(
+    entity_id: str,
+    sensor_labels: Mapping[str, SensorLabel],
+) -> str:
+    label = sensor_labels.get(entity_id)
+    if label is None:
+        return entity_id
+    return f"{label.place_number}/{label.batch}/{label.interval_min}m:{entity_id}"
+
+
+def _label_field(
+    entity_id: str,
+    sensor_labels: Mapping[str, SensorLabel],
+    field: Literal["place_number", "batch", "interval_min"],
+) -> str:
+    label = sensor_labels.get(entity_id)
+    if label is None:
+        return "-"
+    return str(getattr(label, field))
+
+
+def _format_size(size_bytes: int | None) -> str:
+    if size_bytes is None:
+        return "missing"
+    value = float(size_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024 or unit == "GiB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GiB"

@@ -10,9 +10,12 @@ import pytest
 
 from sendai_pipeline.state import StateValidationError, WindowStateStore
 from sendai_pipeline.state_tools import (
+    build_state_report,
     diagnose_state,
     diagnoses_to_json,
+    load_sensor_labels,
     repair_state,
+    state_report_to_pretty,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -123,6 +126,9 @@ def test_diagnose_state_categorizes_open_windows_deterministically(
         "stored",
     ]
     assert diagnoses[0].failed_http_statuses == (400,)
+    assert diagnoses[2].missing_target_ids == (ENTITY_3,)
+    assert diagnoses[3].failed_target_ids == (ENTITY_2,)
+    assert diagnoses[3].failed_target_http_statuses == (502,)
     first_json_row = json.loads(diagnoses_to_json(diagnoses))[0]
     assert first_json_row["window"] == all_failed
     assert first_json_row["expected_target_source"] == "stored"
@@ -178,6 +184,193 @@ def test_diagnose_state_retry_reachable_uses_source_window_and_config(
 
     assert diagnosis.source_window_start == datetime(2026, 5, 25, 8, 40, 0, tzinfo=JST)
     assert diagnosis.retry_reachable is True
+
+
+def test_build_state_report_counts_retained_windows_and_ranks_target_issues(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "direction.json"
+    partial_old = "per300/20260525_0640"
+    pending_new = "per300/20260525_0650"
+    complete = "per300/20260525_0700"
+    dead_letter = "per300/20260525_0710"
+    unknown = "per300/20260525_0720"
+    _write_state(
+        path,
+        {
+            partial_old: _window(
+                key=partial_old,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={ENTITY_2: _target("failed", 502)},
+            ),
+            pending_new: _window(
+                key=pending_new,
+                status="pending",
+                expected=[ENTITY_1, ENTITY_2],
+                targets={ENTITY_2: _target("failed", 400)},
+            ),
+            complete: _window(
+                key=complete,
+                status="complete",
+                expected=[ENTITY_1],
+                targets={ENTITY_1: _target("ok")},
+            ),
+            dead_letter: _window(
+                key=dead_letter,
+                status="dead_letter",
+                expected=[ENTITY_1],
+                targets={ENTITY_1: _target("failed", 400)},
+            ),
+            unknown: _window(key=unknown, status="paused"),
+        },
+    )
+    store = WindowStateStore.load(path)
+
+    report = build_state_report(store, product="direction", now=NOW)
+
+    assert report.status_counts == {
+        "complete": 1,
+        "partial": 1,
+        "pending": 1,
+        "dead_letter": 1,
+        "unknown": 1,
+    }
+    assert [item.entity_id for item in report.missing_targets] == [ENTITY_1, ENTITY_3]
+    assert report.missing_targets[0].count == 2
+    assert report.missing_targets[0].oldest_window == partial_old
+    assert report.missing_targets[0].newest_window == pending_new
+    assert [item.entity_id for item in report.failed_targets] == [ENTITY_2]
+    assert report.failed_targets[0].count == 2
+    assert report.failed_http_status_counts == ((400, 1), (502, 1))
+
+
+def test_pretty_report_enriches_targets_with_metadata_and_can_use_ascii_bars(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    metadata_path = tmp_path / "metadata" / "sensors.csv"
+    key = "per300/20260525_0640"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[ENTITY_1, ENTITY_2],
+                targets={ENTITY_2: _target("failed", 502)},
+            )
+        },
+    )
+    metadata_path.parent.mkdir(parents=True)
+    metadata_path.write_text(
+        "\n".join(
+            [
+                "place_number,batch,expected_device_type,interval_min,"
+                "entity_type,entity_id,identifcation,active",
+                f"101,2026,M5Stack,5,Blesensor.per300,{ENTITY_1},101,true",
+                f"102,2026,M5Stack,5,Blesensor.per300,{ENTITY_2},102,true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    store = WindowStateStore.load(path)
+    report = build_state_report(store, product="flow", now=NOW)
+
+    output = state_report_to_pretty(
+        report,
+        state_path=path,
+        state_size_bytes=path.stat().st_size,
+        sensor_labels=load_sensor_labels(metadata_path),
+        top=10,
+        window_limit=10,
+        window_sensor_limit=8,
+        ascii_only=True,
+    )
+
+    assert "State doctor: flow" in output
+    assert "C" in output
+    assert "P" in output
+    assert "█" not in output
+    assert "C complete" in output
+    assert "P partial" in output
+    assert "101/2026/5m:" in output
+    assert ENTITY_1 in output
+
+
+def test_pretty_report_hints_when_table_rows_are_hidden(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "flow.json"
+    first = "per300/20260525_0640"
+    second = "per300/20260525_0645"
+    _write_state(
+        path,
+        {
+            first: _window(
+                key=first,
+                expected=[ENTITY_1, ENTITY_2],
+                targets={ENTITY_2: _target("failed", 502)},
+            ),
+            second: _window(
+                key=second,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={ENTITY_2: _target("failed", 400)},
+            ),
+        },
+    )
+    store = WindowStateStore.load(path)
+    report = build_state_report(store, product="flow", now=NOW)
+
+    output = state_report_to_pretty(
+        report,
+        state_path=path,
+        state_size_bytes=path.stat().st_size,
+        sensor_labels={},
+        top=1,
+        window_limit=1,
+        window_sensor_limit=8,
+        ascii_only=True,
+    )
+
+    assert "... 1 more open windows hidden; rerun with --all" in output
+    assert "... 1 more missing targets hidden; rerun with --all" in output
+    assert f"{second}  partial" not in output
+
+
+def test_pretty_report_all_rows_has_no_hidden_hint(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "flow.json"
+    first = "per300/20260525_0640"
+    second = "per300/20260525_0645"
+    _write_state(
+        path,
+        {
+            first: _window(
+                key=first,
+                expected=[ENTITY_1, ENTITY_2],
+                targets={ENTITY_2: _target("failed", 502)},
+            ),
+            second: _window(
+                key=second,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={ENTITY_2: _target("failed", 400)},
+            ),
+        },
+    )
+    store = WindowStateStore.load(path)
+    report = build_state_report(store, product="flow", now=NOW)
+
+    output = state_report_to_pretty(
+        report,
+        state_path=path,
+        state_size_bytes=path.stat().st_size,
+        sensor_labels={},
+        top=None,
+        window_limit=None,
+        window_sensor_limit=8,
+        ascii_only=True,
+    )
+
+    assert "hidden; rerun with --all" not in output
+    assert first in output
+    assert second in output
 
 
 def test_repair_state_dry_run_does_not_write(tmp_path: Path) -> None:

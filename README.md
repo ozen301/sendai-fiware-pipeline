@@ -71,7 +71,8 @@ uv run python scripts/show_data.py --source comet --type Blesensor.per300 \
   jp.sendai.Blesensor.per300.101
 
 # Diagnose stuck windows (read-only).
-uv run python scripts/state_doctor.py flow
+uv run python scripts/state_doctor.py flow --pretty
+uv run python scripts/state_doctor.py direction --pretty
 ```
 
 Full per-script reference in
