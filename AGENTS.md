@@ -175,5 +175,17 @@ hostnames, or restricted reference content.
 
 ### Commit Messages
 
-Use simple imperative subjects: `Add X`, `Fix Y`, `Remove Z`. Add a
-body only when the reason is not obvious from the diff.
+Use Conventional Commits format:
+
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+Common types: `feat`, `fix`, `refactor`, `docs`, `style`, `test`, `chore`.
+Add a body only when the reason is not obvious from the diff;
+add footers for issue references (`Closes #123`), breaking change notices
+(`BREAKING CHANGE: ...`), or other metadata. Simple commits need only the subject line.

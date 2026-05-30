@@ -208,6 +208,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Codex local hooks/config:
+.codex/
+
 # PyPI configuration file
 .pypirc
 
@@ -232,6 +235,7 @@ ref_docs/
 !/metadata/
 !/metadata/sensors.example.csv
 
-# Local agent files
+# Local agent config
 #   The general instructions are stored in AGENTS.md, which is not ignored.
 CLAUDE.md
+.claude/
