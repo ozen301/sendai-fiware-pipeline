@@ -117,7 +117,7 @@ def test_diagnose_state_categorizes_open_windows_deterministically(
     assert [item.target_status_category for item in diagnoses] == [
         "all_failed",
         "all_ok",
-        "missing_targets",
+        "mixed",
         "mixed",
     ]
     assert [item.expected_target_source for item in diagnoses] == [
@@ -127,7 +127,6 @@ def test_diagnose_state_categorizes_open_windows_deterministically(
         "stored",
     ]
     assert diagnoses[0].failed_http_statuses == (400,)
-    assert diagnoses[2].missing_target_ids == (ENTITY_3,)
     assert diagnoses[3].failed_target_ids == (ENTITY_2,)
     assert diagnoses[3].failed_target_http_statuses == (502,)
     first_json_row = json.loads(diagnoses_to_json(diagnoses))[0]
@@ -236,10 +235,6 @@ def test_build_state_report_counts_retained_windows_and_ranks_target_issues(
         "dead_letter": 1,
         "unknown": 1,
     }
-    assert [item.entity_id for item in report.missing_targets] == [ENTITY_1, ENTITY_3]
-    assert report.missing_targets[0].count == 2
-    assert report.missing_targets[0].oldest_window == partial_old
-    assert report.missing_targets[0].newest_window == pending_new
     assert [item.entity_id for item in report.failed_targets] == [ENTITY_2]
     assert report.failed_targets[0].count == 2
     assert report.failed_http_status_counts == ((400, 1), (502, 1))
@@ -284,7 +279,6 @@ def test_pretty_report_enriches_targets_with_metadata_and_can_use_ascii_bars(
         sensor_labels=load_sensor_labels(metadata_path),
         top=10,
         window_limit=10,
-        window_sensor_limit=8,
         ascii_only=True,
     )
 
@@ -294,8 +288,9 @@ def test_pretty_report_enriches_targets_with_metadata_and_can_use_ascii_bars(
     assert "█" not in output
     assert "C complete" in output
     assert "P partial" in output
-    assert "101/2026/5m:" in output
-    assert ENTITY_1 in output
+    entity_2_line = next(line for line in output.splitlines() if ENTITY_2 in line)
+    entity_2_cells = entity_2_line.split()
+    assert entity_2_cells[:4] == [ENTITY_2, "102", "2026", "5"]
 
 
 def test_pretty_report_hints_when_table_rows_are_hidden(tmp_path: Path) -> None:
@@ -313,7 +308,7 @@ def test_pretty_report_hints_when_table_rows_are_hidden(tmp_path: Path) -> None:
             second: _window(
                 key=second,
                 expected=[ENTITY_1, ENTITY_2, ENTITY_3],
-                targets={ENTITY_2: _target("failed", 400)},
+                targets={ENTITY_3: _target("failed", 400)},
             ),
         },
     )
@@ -327,12 +322,11 @@ def test_pretty_report_hints_when_table_rows_are_hidden(tmp_path: Path) -> None:
         sensor_labels={},
         top=1,
         window_limit=1,
-        window_sensor_limit=8,
         ascii_only=True,
     )
 
     assert "... 1 more open windows hidden; rerun with --all" in output
-    assert "... 1 more missing targets hidden; rerun with --all" in output
+    assert "... 1 more failed targets hidden; rerun with --all" in output
     assert f"{second}  partial" not in output
 
 
@@ -365,7 +359,6 @@ def test_pretty_report_all_rows_has_no_hidden_hint(tmp_path: Path) -> None:
         sensor_labels={},
         top=None,
         window_limit=None,
-        window_sensor_limit=8,
         ascii_only=True,
     )
 

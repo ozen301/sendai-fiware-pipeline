@@ -44,12 +44,6 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         help="open-window rows to show in pretty output",
     )
     parser.add_argument(
-        "--window-sensor-limit",
-        type=_positive_int,
-        default=8,
-        help="target labels to show per open window in pretty output",
-    )
-    parser.add_argument(
         "--ascii",
         action="store_true",
         help="use plain ASCII bars in pretty output",
@@ -84,7 +78,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     sensor_labels=try_load_sensor_labels(_metadata_path_from_env()),
                     top=None if args.all else args.top,
                     window_limit=None if args.all else args.window_limit,
-                    window_sensor_limit=args.window_sensor_limit,
                     ascii_only=bool(args.ascii),
                 )
                 + "\n"

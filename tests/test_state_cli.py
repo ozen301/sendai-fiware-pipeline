@@ -107,7 +107,6 @@ def test_state_doctor_cli_warns_when_state_changes_during_read(
                 "unknown": 0,
             },
             open_windows=(),
-            missing_targets=(),
             failed_targets=(),
             failed_http_status_counts=(),
         )
@@ -160,7 +159,7 @@ def test_state_doctor_cli_pretty_reports_dashboard_with_unicode_bars(
     assert "State doctor: flow" in output
     assert "Status overview" in output
     assert "Open windows" in output
-    assert "Top missing targets" in output
+    assert "Top failed targets" in output
     assert "▒ partial" in output
 
 

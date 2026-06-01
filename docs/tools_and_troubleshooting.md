@@ -319,25 +319,23 @@ uv run python scripts/state_doctor.py {flow|direction} --pretty
 |---|---|
 | `flow` / `direction` (positional, required) | Which product's state to inspect. |
 | `--pretty` | Render a human-readable dashboard with status bars and tables instead of JSON. |
-| `--top N` | Limit ranked missing/failed target tables in `--pretty` output. Default: `20`. |
+| `--top N` | Limit ranked failed target tables in `--pretty` output. Default: `20`. |
 | `--window-limit N` | Limit open-window rows in `--pretty` output. Default: `30`. |
-| `--window-sensor-limit N` | Limit missing target labels shown per open window in `--pretty` output. Default: `8`. |
 | `--ascii` | Keep `--pretty` output ASCII-only. |
 | `--all` | Show all `--pretty` dashboard table rows. |
 
 Default output is JSON for scripts. It includes retained-window status
-counts, open-window diagnostics, ranked missing/failed target summaries,
+counts, open-window diagnostics, ranked failed target summaries,
 and failed HTTP status counts. Each open-window row includes fields
 including:
 
 - `window` — the window key, e.g. `per3600/20260524_1000`.
 - `status` — `pending` or `partial`.
 - `interval_min`, `first_seen`, `source_window_start`, `source_window_end` — window timing context.
-- `target_status_category` — `all_failed`, `all_ok`, `mixed`, or `missing_targets`.
+- `target_status_category` — `all_failed`, `all_ok`, or `mixed`.
 - `expected_target_source` — `stored` when the v2 expected-target snapshot is present, `derived` for legacy rows that fell back to currently-recorded target keys (treat `derived` as diagnostic only).
-- `target_count` / `ok_count` / `failed_count` / `missing_count` — aggregate counts across the window's expected targets.
+- `target_count` / `ok_count` / `failed_count` — aggregate counts across the window's expected targets.
 - `failed_http_statuses` — distinct HTTP status codes seen on `failed` targets.
-- `missing_target_ids` — expected target IDs with no retained target record for this window.
 - `failed_target_ids` — expected target IDs whose retained target record is `failed`.
 - `retry_reachable` — whether the window is still inside the configured retry horizon (`MAX_LOOKBACK_HOURS_*`).
 
@@ -532,8 +530,8 @@ are escalations only if the earlier one rules out the simpler cause.
 
 ### "A window is stuck `partial` and not clearing"
 
-1. `state_doctor.py {flow|direction}` — read which targets are
-   missing or failed and check `target_status_category` /
+1. `state_doctor.py {flow|direction}` — read which targets failed
+   and check `target_status_category` /
    `expected_target_source` / `retry_reachable`.
 2. If `target_status_category=all_ok` and `expected_target_source=stored`:
    the doctor is telling you the aggregate status is stale.

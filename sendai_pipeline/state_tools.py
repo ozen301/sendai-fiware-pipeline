@@ -48,9 +48,7 @@ class WindowDiagnosis:
     target_count: int
     ok_count: int
     failed_count: int
-    missing_count: int
     failed_http_statuses: tuple[int, ...]
-    missing_target_ids: tuple[str, ...]
     failed_target_ids: tuple[str, ...]
     failed_target_http_statuses: tuple[int | None, ...]
     retry_reachable: bool
@@ -73,7 +71,6 @@ class StateDoctorReport:
     product: ProductName
     status_counts: dict[str, int]
     open_windows: tuple[WindowDiagnosis, ...]
-    missing_targets: tuple[TargetIssueSummary, ...]
     failed_targets: tuple[TargetIssueSummary, ...]
     failed_http_status_counts: tuple[tuple[int, int], ...]
 
@@ -207,10 +204,6 @@ def build_state_report(
         product=product,
         status_counts=retained_status_counts(store),
         open_windows=open_windows,
-        missing_targets=_summarize_target_issues(
-            open_windows,
-            target_ids=lambda item: item.missing_target_ids,
-        ),
         failed_targets=_summarize_target_issues(
             open_windows,
             target_ids=lambda item: item.failed_target_ids,
@@ -420,16 +413,12 @@ def _diagnose_window(
         targets = {}
     ok_count = 0
     failed_count = 0
-    missing_count = 0
     failed_http_statuses: set[int] = set()
-    missing_target_ids: list[str] = []
     failed_target_ids: list[str] = []
     failed_target_http_statuses: list[int | None] = []
     for entity_id in expected:
         target = targets.get(entity_id)
         if not isinstance(target, dict):
-            missing_count += 1
-            missing_target_ids.append(entity_id)
             continue
         status = target.get("status")
         if status == "ok":
@@ -447,8 +436,6 @@ def _diagnose_window(
         category = "all_ok"
     elif expected and failed_count == len(expected):
         category = "all_failed"
-    elif missing_count:
-        category = "missing_targets"
     else:
         category = "mixed"
 
@@ -469,9 +456,7 @@ def _diagnose_window(
         target_count=len(expected),
         ok_count=ok_count,
         failed_count=failed_count,
-        missing_count=missing_count,
         failed_http_statuses=tuple(sorted(failed_http_statuses)),
-        missing_target_ids=tuple(missing_target_ids),
         failed_target_ids=tuple(failed_target_ids),
         failed_target_http_statuses=tuple(failed_target_http_statuses),
         retry_reachable=(now - retry_anchor) <= timedelta(hours=max_lookback_hours),
@@ -930,9 +915,6 @@ def state_report_to_json(report: StateDoctorReport) -> str:
         "total_windows": sum(report.status_counts.values()),
         "open_window_count": len(report.open_windows),
         "open_windows": [_diagnosis_to_row(item) for item in report.open_windows],
-        "missing_targets": [
-            _target_issue_to_row(item) for item in report.missing_targets
-        ],
         "failed_targets": [
             _target_issue_to_row(item) for item in report.failed_targets
         ],
@@ -952,7 +934,6 @@ def state_report_to_pretty(
     sensor_labels: Mapping[str, SensorLabel],
     top: int | None,
     window_limit: int | None,
-    window_sensor_limit: int,
     ascii_only: bool,
 ) -> str:
     """Render a human-readable state doctor dashboard."""
@@ -975,9 +956,7 @@ def state_report_to_pretty(
                 "int",
                 "ok",
                 "fail",
-                "miss",
                 "retry",
-                "missing targets",
             ),
             [
                 (
@@ -986,13 +965,7 @@ def state_report_to_pretty(
                     str(item.interval_min),
                     str(item.ok_count),
                     str(item.failed_count),
-                    str(item.missing_count),
                     "yes" if item.retry_reachable else "no",
-                    _format_target_list(
-                        item.missing_target_ids,
-                        sensor_labels=sensor_labels,
-                        limit=window_sensor_limit,
-                    ),
                 )
                 for item in open_windows
             ],
@@ -1003,22 +976,6 @@ def state_report_to_pretty(
             label="open windows",
             total=len(report.open_windows),
             shown=len(open_windows),
-        )
-    )
-
-    missing_targets = _limited(report.missing_targets, top)
-    lines.extend(["", _target_section_heading("missing", top)])
-    lines.extend(
-        _target_issue_table_lines(
-            missing_targets,
-            sensor_labels=sensor_labels,
-        )
-    )
-    lines.extend(
-        _hidden_hint(
-            label="missing targets",
-            total=len(report.missing_targets),
-            shown=len(missing_targets),
         )
     )
 
@@ -1055,9 +1012,7 @@ def _diagnosis_to_row(item: WindowDiagnosis) -> dict[str, object]:
         "target_count": item.target_count,
         "ok_count": item.ok_count,
         "failed_count": item.failed_count,
-        "missing_count": item.missing_count,
         "failed_http_statuses": item.failed_http_statuses,
-        "missing_target_ids": item.missing_target_ids,
         "failed_target_ids": item.failed_target_ids,
         "failed_target_http_statuses": item.failed_target_http_statuses,
         "retry_reachable": item.retry_reachable,
@@ -1224,33 +1179,6 @@ def _hidden_hint(*, label: str, total: int, shown: int) -> list[str]:
     if hidden <= 0:
         return []
     return [f"... {hidden} more {label} hidden; rerun with --all to show all rows."]
-
-
-def _format_target_list(
-    entity_ids: Iterable[str],
-    *,
-    sensor_labels: Mapping[str, SensorLabel],
-    limit: int,
-) -> str:
-    targets = list(entity_ids)
-    if not targets:
-        return "-"
-    shown = [
-        _compact_target_label(entity_id, sensor_labels) for entity_id in targets[:limit]
-    ]
-    if len(targets) > limit:
-        shown.append(f"+{len(targets) - limit} more")
-    return ", ".join(shown)
-
-
-def _compact_target_label(
-    entity_id: str,
-    sensor_labels: Mapping[str, SensorLabel],
-) -> str:
-    label = sensor_labels.get(entity_id)
-    if label is None:
-        return entity_id
-    return f"{label.place_number}/{label.batch}/{label.interval_min}m:{entity_id}"
 
 
 def _label_field(
