@@ -197,6 +197,13 @@ targets are retried; prior-`ok` targets are not re-POSTed even if
 source aggregates later drift. This avoids duplicate STH-Comet history
 rows.
 
+A window is `complete` once every entity id in its expected target set
+has a recorded `ok`. The two products build that expected set
+differently — Product A unions it from the targets actually observed
+(§3.2), Product B fixes it to the active-metadata roster (§4) — so a
+silent Product A place that emits no source row never holds its window
+in `partial`.
+
 Once STH-Comet subscriptions are enabled, correction by normal repost
 is not history-idempotent. Treat Comet deletion/replay as an operator
 repair workflow; upstream STH-Comet deletion is coarse (service /
@@ -269,6 +276,31 @@ Fetched rows then apply the §2 common rules. Per-row order (matches
 4. Drop if `device_type` ≠ metadata `expected_device_type` (§2.4).
 
 Each surviving row produces one payload for the resolved entity.
+
+### 3.2.1 Window completion (observed-target)
+
+A Product A window's `expected_target_ids` is the stored set **unioned
+with** the entities that produced a valid payload on the current run. It
+is *not* the full active-metadata roster: a per-place sensor that saw
+nobody emits no source row, so that entity is never required and does
+not hold the window in `partial`. The window completes against the
+targets it actually observed.
+
+Late source rows can still arrive for a window that already completed
+and aged past the normal rolling lookback. In send mode the pipeline
+runs **targeted supplemental discovery**: it re-queries the retained
+`complete` windows by exact `startdate` (one `startdate IN (…)` query
+per interval, bounded to windows whose source start falls between the
+max-lookback horizon and the normal lookback's lower bound). A row for a
+not-yet-seen entity expands that window's expected set and is POSTed
+without re-sending the targets already `ok`; a re-query that reveals no
+new entity is a no-op. Dry-run performs no supplemental discovery.
+
+Old on-disk flow state written under the previous full-roster model is
+converted with the one-off `scripts/migrate_flow_state.py` tool
+(dry-run by default; `--apply` to write, after a timestamped backup),
+which re-derives each window's expected set from its recorded targets,
+recomputes status, and drops windows that recorded no targets.
 
 ### 3.3 Attribute mapping (request body)
 
@@ -380,6 +412,15 @@ The `peopleCount_flow` value, for the entity's own place `N`:
 Targets with no surviving observations still receive a payload with
 sentinel `peopleCount_flow = {"from": {"all": null}, "to": {"all":
 null}}` so Comet history remains continuous.
+
+Because every active target always receives a payload, Product B's
+completion is **fixed-target**: `expected_target_ids` is the
+active-metadata roster snapshotted on the window's first attempt and is
+not expanded from current metadata on retry (a mid-flight metadata
+change logs `window_expected_targets_changed` and keeps the original
+snapshot). This is the deliberate counterpart to Product A's
+observed-target completion (§3.2.1); Product B has no supplemental
+discovery pass and is not affected by the flow-state migration.
 
 **Naming note.** A DB row with `from_group_place_id = 'ALL'` and
 `to_group_place_id` resolving to place `N` populates

@@ -62,6 +62,25 @@ class FakeDbCursor:
         return None
 
     def execute(self, _sql: str, params: tuple[Any, ...]) -> None:
+        normalized_sql = " ".join(_sql.split())
+        if "startdate IN" in normalized_sql:
+            interval_min = int(params[0])
+            startdates = tuple(str(value) for value in params[1:-1])
+            max_imputation_tier = int(params[-1])
+            self._connection.startdate_queries.append(
+                (interval_min, startdates, max_imputation_tier)
+            )
+            startdate_set = set(startdates)
+            self._rows = [
+                row
+                for row in self._connection.startdate_rows_by_interval.get(
+                    interval_min, []
+                )
+                if str(row["startdate"]) in startdate_set
+                and int(row.get("imputation_tier", 0)) <= max_imputation_tier
+            ]
+            return
+
         interval_min, lower_bound, upper_bound, max_imputation_tier = params
         self._connection.queries.append(
             (interval_min, lower_bound, upper_bound, max_imputation_tier)
@@ -80,12 +99,24 @@ class FakeDbConnection:
     def __init__(
         self,
         rows_by_interval: Mapping[int, Iterable[Mapping[str, Any]]] | None = None,
+        *,
+        startdate_rows_by_interval: Mapping[int, Iterable[Mapping[str, Any]]]
+        | None = None,
     ) -> None:
         self.rows_by_interval = {
             interval: [dict(row) for row in rows]
             for interval, rows in (rows_by_interval or {}).items()
         }
+        self.startdate_rows_by_interval = (
+            {
+                interval: [dict(row) for row in rows]
+                for interval, rows in startdate_rows_by_interval.items()
+            }
+            if startdate_rows_by_interval is not None
+            else self.rows_by_interval
+        )
         self.queries: list[tuple[int, str, str, int]] = []
+        self.startdate_queries: list[tuple[int, tuple[str, ...], int]] = []
         self.close_calls = 0
 
     def cursor(self) -> FakeDbCursor:
@@ -542,6 +573,544 @@ def test_run_flow_send_mode_posts_all_targets_and_completes_window(
     assert len(records(caplog, "window_complete")) == 1
 
 
+def test_run_flow_completes_new_window_with_observed_targets_only(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    targets = [
+        place(place_number=10),
+        place(place_number=11),
+        place(place_number=12),
+        place(place_number=13),
+    ]
+    observed_targets = targets[:2]
+    rows = [
+        flow_row(group_place_id="sendai202603.10"),
+        flow_row(group_place_id="sendai202603.11"),
+    ]
+    store = state_store(tmp_path, Clock([NOW] * 10))
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: rows}),
+            orion=orion,
+            metadata=targets,
+            store=store,
+            settings=run_settings(tmp_path, send_mode="send"),
+        )
+
+    assert result.exit_code == 0
+    assert result.windows_seen == 1
+    assert result.windows_complete == 1
+    assert result.windows_partial == 0
+    assert result.posts_ok == 2
+    assert result.posts_failed == 0
+    assert [call["entity_id"] for call in orion.calls] == entity_ids(observed_targets)
+    window = store.as_dict()["windows"]["per3600/20260523_0900"]
+    assert window["status"] == "complete"
+    assert window["expected_target_ids"] == entity_ids(observed_targets)
+    assert sorted(window["targets"]) == entity_ids(observed_targets)
+    assert records(caplog, "window_expected_targets_changed") == []
+
+
+def test_run_flow_expands_complete_window_when_target_observed_posts_only_new_target(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ok_target = place(place_number=10)
+    prior_target = place(place_number=11)
+    new_target = place(place_number=12)
+    ok_row = flow_row(group_place_id="sendai202603.10")
+    prior_row = flow_row(group_place_id="sendai202603.11")
+    new_row = flow_row(group_place_id="sendai202603.12")
+    ok_hash = transformed_hash(ok_row, [ok_target])
+    prior_hash = transformed_hash(prior_row, [prior_target])
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=NOW - timedelta(hours=1),
+        last_attempt=NOW - timedelta(hours=1),
+        status="complete",
+        targets={
+            ok_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=ok_hash,
+                last_attempt_at=NOW - timedelta(hours=1),
+            ),
+            prior_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=prior_hash,
+                last_attempt_at=NOW - timedelta(hours=1),
+            ),
+        },
+    )
+    window["expected_target_ids"] = entity_ids([ok_target, prior_target])
+    write_state(path, {"per3600/20260523_0900": window})
+    store = WindowStateStore.load(path, now=Clock([NOW] * 10))
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: [ok_row, prior_row, new_row]}),
+            orion=orion,
+            metadata=[ok_target, prior_target, new_target],
+            store=store,
+            settings=run_settings(tmp_path, send_mode="send"),
+        )
+
+    assert result.exit_code == 0
+    assert result.windows_complete == 1
+    assert result.windows_partial == 0
+    assert result.posts_ok == 1
+    assert result.posts_failed == 0
+    assert [call["entity_id"] for call in orion.calls] == [new_target.entity_id]
+    window = store.as_dict()["windows"]["per3600/20260523_0900"]
+    assert window["status"] == "complete"
+    assert window["expected_target_ids"] == entity_ids(
+        [ok_target, prior_target, new_target]
+    )
+    ok_record = store.target_record("per3600/20260523_0900", ok_target.entity_id)
+    prior_record = store.target_record("per3600/20260523_0900", prior_target.entity_id)
+    assert ok_record is not None
+    assert prior_record is not None
+    assert ok_record["last_payload_sha256"] == ok_hash
+    assert prior_record["last_payload_sha256"] == prior_hash
+    new_record = store.target_record("per3600/20260523_0900", new_target.entity_id)
+    assert new_record is not None
+    assert new_record["status"] == "ok"
+    skipped = records(caplog, "post_skipped_unchanged")
+    assert [record.entity_id for record in skipped] == entity_ids(
+        [ok_target, prior_target]
+    )
+
+
+def test_run_flow_keeps_expanded_window_partial_until_new_target_retry_succeeds(
+    tmp_path: Path,
+) -> None:
+    ok_target = place(place_number=10)
+    prior_target = place(place_number=11)
+    new_target = place(place_number=12)
+    ok_row = flow_row(group_place_id="sendai202603.10")
+    prior_row = flow_row(group_place_id="sendai202603.11")
+    new_row = flow_row(group_place_id="sendai202603.12")
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=NOW - timedelta(hours=1),
+        last_attempt=NOW - timedelta(hours=1),
+        status="complete",
+        targets={
+            ok_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=transformed_hash(ok_row, [ok_target]),
+                last_attempt_at=NOW - timedelta(hours=1),
+            ),
+            prior_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=transformed_hash(prior_row, [prior_target]),
+                last_attempt_at=NOW - timedelta(hours=1),
+            ),
+        },
+    )
+    window["expected_target_ids"] = entity_ids([ok_target, prior_target])
+    write_state(path, {"per3600/20260523_0900": window})
+    store = WindowStateStore.load(path, now=Clock([NOW] * 20))
+    rows = [ok_row, prior_row, new_row]
+    metadata = [ok_target, prior_target, new_target]
+
+    failed_result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: rows}),
+        orion=FakeOrionClient(results=[{"status": 502, "ok": False}]),
+        metadata=metadata,
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert failed_result.exit_code == 1
+    assert failed_result.windows_complete == 0
+    assert failed_result.windows_partial == 1
+    assert failed_result.posts_ok == 0
+    assert failed_result.posts_failed == 1
+    window = store.as_dict()["windows"]["per3600/20260523_0900"]
+    assert window["status"] == "partial"
+    assert window["expected_target_ids"] == entity_ids(metadata)
+    failed_record = store.target_record("per3600/20260523_0900", new_target.entity_id)
+    assert failed_record is not None
+    assert failed_record["status"] == "failed"
+    assert failed_record["last_http_status"] == 502
+
+    retry_orion = FakeOrionClient()
+    retried_result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: rows}),
+        orion=retry_orion,
+        metadata=metadata,
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert retried_result.exit_code == 0
+    assert retried_result.windows_complete == 1
+    assert retried_result.windows_partial == 0
+    assert retried_result.posts_ok == 1
+    assert retried_result.posts_failed == 0
+    assert [call["entity_id"] for call in retry_orion.calls] == [new_target.entity_id]
+    assert store.as_dict()["windows"]["per3600/20260523_0900"]["status"] == "complete"
+    retried_record = store.target_record("per3600/20260523_0900", new_target.entity_id)
+    assert retried_record is not None
+    assert retried_record["status"] == "ok"
+
+
+def test_run_flow_skips_state_for_new_window_when_all_rows_drop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rows = [
+        flow_row(group_place_id="quick.10"),
+        flow_row(group_place_id="sendai202603.10", device_type="Pixel3aUT"),
+    ]
+    store = state_store(tmp_path, Clock([NOW] * 10))
+    begin_calls: list[str] = []
+    real_begin = store.begin_window_attempt
+
+    def begin_spy(window_key: str, **kwargs: Any) -> None:
+        begin_calls.append(window_key)
+        real_begin(window_key, **kwargs)
+
+    monkeypatch.setattr(store, "begin_window_attempt", begin_spy)
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: rows}),
+            orion=orion,
+            metadata=[place(place_number=10)],
+            store=store,
+            settings=run_settings(tmp_path, send_mode="send"),
+        )
+
+    assert result.exit_code == 0
+    assert result.windows_seen == 1
+    assert result.windows_complete == 0
+    assert result.windows_partial == 0
+    assert result.posts_ok == 0
+    assert result.posts_failed == 0
+    assert result.rows_dropped == 2
+    assert orion.calls == []
+    assert begin_calls == []
+    assert store.as_dict()["windows"] == {}
+    assert records(caplog, "window_complete") == []
+    assert records(caplog, "window_partial") == []
+
+
+def test_run_flow_keeps_complete_window_when_observed_subset_stored_skips_posts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observed_target = place(place_number=10)
+    stored_only_target = place(place_number=11)
+    observed_row = flow_row(group_place_id="sendai202603.10")
+    stored_only_row = flow_row(group_place_id="sendai202603.11")
+    observed_hash = transformed_hash(observed_row, [observed_target])
+    stored_only_hash = transformed_hash(stored_only_row, [stored_only_target])
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=NOW - timedelta(hours=1),
+        last_attempt=NOW - timedelta(hours=1),
+        status="complete",
+        targets={
+            observed_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=observed_hash,
+                last_attempt_at=NOW - timedelta(hours=1),
+            ),
+            stored_only_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=stored_only_hash,
+                last_attempt_at=NOW - timedelta(hours=1),
+            ),
+        },
+    )
+    window["expected_target_ids"] = entity_ids([observed_target, stored_only_target])
+    write_state(path, {"per3600/20260523_0900": window})
+    store = WindowStateStore.load(path, now=Clock([NOW] * 10))
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: [observed_row]}),
+            orion=orion,
+            metadata=[observed_target, stored_only_target],
+            store=store,
+            settings=run_settings(tmp_path, send_mode="send"),
+        )
+
+    assert result.exit_code == 0
+    assert result.windows_complete == 1
+    assert result.windows_partial == 0
+    assert result.posts_ok == 0
+    assert result.posts_failed == 0
+    assert orion.calls == []
+    window = store.as_dict()["windows"]["per3600/20260523_0900"]
+    assert window["status"] == "complete"
+    assert window["expected_target_ids"] == entity_ids(
+        [observed_target, stored_only_target]
+    )
+    assert records(caplog, "window_expected_targets_changed") == []
+    skipped = records(caplog, "post_skipped_unchanged")
+    assert len(skipped) == 1
+    assert skipped[0].entity_id == observed_target.entity_id
+
+
+def test_run_flow_supplemental_expands_complete_window_when_late_target_appears(
+    tmp_path: Path,
+) -> None:
+    ok_target = place(place_number=10)
+    prior_target = place(place_number=11)
+    new_target = place(place_number=12)
+    startdate = "20260522_0800"
+    window_key = f"per3600/{startdate}"
+    ok_row = flow_row(startdate=startdate, group_place_id="sendai202603.10")
+    prior_row = flow_row(startdate=startdate, group_place_id="sendai202603.11")
+    new_row = flow_row(startdate=startdate, group_place_id="sendai202603.12")
+    ok_hash = transformed_hash(ok_row, [ok_target])
+    prior_hash = transformed_hash(prior_row, [prior_target])
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=NOW - timedelta(hours=30),
+        last_attempt=NOW - timedelta(hours=30),
+        status="complete",
+        targets={
+            ok_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=ok_hash,
+                last_attempt_at=NOW - timedelta(hours=30),
+            ),
+            prior_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=prior_hash,
+                last_attempt_at=NOW - timedelta(hours=30),
+            ),
+        },
+    )
+    window["expected_target_ids"] = entity_ids([ok_target, prior_target])
+    write_state(path, {window_key: window})
+    store = WindowStateStore.load(path, now=Clock([NOW] * 20))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [ok_row, prior_row, new_row]},
+    )
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=orion,
+        metadata=[ok_target, prior_target, new_target],
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert result.exit_code == 0
+    assert result.windows_seen == 1
+    assert result.windows_complete == 1
+    assert result.windows_partial == 0
+    assert result.posts_ok == 1
+    assert result.posts_failed == 0
+    assert db_connection.startdate_queries == [(60, (startdate,), 2)]
+    assert [call["entity_id"] for call in orion.calls] == [new_target.entity_id]
+    window = store.as_dict()["windows"][window_key]
+    assert window["status"] == "complete"
+    assert window["expected_target_ids"] == entity_ids(
+        [ok_target, prior_target, new_target]
+    )
+    ok_record = store.target_record(window_key, ok_target.entity_id)
+    prior_record = store.target_record(window_key, prior_target.entity_id)
+    new_record = store.target_record(window_key, new_target.entity_id)
+    assert ok_record is not None
+    assert prior_record is not None
+    assert new_record is not None
+    assert ok_record["last_payload_sha256"] == ok_hash
+    assert prior_record["last_payload_sha256"] == prior_hash
+    assert new_record["status"] == "ok"
+
+
+def test_run_flow_supplemental_noops_when_late_rows_have_no_new_target(
+    tmp_path: Path,
+) -> None:
+    ok_target = place(place_number=10)
+    prior_target = place(place_number=11)
+    startdate = "20260522_0800"
+    window_key = f"per3600/{startdate}"
+    ok_row = flow_row(startdate=startdate, group_place_id="sendai202603.10")
+    prior_row = flow_row(startdate=startdate, group_place_id="sendai202603.11")
+    dropped_row = flow_row(
+        startdate=startdate,
+        group_place_id="sendai202603.10",
+        device_type="Pixel3aUT",
+    )
+    ok_hash = transformed_hash(ok_row, [ok_target])
+    prior_hash = transformed_hash(prior_row, [prior_target])
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=NOW - timedelta(hours=30),
+        last_attempt=NOW - timedelta(hours=30),
+        status="complete",
+        targets={
+            ok_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=ok_hash,
+                last_attempt_at=NOW - timedelta(hours=30),
+            ),
+            prior_target.entity_id: target_record(
+                status="ok",
+                payload_sha256=prior_hash,
+                last_attempt_at=NOW - timedelta(hours=30),
+            ),
+        },
+    )
+    window["expected_target_ids"] = entity_ids([ok_target, prior_target])
+    write_state(path, {window_key: window})
+    store = WindowStateStore.load(path, now=Clock([NOW] * 20))
+    before_window = deepcopy(store.as_dict()["windows"][window_key])
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [ok_row, prior_row, dropped_row]},
+    )
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=orion,
+        metadata=[ok_target, prior_target],
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert result.exit_code == 0
+    assert result.windows_seen == 0
+    assert result.windows_complete == 0
+    assert result.windows_partial == 0
+    assert result.posts_ok == 0
+    assert result.posts_failed == 0
+    assert result.rows_dropped == 0
+    assert db_connection.startdate_queries == [(60, (startdate,), 2)]
+    assert orion.calls == []
+    assert store.as_dict()["windows"][window_key] == before_window
+
+
+def test_run_flow_supplemental_skips_query_when_no_complete_window_eligible(
+    tmp_path: Path,
+) -> None:
+    target = place(place_number=10)
+    normal_startdate = "20260523_0500"
+    too_old_startdate = "20260519_0800"
+    normal_row = flow_row(startdate=normal_startdate)
+    too_old_row = flow_row(startdate=too_old_startdate)
+    path = tmp_path / "state" / "flow.json"
+    normal_window = window_record(
+        first_seen=NOW - timedelta(hours=8),
+        last_attempt=NOW - timedelta(hours=8),
+        status="complete",
+        targets={
+            target.entity_id: target_record(
+                status="ok",
+                payload_sha256=transformed_hash(normal_row, [target]),
+                last_attempt_at=NOW - timedelta(hours=8),
+            )
+        },
+    )
+    normal_window["expected_target_ids"] = [target.entity_id]
+    too_old_window = window_record(
+        first_seen=NOW - timedelta(hours=100),
+        last_attempt=NOW - timedelta(hours=100),
+        status="complete",
+        targets={
+            target.entity_id: target_record(
+                status="ok",
+                payload_sha256=transformed_hash(too_old_row, [target]),
+                last_attempt_at=NOW - timedelta(hours=100),
+            )
+        },
+    )
+    too_old_window["expected_target_ids"] = [target.entity_id]
+    write_state(
+        path,
+        {
+            f"per3600/{normal_startdate}": normal_window,
+            f"per3600/{too_old_startdate}": too_old_window,
+        },
+    )
+    store = WindowStateStore.load(path, now=Clock([NOW] * 10))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [normal_row, too_old_row]},
+    )
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[target],
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert result.exit_code == 0
+    assert result.windows_seen == 0
+    assert result.posts_ok == 0
+    assert db_connection.startdate_queries == []
+
+
+def test_run_flow_supplemental_skips_query_in_dry_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = place(place_number=10)
+    startdate = "20260522_0800"
+    row = flow_row(startdate=startdate)
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=NOW - timedelta(hours=30),
+        last_attempt=NOW - timedelta(hours=30),
+        status="complete",
+        targets={
+            target.entity_id: target_record(
+                status="ok",
+                payload_sha256=transformed_hash(row, [target]),
+                last_attempt_at=NOW - timedelta(hours=30),
+            )
+        },
+    )
+    window["expected_target_ids"] = [target.entity_id]
+    write_state(path, {f"per3600/{startdate}": window})
+    store = WindowStateStore.load(path, now=Clock([NOW]))
+    forbid_state_mutations(monkeypatch, store)
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [row]},
+    )
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[target],
+        store=store,
+    )
+
+    assert result.exit_code == 0
+    assert result.windows_seen == 0
+    assert result.posts_ok == 0
+    assert db_connection.startdate_queries == []
+
+
 def test_run_flow_failed_post_records_partial_and_nonzero_exit(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -748,7 +1317,7 @@ def test_run_flow_skips_drifted_ok_target_and_keeps_original_hash(
     assert drift[0].computed_payload_sha256 == new_hash
 
 
-def test_run_flow_uses_stored_expected_targets_when_metadata_changed(
+def test_run_flow_preserves_stored_target_when_unobserved_keeps_partial_without_warning(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -789,11 +1358,10 @@ def test_run_flow_uses_stored_expected_targets_when_metadata_changed(
         "expected_target_ids"
     ] == [current_target.entity_id, removed_entity_id]
     assert store.as_dict()["windows"]["per3600/20260523_0900"]["status"] == "partial"
-    changed = records(caplog, "window_expected_targets_changed")
-    assert len(changed) == 1
-    assert changed[0].window == "per3600/20260523_0900"
-    assert changed[0].count_expected == 2
-    assert changed[0].count_live == 1
+    assert records(caplog, "window_expected_targets_changed") == []
+    partials = records(caplog, "window_partial")
+    assert len(partials) == 1
+    assert partials[0].window == "per3600/20260523_0900"
 
 
 def test_run_flow_retries_failed_target_even_when_hash_matches(
@@ -1403,13 +1971,13 @@ def test_run_flow_logs_window_events_for_mixed_run(
         )
 
     assert result.exit_code == 1
+    assert result.windows_complete == 2
+    assert result.windows_partial == 0
     assert [record.window for record in records(caplog, "window_complete")] == [
-        "per3600/20260523_0800"
+        "per3600/20260523_0800",
+        "per3600/20260523_0900",
     ]
-    partials = records(caplog, "window_partial")
-    assert len(partials) == 1
-    assert partials[0].levelname == "WARNING"
-    assert partials[0].window == "per3600/20260523_0900"
+    assert records(caplog, "window_partial") == []
     stuck = records(caplog, "window_giving_up_soon")
     assert len(stuck) == 1
     assert stuck[0].levelname == "ERROR"

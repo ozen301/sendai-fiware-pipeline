@@ -116,13 +116,15 @@ uv run python scripts/resend.py {flow|direction}
 3. For each window, call the same `_process_send_window` the cron
    runners use, but with **`interval_metadata` filtered to the
    place/entity-id selection** so the transform step builds payloads
-   only for the requested targets. `expected_target_ids` is filtered to
-   the same set so window completion accounting stays consistent. (The
+   only for the requested targets. For Product A, completion state still
+   follows the normal observed-target rule (`stored ∪ observed`) and a
+   filtered resend never shrinks existing `expected_target_ids`. For
+   Product B, a new resend-created window uses the filtered fixed-target
+   set; an existing window keeps its stored first-attempt snapshot. (The
    transforms iterate `interval_metadata`/the metadata index when
-   constructing payloads; filtering `expected_target_ids` alone would
-   still POST to every active target and only narrow state
-   bookkeeping — that's the opposite of what `--place` means to an
-   operator.)
+   constructing payloads; filtering state bookkeeping alone would still
+   POST to every active target — that's the opposite of what `--place`
+   means to an operator.)
 4. `--force` flips the per-target skip: pass a flag through
    `_process_send_window` that causes the hash-skip check to be
    bypassed for this run. (Implementation detail: add a

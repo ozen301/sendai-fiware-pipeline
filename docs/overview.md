@@ -90,11 +90,13 @@ targets:
 - `pending` — a fresh attempt is in flight. Set at the start of every
   retry, so prior `ok` or `failed` target records may still be present
   underneath; the aggregate is only re-derived after the run finishes.
-- `partial` — the run finished with at least one expected target missing
-  or any target `failed`. The window is still eligible for the next
-  run's retry.
+- `partial` — the run finished with at least one expected target not yet
+  `ok` (still missing, `pending`, or `failed`). The window is still
+  eligible for the next run's retry.
 - `complete` — every entity id in `expected_target_ids` has a recorded
-  `ok` and no target is `failed`.
+  `ok`. What goes *into* `expected_target_ids` differs by product
+  (observed-union for Product A, fixed roster for Product B); see "Record
+  outcome" below.
 - `dead_letter` — operator-marked unrecoverable. Never retried.
 
 **Target status.** Per-target outcome: `ok` / `failed` / `pending`. Once
@@ -288,12 +290,27 @@ The five stages in plain words:
    of the payload bytes (used to detect "would this re-POST send the
    same value?" during retries). The window aggregate status (`pending`,
    `partial`, `complete`, `dead_letter`) is then recomputed against the
-   window's `expected_target_ids` — a stored set of entity ids that the
-   window's *first* attempt snapshotted from the active metadata. If
-   every id in that set has a recorded `ok` and nothing failed, the
-   window goes to `complete`; otherwise it stays `partial`. Snapshotting
-   the expected set up front prevents a mid-flight metadata change from
-   silently redefining what "complete" means for an in-progress window.
+   window's `expected_target_ids`. The two products define that set
+   differently:
+
+   - **Product A (per-place counts):** expected = the previously-stored
+     set **unioned with** the targets that produced a valid payload this
+     run. A per-place sensor that legitimately saw nobody emits no source
+     row, so that entity is simply never part of the window's expected
+     set — it does not block completion. The window therefore completes
+     against the targets it actually saw. A late row for a target that
+     was not seen yet is picked up by send-mode targeted supplemental
+     discovery (re-query the retained complete windows by exact
+     `startdate`) and expands the expected set on a later run.
+   - **Product B (inter-place flow):** every active target receives a
+     payload (a sentinel `null` when the place was silent), so expected
+     is the fixed roster snapshotted from active metadata on the window's
+     *first* attempt and is not expanded from current metadata on retry.
+     Snapshotting up front prevents a mid-flight metadata change from
+     silently redefining what "complete" means for an in-progress window.
+
+   In both cases the window goes to `complete` once every id in its
+   expected set has a recorded `ok`; otherwise it stays `partial`.
 
 ### A row's life — worked example (Product A)
 
@@ -365,13 +382,19 @@ one entry per id in `expected_target_ids`):
 }
 ```
 
-`expected_target_ids` is the set of entity ids this window's first
-attempt snapshotted from active metadata. The window only reaches
-`complete` once every id in that list has a `targets[…].status = "ok"`
-record and no target is `failed`; if any of the other 60-minute targets
-had returned 500 instead, this window would stay `partial` until the
-next run retries the failed ones (and the `105` target would not be
-re-POSTed because it's already `ok`).
+For Product A, `expected_target_ids` is the union of any
+previously-stored expected set and the targets this window produced a
+valid payload for this run — *not* the full active-metadata roster. A
+per-place sensor that saw nobody produces no source row, so its entity
+is simply absent from this set and does not hold the window in
+`partial`. The window reaches `complete` once every id in the set has a
+`targets[…].status = "ok"` record; if one of the targets had returned
+500 instead, the window would stay `partial` until the next run retries
+the failed ones (and the `105` target would not be re-POSTed because
+it's already `ok`). If a late source row later appears for an entity the
+window never saw, supplemental discovery re-queries that exact
+`startdate`, adds the entity to `expected_target_ids`, and POSTs it
+without re-sending the targets that are already `ok`.
 
 ### Product B differences
 
@@ -401,6 +424,14 @@ differences from Product A:
   `peopleCount_flow = {"from": {"all": null}, "to": {"all": null}}`.
   This keeps Comet history continuous even when a place was silent for
   the window.
+- **Completion is fixed-target, not observed-union.** Because every
+  active target always gets a payload, Product B's `expected_target_ids`
+  is the full roster snapshotted from active metadata on the window's
+  first attempt and is never expanded from current metadata on retry (a
+  metadata change mid-flight logs `window_expected_targets_changed` and
+  keeps the original snapshot). This is the opposite of Product A, whose
+  expected set grows from the targets actually observed. Product B has no
+  supplemental discovery pass.
 - **`null` vs `0`** matters and is preserved end-to-end: `null` means
   no observation, `0` means an observed zero. The two are semantically
   different and the pipeline never collapses one into the other.
@@ -437,6 +468,7 @@ sendai-fiware-pipeline-dev/
 │   ├── refresh_metadata.py       # rebuild metadata/sensors.csv from inputs
 │   ├── state_doctor.py           # read-only state inspection
 │   ├── state_repair.py           # repair aggregate status / dead-letter
+│   ├── migrate_flow_state.py     # one-off: migrate flow state to observed-target completion
 │   ├── resend.py                 # replay one or a range of source windows
 │   └── dev/                      # REPL/notebook probes — not production
 │

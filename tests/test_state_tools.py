@@ -14,6 +14,7 @@ from sendai_pipeline.state_tools import (
     diagnose_state,
     diagnoses_to_json,
     load_sensor_labels,
+    migrate_flow_state,
     repair_state,
     state_report_to_pretty,
 )
@@ -580,3 +581,212 @@ def test_repair_state_refuses_apply_without_explicit_windows(tmp_path: Path) -> 
             state_path=tmp_path / "state" / "flow.json",
             lock_path=tmp_path / "state" / "flow.lock",
         )
+
+
+def test_migrate_flow_state_apply_drops_empty_targets_window(tmp_path: Path) -> None:
+    path = tmp_path / "state" / "flow.json"
+    key = "per300/20260525_0640"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[ENTITY_1],
+                targets={},
+            )
+        },
+    )
+
+    result = migrate_flow_state(
+        apply=True,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.product == "flow"
+    assert result.dry_run is False
+    assert result.changes[0].window_key == key
+    assert result.changes[0].action == "dropped"
+    assert key not in WindowStateStore.load(path).as_dict()["windows"]
+
+
+def test_migrate_flow_state_apply_rederives_expected_and_completes_stuck_window(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    key = "per300/20260525_0640"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={ENTITY_1: _target("ok"), ENTITY_2: _target("ok")},
+            )
+        },
+    )
+
+    result = migrate_flow_state(
+        apply=True,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.changes[0].action == "recomputed"
+    assert result.changes[0].before_status == "partial"
+    assert result.changes[0].after_status == "complete"
+    window = WindowStateStore.load(path).as_dict()["windows"][key]
+    assert window["expected_target_ids"] == [ENTITY_1, ENTITY_2]
+    assert window["status"] == "complete"
+
+
+def test_migrate_flow_state_apply_keeps_failed_recorded_target_partial(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    key = "per300/20260525_0640"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={ENTITY_1: _target("ok"), ENTITY_2: _target("failed", 502)},
+            )
+        },
+    )
+
+    result = migrate_flow_state(
+        apply=True,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.changes[0].action == "recomputed"
+    assert result.changes[0].after_status == "partial"
+    window = WindowStateStore.load(path).as_dict()["windows"][key]
+    assert window["expected_target_ids"] == [ENTITY_1, ENTITY_2]
+    assert window["status"] == "partial"
+
+
+def test_migrate_flow_state_apply_includes_pending_and_ignores_invalid_targets(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    key = "per300/20260525_0640"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={
+                    ENTITY_1: _target("ok"),
+                    ENTITY_2: _target("pending", 0),
+                    ENTITY_3: _target("unknown"),
+                },
+            )
+        },
+    )
+
+    result = migrate_flow_state(
+        apply=True,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.changes[0].action == "recomputed"
+    assert result.changes[0].after_status == "partial"
+    window = WindowStateStore.load(path).as_dict()["windows"][key]
+    assert window["expected_target_ids"] == [ENTITY_1, ENTITY_2]
+    assert window["status"] == "partial"
+
+
+def test_migrate_flow_state_apply_leaves_dead_letter_window_unchanged(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    key = "per300/20260525_0640"
+    dead_letter = _window(
+        key=key,
+        status="dead_letter",
+        expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+        targets={},
+    )
+    dead_letter["dead_letter_reason"] = "operator reviewed"
+    _write_state(path, {key: dead_letter})
+
+    result = migrate_flow_state(
+        apply=True,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.changes == ()
+    assert WindowStateStore.load(path).as_dict()["windows"][key] == dead_letter
+
+
+def test_migrate_flow_state_apply_writes_backup_with_pre_migration_state(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    key = "per300/20260525_0640"
+    before_window = _window(
+        key=key,
+        expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+        targets={ENTITY_1: _target("ok"), ENTITY_2: _target("ok")},
+    )
+    _write_state(path, {key: before_window})
+
+    result = migrate_flow_state(
+        apply=True,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.backup_path is not None
+    assert result.backup_path.exists()
+    assert (
+        WindowStateStore.load(result.backup_path).as_dict()["windows"][key]
+        == before_window
+    )
+
+
+def test_migrate_flow_state_dry_run_reports_plan_without_writing(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    drop_key = "per300/20260525_0640"
+    recompute_key = "per300/20260525_0645"
+    _write_state(
+        path,
+        {
+            drop_key: _window(
+                key=drop_key,
+                expected=[ENTITY_1],
+                targets={},
+            ),
+            recompute_key: _window(
+                key=recompute_key,
+                expected=[ENTITY_1, ENTITY_2, ENTITY_3],
+                targets={ENTITY_1: _target("ok"), ENTITY_2: _target("ok")},
+            ),
+        },
+    )
+    before = path.read_text(encoding="utf-8")
+
+    result = migrate_flow_state(
+        apply=False,
+        state_path=path,
+        lock_path=tmp_path / "state" / "flow.lock",
+    )
+
+    assert result.dry_run is True
+    assert result.backup_path is None
+    assert [(change.window_key, change.action) for change in result.changes] == [
+        (drop_key, "dropped"),
+        (recompute_key, "recomputed"),
+    ]
+    assert result.changes[1].before_status == "partial"
+    assert result.changes[1].after_status == "complete"
+    assert path.read_text(encoding="utf-8") == before

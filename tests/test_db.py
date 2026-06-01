@@ -12,6 +12,7 @@ from sendai_pipeline.db import (
     connect,
     select_direction_metrics,
     select_flow_metrics,
+    select_flow_metrics_for_startdates,
 )
 
 EXPECTED_FLOW_SQL = " ".join(
@@ -23,6 +24,19 @@ EXPECTED_FLOW_SQL = " ".join(
     WHERE interval_min = %s
       AND startdate >= %s
       AND startdate <= %s
+      AND imputation_tier <= %s
+    ORDER BY startdate, group_place_id
+    """.split()
+)
+
+EXPECTED_FLOW_STARTDATES_SQL = " ".join(
+    """
+    SELECT startdate, group_place_id, device_type, interval_min,
+           flow_gt_m60, flow_gt_m80, flow_gt_m120,
+           stay_gt_m60, stay_gt_m80
+    FROM flow_metrics2_per_place2_agg_imputed
+    WHERE interval_min = %s
+      AND startdate IN (%s, %s, %s)
       AND imputation_tier <= %s
     ORDER BY startdate, group_place_id
     """.split()
@@ -252,8 +266,10 @@ class FakeConnection:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self._cursor = FakeCursor(rows or [])
         self.close_calls = 0
+        self.cursor_calls = 0
 
     def cursor(self) -> FakeCursor:
+        self.cursor_calls += 1
         return self._cursor
 
     def close(self) -> None:
@@ -296,6 +312,58 @@ def test_select_flow_metrics_emits_exact_sql_and_returns_rows() -> None:
     sql, params = connection._cursor.executed[0]
     assert _normalize_sql(sql) == EXPECTED_FLOW_SQL
     assert params == (60, "20260513_0500", "20260513_0700", 2)
+
+
+def test_select_flow_metrics_for_startdates_emits_in_clause_and_returns_rows() -> None:
+    rows = [
+        {
+            "startdate": "20260513_0700",
+            "group_place_id": "sendai2023.10",
+            "device_type": "Pixel3aUT",
+            "interval_min": 60,
+            "flow_gt_m60": 1,
+            "flow_gt_m80": 2,
+            "flow_gt_m120": 3,
+            "stay_gt_m60": 4,
+            "stay_gt_m80": 5,
+        }
+    ]
+    connection = FakeConnection(rows)
+
+    result = select_flow_metrics_for_startdates(  # type: ignore[arg-type]
+        connection,
+        interval_min=60,
+        startdates=("20260513_0500", "20260513_0600", "20260513_0700"),
+        max_imputation_tier=2,
+    )
+
+    assert result == rows
+    assert len(connection._cursor.executed) == 1
+    sql, params = connection._cursor.executed[0]
+    assert _normalize_sql(sql) == EXPECTED_FLOW_STARTDATES_SQL
+    assert params == (
+        60,
+        "20260513_0500",
+        "20260513_0600",
+        "20260513_0700",
+        2,
+    )
+
+
+def test_select_flow_metrics_for_startdates_empty_startdates_skips_cursor() -> None:
+    connection = FakeConnection([{"startdate": "20260513_0700"}])
+
+    result = select_flow_metrics_for_startdates(  # type: ignore[arg-type]
+        connection,
+        interval_min=60,
+        startdates=[],
+        max_imputation_tier=2,
+    )
+
+    assert result == []
+    assert connection.cursor_calls == 0
+    assert connection._cursor.executed == []
+    assert connection._cursor.entered is False
 
 
 def test_select_direction_metrics_emits_exact_sql_and_returns_rows() -> None:

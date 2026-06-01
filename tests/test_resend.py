@@ -1,4 +1,5 @@
 import importlib
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -417,6 +418,68 @@ def test_resend_place_filter_filters_expected_target_ids_consistently(
     assert calls[0].expected_target_ids == calls[0].interval_entity_ids == [ENTITY_10]
 
 
+def test_resend_flow_place_filter_posts_requested_target_but_preserves_stored_expected(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = [
+        {
+            "startdate": "20260524_1000",
+            "group_place_id": "sendai202603.10",
+            "device_type": "M5Stack",
+            "interval_min": 60,
+            "flow_gt_m60": 6,
+            "flow_gt_m80": 237,
+            "flow_gt_m120": 430,
+            "stay_gt_m60": 0.2,
+            "stay_gt_m80": 40.9,
+            "imputation_tier": 0,
+        }
+    ]
+    state_path = tmp_path / "state" / "flow.json"
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "windows": {
+                    "per3600/20260524_1000": {
+                        "first_seen": "2026-05-24T13:00:00+09:00",
+                        "last_attempt": "2026-05-24T13:00:00+09:00",
+                        "attempt_count": 1,
+                        "interval_min": 60,
+                        "source_window_start": "2026-05-24T10:00:00+09:00",
+                        "source_window_end": "2026-05-24T11:00:00+09:00",
+                        "expected_target_ids": [ENTITY_10, ENTITY_11],
+                        "targets": {},
+                        "status": "partial",
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _call_main(
+        resend,
+        _base_args(send=True) + ["--place", "10", "--force"],
+    )
+
+    assert result == 0
+    assert [call["entity_id"] for call in orion.calls] == [ENTITY_10]
+    window = json.loads(state_path.read_text(encoding="utf-8"))["windows"][
+        "per3600/20260524_1000"
+    ]
+    assert window["expected_target_ids"] == [ENTITY_10, ENTITY_11]
+    assert window["status"] == "partial"
+    assert sorted(window["targets"]) == [ENTITY_10]
+
+
 def test_resend_multiple_place_flags_narrow_to_intersection(
     tmp_path: Path,
     metadata_path: Path,
@@ -741,6 +804,51 @@ def _patch_send_dependencies(
         lambda _settings, *, auth: orion,
     )
     return db_connection
+
+
+def _patch_real_send_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    resend: Any,
+) -> tuple[FakeDbConnection, FakeOrionClient]:
+    db_connection = FakeDbConnection()
+    orion = FakeOrionClient()
+
+    _patch_module_attr(
+        monkeypatch, resend, "db", db, "connect", lambda _settings: db_connection
+    )
+    monkeypatch.setattr(db, "connect", lambda _settings: db_connection)
+    _patch_select_metrics(monkeypatch, resend, db_connection)
+
+    monkeypatch.setattr(auth.AuthSettings, "from_env", staticmethod(lambda: object()))
+    monkeypatch.setattr(auth, "AuthClient", lambda _settings: object())
+    _patch_module_attr(
+        monkeypatch,
+        resend,
+        "auth",
+        auth,
+        "AuthClient",
+        lambda _settings: object(),
+    )
+
+    monkeypatch.setattr(
+        orion_client.OrionSettings,
+        "from_env",
+        staticmethod(lambda: object()),
+    )
+    monkeypatch.setattr(
+        orion_client,
+        "OrionClient",
+        lambda _settings, *, auth: orion,
+    )
+    _patch_module_attr(
+        monkeypatch,
+        resend,
+        "orion_client",
+        orion_client,
+        "OrionClient",
+        lambda _settings, *, auth: orion,
+    )
+    return db_connection, orion
 
 
 def _patch_process_windows(

@@ -155,7 +155,9 @@ class WindowStateStore:
             source_window_end: Exclusive source window end. Derived from start
                 plus interval when omitted.
             expected_target_ids: Entity IDs expected for this source window.
-                New windows snapshot this set; retries must use the same set.
+                New windows snapshot this set. Retries that provide a non-empty
+                set replace the stored snapshot; retries that omit it preserve
+                the stored snapshot.
         """
         timestamp = self._now().isoformat()
         windows = self._windows()
@@ -184,14 +186,10 @@ class WindowStateStore:
             raise StateValidationError(f"cannot retry dead-letter window: {window_key}")
 
         self._ensure_window_metadata(window_key, window, metadata)
-        if "expected_target_ids" not in window or (
-            not window["expected_target_ids"] and expected
-        ):
+        if expected:
             window["expected_target_ids"] = expected
-        elif expected and window["expected_target_ids"] != expected:
-            raise StateValidationError(
-                f"expected targets changed for window {window_key}"
-            )
+        else:
+            window.setdefault("expected_target_ids", [])
 
         window["last_attempt"] = timestamp
         window["attempt_count"] = int(window.get("attempt_count", 0)) + 1
@@ -245,19 +243,30 @@ class WindowStateStore:
         window_key: str,
         expected_target_ids: Iterable[str] | None = None,
     ) -> str:
-        """Recompute, store, and return a window's aggregate status."""
+        """Recompute, store, and return a window's aggregate status.
+
+        Args:
+            window_key: Stable key for the source aggregation window.
+            expected_target_ids: Optional expected entity IDs. A non-empty
+                value replaces the stored snapshot; omitting it uses the stored
+                snapshot.
+
+        Returns:
+            The updated aggregate window status.
+
+        Raises:
+            StateValidationError: If the window has not been started or the
+                effective expected target set is empty.
+        """
         window = self._window(window_key)
         targets = window.setdefault("targets", {})
-        expected = _normalized_expected_target_ids(expected_target_ids)
-        stored_expected = window.get("expected_target_ids")
-        if stored_expected is None or (not stored_expected and expected):
-            window["expected_target_ids"] = expected
-        elif expected and stored_expected != expected:
-            raise StateValidationError(
-                f"expected targets changed for window {window_key}"
-            )
+        if expected_target_ids is None:
+            stored_expected = window.get("expected_target_ids")
+            expected = list(stored_expected) if stored_expected is not None else []
         else:
-            expected = list(stored_expected)
+            expected = _normalized_expected_target_ids(expected_target_ids)
+        if expected:
+            window["expected_target_ids"] = expected
 
         if not expected:
             raise StateValidationError(
@@ -267,26 +276,27 @@ class WindowStateStore:
         all_expected_ok = all(
             targets.get(entity_id, {}).get("status") == "ok" for entity_id in expected
         )
-        any_failed = any(
-            target.get("status") == "failed" for target in targets.values()
-        )
 
-        status = "complete" if all_expected_ok and not any_failed else "partial"
+        status = "complete" if all_expected_ok else "partial"
         window["status"] = status
         return status
 
     def gc_complete_before(self, cutoff: datetime) -> int:
-        """Remove complete windows whose last attempt is strictly before cutoff.
+        """Remove complete windows whose source start is strictly before cutoff.
 
-        Complete-window retention is based on when the window was healed, not
-        on the source timestamp that retry lookback uses for open windows.
+        Args:
+            cutoff: Source-window start cutoff. Complete windows older than
+                this timestamp are removed.
+
+        Returns:
+            Number of complete windows removed.
         """
         windows = self._windows()
         remove_keys = [
             key
             for key, window in windows.items()
             if window.get("status") == "complete"
-            and datetime.fromisoformat(window["last_attempt"]) < cutoff
+            and self.source_window_start(key, window) < cutoff
         ]
 
         for key in remove_keys:
@@ -312,6 +322,25 @@ class WindowStateStore:
         ]
         open_windows.sort(key=lambda item: self.retry_anchor(item[0], item[1]))
         return iter(open_windows)
+
+    def iter_complete_windows(self) -> Iterator[tuple[str, dict[str, Any]]]:
+        """Yield complete windows sorted by source start time, then key.
+
+        The yielded window dictionaries are live state. Callers should treat
+        them as read-only.
+
+        Returns:
+            Iterator of ``(window_key, window)`` pairs.
+        """
+        complete_windows = [
+            (key, window)
+            for key, window in self._windows().items()
+            if window.get("status") == "complete"
+        ]
+        complete_windows.sort(
+            key=lambda item: (self.source_window_start(*item), item[0])
+        )
+        return iter(complete_windows)
 
     def source_window_start(
         self,

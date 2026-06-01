@@ -2,7 +2,7 @@
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Self
 
@@ -23,6 +23,17 @@ FROM {FLOW_METRICS_TABLE}
 WHERE interval_min = %s
   AND startdate >= %s
   AND startdate <= %s
+  AND imputation_tier <= %s
+ORDER BY startdate, group_place_id
+"""
+
+_FLOW_METRICS_FOR_STARTDATES_SQL_TEMPLATE = f"""
+SELECT startdate, group_place_id, device_type, interval_min,
+       flow_gt_m60, flow_gt_m80, flow_gt_m120,
+       stay_gt_m60, stay_gt_m80
+FROM {FLOW_METRICS_TABLE}
+WHERE interval_min = %s
+  AND startdate IN ({{placeholders}})
   AND imputation_tier <= %s
 ORDER BY startdate, group_place_id
 """
@@ -108,6 +119,28 @@ def select_flow_metrics(
         cursor.execute(
             _FLOW_METRICS_SQL,
             (interval_min, lower_bound, upper_bound, max_imputation_tier),
+        )
+        return cursor.fetchall()
+
+
+def select_flow_metrics_for_startdates(
+    connection: Any,
+    *,
+    interval_min: int,
+    startdates: Iterable[str],
+    max_imputation_tier: int,
+) -> list[dict[str, Any]]:
+    """Return flow metric rows for exact source-window start dates."""
+    startdate_values = tuple(startdates)
+    if not startdate_values:
+        return []
+
+    placeholders = ", ".join("%s" for _ in startdate_values)
+    sql = _FLOW_METRICS_FOR_STARTDATES_SQL_TEMPLATE.format(placeholders=placeholders)
+    with connection.cursor() as cursor:
+        cursor.execute(
+            sql,
+            (interval_min, *startdate_values, max_imputation_tier),
         )
         return cursor.fetchall()
 

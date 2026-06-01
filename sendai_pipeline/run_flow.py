@@ -413,15 +413,15 @@ def _process_interval(
         interval_min,
         source_stability_delay_hours=settings.source_stability_delay_hours,
     )
+    normal_lower_bound = cutoff - timedelta(hours=lookback_hours)
     rows = db.select_flow_metrics(
         db_connection,
         interval_min=interval_min,
-        lower_bound=_format_sql_window_bound(cutoff - timedelta(hours=lookback_hours)),
+        lower_bound=_format_sql_window_bound(normal_lower_bound),
         upper_bound=_format_sql_window_bound(cutoff),
         max_imputation_tier=filter_settings.source_max_imputation_tier,
     )
     interval_metadata = _metadata_index_for_interval(metadata_index, interval_min)
-    expected_target_ids = [place.entity_id for place in interval_metadata.values()]
 
     for startdate, rows_for_window in _group_rows_by_startdate(rows):
         window_key = _window_key(interval_min, startdate)
@@ -437,7 +437,7 @@ def _process_interval(
                 state_store=state_store,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata,
-                expected_target_ids=expected_target_ids,
+                expected_target_ids=(),
                 counts=counts,
             )
         else:
@@ -450,6 +450,18 @@ def _process_interval(
             )
 
     if settings.send_mode == "send":
+        _process_supplemental_complete_windows(
+            interval_min,
+            db_connection=db_connection,
+            orion=orion,
+            state_store=state_store,
+            settings=settings,
+            filter_settings=filter_settings,
+            interval_metadata=interval_metadata,
+            cutoff=cutoff,
+            normal_lower_bound=normal_lower_bound,
+            counts=counts,
+        )
         _log_windows_near_retry_horizon(
             state_store,
             interval_min=interval_min,
@@ -472,18 +484,38 @@ def _process_send_window(
     expected_target_ids: Iterable[str],
     counts: _RunCounts,
     force_resend: bool = False,
-) -> None:
-    """Post one source window and update persistent per-target state."""
+    skip_if_no_new_target: bool = False,
+) -> bool:
+    """Post one source window and update persistent per-target state.
+
+    Flow windows derive their expected target set from targets observed in
+    transformed source rows unioned with any stored snapshot for the same
+    window. The ``expected_target_ids`` argument is accepted to keep this
+    helper's call surface aligned with Product B, but Product A does not use it
+    to shrink or expand state; callers filter ``interval_metadata`` to control
+    which payloads are built.
+    """
     source_start = _parse_source_window_start(startdate)
+    payloads = transform_flow_rows(
+        rows_for_window,
+        interval_metadata,
+        ignored_place_prefixes=filter_settings.ignored_place_prefixes,
+    )
+    observed_target_ids = _payload_target_ids(payloads)
+    if skip_if_no_new_target:
+        stored_target_ids = set(state_store.expected_target_ids(window_key) or ())
+        if set(observed_target_ids) <= stored_target_ids:
+            return False
+
+    counts.rows_dropped += len(rows_for_window) - len(payloads)
     effective_expected_target_ids = _effective_expected_target_ids(
         state_store,
         window_key,
-        expected_target_ids,
+        observed_target_ids=observed_target_ids,
     )
-    effective_metadata = _metadata_for_expected_targets(
-        interval_metadata,
-        effective_expected_target_ids,
-    )
+    if not effective_expected_target_ids:
+        return False
+
     state_store.begin_window_attempt(
         window_key,
         interval_min=interval_min,
@@ -491,12 +523,6 @@ def _process_send_window(
         source_window_end=source_start + timedelta(minutes=interval_min),
         expected_target_ids=effective_expected_target_ids,
     )
-    payloads = transform_flow_rows(
-        rows_for_window,
-        effective_metadata,
-        ignored_place_prefixes=filter_settings.ignored_place_prefixes,
-    )
-    counts.rows_dropped += len(rows_for_window) - len(payloads)
 
     for payload in payloads:
         payload_sha256 = _attrs_sha256(payload["attrs"])
@@ -562,40 +588,78 @@ def _process_send_window(
     elif status == "dead_letter":
         counts.windows_dead_letter += 1
 
+    return True
+
+
+def _process_supplemental_complete_windows(
+    interval_min: int,
+    *,
+    db_connection: _DbConnection,
+    orion: _OrionForFlow,
+    state_store: WindowStateStore,
+    settings: RunFlowSettings,
+    filter_settings: FilterSettings,
+    interval_metadata: Mapping[tuple[int, int], SensorPlace],
+    cutoff: datetime,
+    normal_lower_bound: datetime,
+    counts: _RunCounts,
+) -> None:
+    """Re-query retained complete windows older than the normal source range."""
+    prefix = f"{_INTERVAL_PREFIXES[interval_min]}/"
+    horizon = cutoff - timedelta(hours=_max_lookback_hours(settings, interval_min))
+    eligible_windows: list[tuple[str, str]] = []
+
+    for window_key, window in state_store.iter_complete_windows():
+        if not window_key.startswith(prefix):
+            continue
+        source_window_start = state_store.source_window_start(window_key, window)
+        if horizon <= source_window_start < normal_lower_bound:
+            eligible_windows.append((window_key, window_key[len(prefix) :]))
+
+    if not eligible_windows:
+        return
+
+    startdates = [startdate for _, startdate in eligible_windows]
+    rows = db.select_flow_metrics_for_startdates(
+        db_connection,
+        interval_min=interval_min,
+        startdates=startdates,
+        max_imputation_tier=filter_settings.source_max_imputation_tier,
+    )
+    rows_by_startdate = dict(_group_rows_by_startdate(rows))
+
+    for window_key, startdate in eligible_windows:
+        attempted = _process_send_window(
+            window_key,
+            interval_min=interval_min,
+            startdate=startdate,
+            rows_for_window=rows_by_startdate.get(startdate, []),
+            orion=orion,
+            state_store=state_store,
+            filter_settings=filter_settings,
+            interval_metadata=interval_metadata,
+            expected_target_ids=(),
+            counts=counts,
+            skip_if_no_new_target=True,
+        )
+        if attempted:
+            counts.windows_seen += 1
+
 
 def _effective_expected_target_ids(
     state_store: WindowStateStore,
     window_key: str,
-    configured_expected_target_ids: Iterable[str],
+    *,
+    observed_target_ids: Iterable[str],
 ) -> list[str]:
     """Return the target set this attempt must honor for one window."""
-    configured = sorted(set(configured_expected_target_ids))
     stored = state_store.expected_target_ids(window_key)
-    if not stored:
-        return configured
-    if stored != configured:
-        _lifecycle_logger.warning(
-            "window expected targets differ from active metadata",
-            extra={
-                "event": "window_expected_targets_changed",
-                "window": window_key,
-                "count_expected": len(stored),
-                "count_live": len(configured),
-            },
-        )
-    return stored
+    return sorted(set(stored or ()).union(observed_target_ids))
 
 
-def _metadata_for_expected_targets(
-    interval_metadata: Mapping[tuple[int, int], SensorPlace],
-    expected_target_ids: Iterable[str],
-) -> dict[tuple[int, int], SensorPlace]:
-    expected = set(expected_target_ids)
-    return {
-        key: place
-        for key, place in interval_metadata.items()
-        if place.entity_id in expected
-    }
+def _payload_target_ids(payloads: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Return unique target entity IDs observed in transformed payloads."""
+    return sorted({str(payload["entity_id"]) for payload in payloads})
 
 
 def _process_dry_run_window(

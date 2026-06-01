@@ -19,7 +19,7 @@ Tools fall into six groups:
 | **Metadata** | [`refresh_metadata.py`](#refresh_metadatapy) |
 | **Inspect Orion / Comet** | [`show_data.py`](#show_datapy) |
 | **Delete Orion / Comet** | [`delete_entities.py`](#delete_entitiespy), [`delete_history.py`](#delete_historypy), [`delete_subscriptions.py`](#delete_subscriptionspy) |
-| **Inspect / repair state** | [`state_doctor.py`](#state_doctorpy), [`state_repair.py`](#state_repairpy) |
+| **Inspect / repair state** | [`state_doctor.py`](#state_doctorpy), [`state_repair.py`](#state_repairpy), [`migrate_flow_state.py`](#migrate_flow_statepy) |
 | **Replay** | [`resend.py`](#resendpy) |
 
 A symptom-keyed troubleshooting index is at the [bottom of this
@@ -409,6 +409,37 @@ uv run python scripts/state_repair.py direction \
 Do not edit `state/*.json` by hand. Always go through this tool so
 the backup, lock acquisition, and reload-and-verify steps happen.
 
+### `migrate_flow_state.py`
+
+One-off migration that converts **flow** state written under the old
+full-roster completion model to the observed-target model: it re-derives
+each window's `expected_target_ids` from the targets actually recorded,
+recomputes the aggregate status, and drops windows that recorded no
+targets. `dead_letter` windows are left untouched. Dry-run is the
+default; `--apply` mutates state under the flow product lock, writes a
+timestamped `.bak` backup under `state/`, and reloads-and-verifies the
+result. Flow-only — there is no `product` argument and direction state
+is never touched.
+
+```
+uv run python scripts/migrate_flow_state.py [--apply]
+```
+
+| Flag | Purpose |
+|---|---|
+| `--apply` | Actually mutate `state/flow.json`. Omit for dry-run (default). |
+
+```sh
+# Preview what would change, then apply.
+uv run python scripts/migrate_flow_state.py
+uv run python scripts/migrate_flow_state.py --apply
+```
+
+Run this once, after deploying the observed-target completion change, to
+clear flow windows that were stuck `partial` only because a never-seen
+target sat in their old expected roster. It is idempotent and safe to
+re-run.
+
 ---
 
 ## Replay
@@ -453,6 +484,12 @@ unchanged payload hashes are skipped (the same code path as normal
 send-mode retries) — so resend is safe to use even when a window is
 already partly complete. Pass `--force` when the intent is to
 redeliver values that haven't changed.
+
+For Product A, `--place` / `--entity-id` limits which flow payloads are
+built and POSTed, but it does not shrink a retained window's
+`expected_target_ids`; completion remains `stored ∪ observed`. For
+Product B, filtered resends create a filtered fixed-target set only when
+the window has no stored snapshot yet.
 
 Examples:
 

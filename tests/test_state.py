@@ -437,31 +437,54 @@ def test_gc_complete_before_removes_only_old_complete_windows(tmp_path: Path) ->
     _write_state(
         path,
         {
-            "old_complete": _window(
-                first_seen=T0,
-                last_attempt=T0,
-                status="complete",
-            ),
-            "recent_complete": _window(
-                first_seen=T0,
-                last_attempt=T4,
-                status="complete",
-            ),
-            "old_dead_letter": _window(
-                first_seen=T0,
-                last_attempt=T0,
-                status="dead_letter",
-            ),
-            "old_partial": _window(
-                first_seen=T0,
-                last_attempt=T0,
-                status="partial",
-            ),
-            "old_pending": _window(
-                first_seen=T0,
-                last_attempt=T0,
-                status="pending",
-            ),
+            "old_source_recent_attempt_complete": {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T4,
+                    status="complete",
+                ),
+                **_window_metadata(
+                    source_window_start=datetime(2026, 5, 13, 6, 0, 0, tzinfo=JST),
+                ),
+            },
+            "recent_source_old_attempt_complete": {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T0,
+                    status="complete",
+                ),
+                **_window_metadata(source_window_start=T2),
+            },
+            "old_source_dead_letter": {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T4,
+                    status="dead_letter",
+                ),
+                **_window_metadata(
+                    source_window_start=datetime(2026, 5, 13, 6, 0, 0, tzinfo=JST),
+                ),
+            },
+            "old_source_partial": {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T4,
+                    status="partial",
+                ),
+                **_window_metadata(
+                    source_window_start=datetime(2026, 5, 13, 6, 0, 0, tzinfo=JST),
+                ),
+            },
+            "old_source_pending": {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T4,
+                    status="pending",
+                ),
+                **_window_metadata(
+                    source_window_start=datetime(2026, 5, 13, 6, 0, 0, tzinfo=JST),
+                ),
+            },
         },
     )
     store = WindowStateStore.load(path, now=Clock([T5]))
@@ -470,11 +493,41 @@ def test_gc_complete_before_removes_only_old_complete_windows(tmp_path: Path) ->
 
     assert removed == 1
     assert set(store.as_dict()["windows"]) == {
-        "recent_complete",
-        "old_dead_letter",
-        "old_partial",
-        "old_pending",
+        "recent_source_old_attempt_complete",
+        "old_source_dead_letter",
+        "old_source_partial",
+        "old_source_pending",
     }
+
+
+def test_gc_complete_before_uses_legacy_key_source_window_start(
+    tmp_path: Path,
+) -> None:
+    path = _state_path(tmp_path)
+    _write_state(
+        path,
+        {
+            WINDOW_EARLY: _window(
+                first_seen=T0,
+                last_attempt=T4,
+                status="complete",
+            ),
+            WINDOW_LATER: _window(
+                first_seen=T0,
+                last_attempt=T0,
+                status="complete",
+            ),
+        },
+    )
+    store = WindowStateStore.load(path, now=Clock([T5]))
+
+    # Cutoff sits strictly between the two windows' key-derived source starts
+    # (06:00 and 08:00). Both windows' last_attempt values are >= the cutoff,
+    # so removing exactly the early window proves GC keys on source-window age.
+    removed = store.gc_complete_before(T0)
+
+    assert removed == 1
+    assert set(store.as_dict()["windows"]) == {WINDOW_LATER}
 
 
 def test_iter_open_windows_returns_pending_and_partial_sorted_by_first_seen(
@@ -511,6 +564,69 @@ def test_iter_open_windows_returns_pending_and_partial_sorted_by_first_seen(
     keys = [key for key, _window_data in store.iter_open_windows()]
 
     assert keys == [WINDOW, WINDOW_LATER]
+
+
+def test_iter_complete_windows_returns_complete_sorted_by_source_start_then_key(
+    tmp_path: Path,
+) -> None:
+    path = _state_path(tmp_path)
+    same_source = datetime(2026, 5, 13, 7, 0, 0, tzinfo=JST)
+    _write_state(
+        path,
+        {
+            "per3600/20260513_0700_b": {
+                **_window(
+                    first_seen=T2,
+                    last_attempt=T2,
+                    status="complete",
+                ),
+                **_window_metadata(source_window_start=same_source),
+            },
+            WINDOW_LATER: {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T0,
+                    status="complete",
+                ),
+                **_window_metadata(source_window_start=T2),
+            },
+            "per3600/20260513_0700_a": {
+                **_window(
+                    first_seen=T1,
+                    last_attempt=T1,
+                    status="complete",
+                ),
+                **_window_metadata(source_window_start=same_source),
+            },
+            WINDOW_EARLY: {
+                **_window(
+                    first_seen=T0,
+                    last_attempt=T0,
+                    status="partial",
+                ),
+                **_window_metadata(
+                    source_window_start=datetime(2026, 5, 13, 6, 0, 0, tzinfo=JST),
+                ),
+            },
+            "per3600/20260513_0500": _window(
+                first_seen=T0,
+                last_attempt=T0,
+                status="dead_letter",
+            ),
+        },
+    )
+    store = WindowStateStore.load(path, now=Clock([T5]))
+
+    complete_windows = list(store.iter_complete_windows())
+
+    assert [key for key, _window_data in complete_windows] == [
+        "per3600/20260513_0700_a",
+        "per3600/20260513_0700_b",
+        WINDOW_LATER,
+    ]
+    assert (
+        complete_windows[0][1] is store.as_dict()["windows"]["per3600/20260513_0700_a"]
+    )
 
 
 def test_summary_counts_returns_window_and_target_status_totals(
@@ -612,6 +728,39 @@ def test_pending_target_status_does_not_satisfy_completion(tmp_path: Path) -> No
     assert counts["partial"] == 1
 
 
+def test_recompute_status_ignores_failed_targets_outside_expected(
+    tmp_path: Path,
+) -> None:
+    store = WindowStateStore(_state_path(tmp_path), now=Clock([T0, T1, T2, T3]))
+    store.begin_window_attempt(WINDOW, expected_target_ids=[ENTITY_10, ENTITY_11])
+    store.record_target(
+        WINDOW,
+        ENTITY_10,
+        status="ok",
+        http_status=204,
+        payload_sha256=HASH_A,
+    )
+    store.record_target(
+        WINDOW,
+        ENTITY_11,
+        status="ok",
+        http_status=204,
+        payload_sha256=HASH_B,
+    )
+    store.record_target(
+        WINDOW,
+        ENTITY_12,
+        status="failed",
+        http_status=502,
+        payload_sha256=HASH_C,
+    )
+
+    status = store.recompute_status(WINDOW)
+
+    assert status == "complete"
+    assert store.as_dict()["windows"][WINDOW]["status"] == "complete"
+
+
 def test_begin_window_attempt_records_explicit_source_metadata_and_expected_targets(
     tmp_path: Path,
 ) -> None:
@@ -656,7 +805,36 @@ def test_load_legacy_state_derives_source_window_start_from_key(tmp_path: Path) 
     )
 
 
-def test_recompute_status_rejects_changed_expected_target_snapshot(
+def test_recompute_status_overwrites_changed_expected_target_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = WindowStateStore(_state_path(tmp_path), now=Clock([T0, T1, T2]))
+    store.begin_window_attempt(WINDOW, expected_target_ids=[ENTITY_10])
+    store.record_target(
+        WINDOW,
+        ENTITY_10,
+        status="ok",
+        http_status=204,
+        payload_sha256=HASH_A,
+    )
+    store.record_target(
+        WINDOW,
+        ENTITY_11,
+        status="ok",
+        http_status=204,
+        payload_sha256=HASH_B,
+    )
+
+    status = store.recompute_status(
+        WINDOW,
+        expected_target_ids=[ENTITY_11, ENTITY_10, ENTITY_11],
+    )
+
+    assert status == "complete"
+    assert store.expected_target_ids(WINDOW) == [ENTITY_10, ENTITY_11]
+
+
+def test_recompute_status_uses_stored_expected_target_snapshot_when_omitted(
     tmp_path: Path,
 ) -> None:
     store = WindowStateStore(_state_path(tmp_path), now=Clock([T0, T1]))
@@ -669,8 +847,10 @@ def test_recompute_status_rejects_changed_expected_target_snapshot(
         payload_sha256=HASH_A,
     )
 
-    with pytest.raises(StateValidationError, match="expected targets changed"):
-        store.recompute_status(WINDOW, expected_target_ids=[ENTITY_10, ENTITY_11])
+    status = store.recompute_status(WINDOW)
+
+    assert status == "complete"
+    assert store.expected_target_ids(WINDOW) == [ENTITY_10]
 
 
 def test_recompute_status_rejects_empty_expected_target_set(tmp_path: Path) -> None:
@@ -681,14 +861,46 @@ def test_recompute_status_rejects_empty_expected_target_set(tmp_path: Path) -> N
         store.recompute_status(WINDOW)
 
 
-def test_begin_window_attempt_rejects_changed_expected_targets_on_retry(
+def test_recompute_status_rejects_empty_provided_expected_target_set(
+    tmp_path: Path,
+) -> None:
+    store = WindowStateStore(_state_path(tmp_path), now=Clock([T0]))
+    store.begin_window_attempt(WINDOW)
+
+    with pytest.raises(StateValidationError, match="no expected targets"):
+        store.recompute_status(WINDOW, expected_target_ids=[])
+
+
+def test_begin_window_attempt_overwrites_changed_expected_targets_on_retry(
     tmp_path: Path,
 ) -> None:
     store = WindowStateStore(_state_path(tmp_path), now=Clock([T0, T1]))
     store.begin_window_attempt(WINDOW, expected_target_ids=[ENTITY_10])
 
-    with pytest.raises(StateValidationError, match="expected targets changed"):
-        store.begin_window_attempt(WINDOW, expected_target_ids=[ENTITY_11])
+    store.begin_window_attempt(
+        WINDOW,
+        expected_target_ids=[ENTITY_11, ENTITY_10, ENTITY_11],
+    )
+
+    window = store.as_dict()["windows"][WINDOW]
+    assert window["expected_target_ids"] == [ENTITY_10, ENTITY_11]
+    assert window["attempt_count"] == 2
+    assert window["last_attempt"] == T1.isoformat()
+    assert window["status"] == "pending"
+
+
+def test_begin_window_attempt_preserves_expected_targets_when_retry_omits_them(
+    tmp_path: Path,
+) -> None:
+    store = WindowStateStore(_state_path(tmp_path), now=Clock([T0, T1]))
+    store.begin_window_attempt(WINDOW, expected_target_ids=[ENTITY_10])
+
+    store.begin_window_attempt(WINDOW)
+
+    window = store.as_dict()["windows"][WINDOW]
+    assert window["expected_target_ids"] == [ENTITY_10]
+    assert window["attempt_count"] == 2
+    assert window["last_attempt"] == T1.isoformat()
 
 
 def test_begin_window_attempt_rejects_dead_letter_retry(tmp_path: Path) -> None:

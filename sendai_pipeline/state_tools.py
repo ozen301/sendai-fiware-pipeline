@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from sendai_pipeline.metadata import MetadataLoadError, SensorPlace, load_metadata
 from sendai_pipeline.state import JST, StateValidationError, WindowStateStore
@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 ProductName = Literal["flow", "direction"]
 RepairAction = Literal["recompute_complete", "dead_letter"]
+FlowMigrationAction = Literal["recomputed", "dropped"]
 ExpectedTargetSource = Literal["stored", "derived"]
 
 PRODUCT_STATE_PATHS: dict[ProductName, Path] = {
@@ -29,6 +30,7 @@ PRODUCT_LOCK_PATHS: dict[ProductName, Path] = {
     "direction": Path("state/direction.lock"),
 }
 _DEFAULT_MAX_LOOKBACK_HOURS: dict[int, int] = {5: 72, 60: 72}
+_FLOW_MIGRATION_TARGET_STATUSES: frozenset[str] = frozenset({"ok", "failed", "pending"})
 
 
 @dataclass(frozen=True)
@@ -105,6 +107,43 @@ class RepairResult:
     dry_run: bool
     backup_path: Path | None
     changes: tuple[RepairChange, ...]
+
+
+@dataclass(frozen=True)
+class FlowMigrationChange:
+    """One flow state migration mutation planned or applied.
+
+    Attributes:
+        window_key: Stable key for the migrated source window.
+        action: Migration action taken for the window.
+        before_status: Aggregate status before migration.
+        after_status: Aggregate status after recompute, or ``None`` when
+            the window is dropped.
+        expected_target_ids: Derived target IDs recorded for the window.
+    """
+
+    window_key: str
+    action: FlowMigrationAction
+    before_status: str
+    after_status: str | None
+    expected_target_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class FlowMigrationResult:
+    """Summary of a dry-run or applied flow state migration.
+
+    Attributes:
+        product: Product name. This migration is always flow-only.
+        dry_run: Whether the state file was left unchanged.
+        backup_path: Timestamped pre-migration backup path, when applied.
+        changes: Planned or applied per-window migration changes.
+    """
+
+    product: ProductName
+    dry_run: bool
+    backup_path: Path | None
+    changes: tuple[FlowMigrationChange, ...]
 
 
 def load_product_state(product: ProductName) -> WindowStateStore:
@@ -275,6 +314,80 @@ def repair_state(
         },
     )
     return RepairResult(
+        product,
+        dry_run=False,
+        backup_path=backup_path,
+        changes=changes,
+    )
+
+
+def migrate_flow_state(
+    *,
+    apply: bool = False,
+    state_path: Path | None = None,
+    lock_path: Path | None = None,
+) -> FlowMigrationResult:
+    """Re-derive retained flow windows from recorded deliverable targets.
+
+    Args:
+        apply: When false, plan without writing. When true, mutate the flow
+            state file under the product lock.
+        state_path: Optional flow state file override.
+        lock_path: Optional flow lock file override.
+
+    Returns:
+        Summary of planned or applied migration changes.
+
+    Raises:
+        StateValidationError: If backup, save, reload, or verification fails.
+    """
+    product: ProductName = "flow"
+    resolved_state_path = state_path or PRODUCT_STATE_PATHS[product]
+    resolved_lock_path = lock_path or PRODUCT_LOCK_PATHS[product]
+
+    if not apply:
+        store = WindowStateStore.load(resolved_state_path)
+        window_count = len(_state_windows(store))
+        changes = tuple(_plan_flow_migration_changes(store))
+        logger.info(
+            "flow state migration dry-run",
+            extra={
+                "event": "flow_state_migration_dry_run",
+                "product": product,
+                "windows_seen": window_count,
+                **_flow_migration_log_counts(changes),
+            },
+        )
+        return FlowMigrationResult(
+            product,
+            dry_run=True,
+            backup_path=None,
+            changes=changes,
+        )
+
+    resolved_lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_lock_path.open("a", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        store = WindowStateStore.load(resolved_state_path)
+        window_count = len(_state_windows(store))
+        backup_path = _backup_state_file(resolved_state_path)
+        changes = tuple(_apply_flow_migration_changes(store))
+        store.save()
+        reloaded = WindowStateStore.load(resolved_state_path)
+        _verify_flow_migration_applied(reloaded, changes)
+
+    logger.info(
+        "flow state migration applied",
+        extra={
+            "event": "flow_state_migration_applied",
+            "product": product,
+            "path": str(resolved_state_path),
+            "backup_path": str(backup_path),
+            "windows_seen": window_count,
+            **_flow_migration_log_counts(changes),
+        },
+    )
+    return FlowMigrationResult(
         product,
         dry_run=False,
         backup_path=backup_path,
@@ -518,6 +631,119 @@ def _window(store: WindowStateStore, window_key: str) -> dict[str, Any]:
     return window
 
 
+def _state_windows(store: WindowStateStore) -> dict[str, Any]:
+    windows = store.as_dict().get("windows")
+    if not isinstance(windows, dict):
+        raise StateValidationError("state windows must be an object")
+    return cast(dict[str, Any], windows)
+
+
+def _plan_flow_migration_changes(
+    store: WindowStateStore,
+) -> tuple[FlowMigrationChange, ...]:
+    changes: list[FlowMigrationChange] = []
+    windows = _state_windows(store)
+    for window_key in sorted(windows):
+        window = windows[window_key]
+        if not isinstance(window, dict):
+            continue
+        change = _plan_flow_migration_change(window_key, window)
+        if change is not None:
+            changes.append(change)
+    return tuple(changes)
+
+
+def _plan_flow_migration_change(
+    window_key: str,
+    window: dict[str, Any],
+) -> FlowMigrationChange | None:
+    before = str(window.get("status", ""))
+    if before == "dead_letter":
+        return None
+    expected = tuple(_derived_flow_target_ids(window))
+    if not expected:
+        return FlowMigrationChange(
+            window_key=window_key,
+            action="dropped",
+            before_status=before,
+            after_status=None,
+            expected_target_ids=(),
+        )
+    return FlowMigrationChange(
+        window_key=window_key,
+        action="recomputed",
+        before_status=before,
+        after_status=_planned_flow_migration_status(window, expected),
+        expected_target_ids=expected,
+    )
+
+
+def _apply_flow_migration_changes(
+    store: WindowStateStore,
+) -> tuple[FlowMigrationChange, ...]:
+    changes: list[FlowMigrationChange] = []
+    windows = _state_windows(store)
+    for window_key in sorted(tuple(windows)):
+        window = windows[window_key]
+        if not isinstance(window, dict):
+            continue
+        before = str(window.get("status", ""))
+        if before == "dead_letter":
+            continue
+        expected = _derived_flow_target_ids(window)
+        if not expected:
+            del windows[window_key]
+            changes.append(
+                FlowMigrationChange(
+                    window_key=window_key,
+                    action="dropped",
+                    before_status=before,
+                    after_status=None,
+                    expected_target_ids=(),
+                )
+            )
+            continue
+        window["expected_target_ids"] = expected
+        after = store.recompute_status(window_key, expected_target_ids=expected)
+        changes.append(
+            FlowMigrationChange(
+                window_key=window_key,
+                action="recomputed",
+                before_status=before,
+                after_status=after,
+                expected_target_ids=tuple(expected),
+            )
+        )
+    return tuple(changes)
+
+
+def _derived_flow_target_ids(window: dict[str, Any]) -> list[str]:
+    targets = window.get("targets", {})
+    if not isinstance(targets, dict):
+        return []
+    return sorted(
+        entity_id
+        for entity_id, target in targets.items()
+        if isinstance(entity_id, str)
+        and isinstance(target, Mapping)
+        and target.get("status") in _FLOW_MIGRATION_TARGET_STATUSES
+    )
+
+
+def _planned_flow_migration_status(
+    window: dict[str, Any],
+    expected_target_ids: Iterable[str],
+) -> str:
+    targets = window.get("targets", {})
+    if not isinstance(targets, Mapping):
+        return "partial"
+    for entity_id in expected_target_ids:
+        target = targets.get(entity_id)
+        if not isinstance(target, Mapping) or target.get("status") != "ok":
+            return "partial"
+    return "complete"
+
+
 def _backup_state_file(state_path: Path) -> Path:
     if not state_path.exists():
         raise StateValidationError(f"state file does not exist: {state_path}")
@@ -549,6 +775,46 @@ def _verify_repair_applied(
             raise StateValidationError(
                 f"repair verification failed for {change.window_key}"
             )
+
+
+def _verify_flow_migration_applied(
+    store: WindowStateStore,
+    changes: Iterable[FlowMigrationChange],
+) -> None:
+    windows = _state_windows(store)
+    for change in changes:
+        window = windows.get(change.window_key)
+        if change.action == "dropped":
+            if window is not None:
+                raise StateValidationError(
+                    f"flow migration verification failed for {change.window_key}"
+                )
+            continue
+        if not isinstance(window, dict):
+            raise StateValidationError(
+                f"flow migration verification failed for {change.window_key}"
+            )
+        if window.get("status") != change.after_status:
+            raise StateValidationError(
+                f"flow migration verification failed for {change.window_key}"
+            )
+        if window.get("expected_target_ids") != list(change.expected_target_ids):
+            raise StateValidationError(
+                f"flow migration verification failed for {change.window_key}"
+            )
+
+
+def _flow_migration_log_counts(
+    changes: Iterable[FlowMigrationChange],
+) -> dict[str, int]:
+    changes_tuple = tuple(changes)
+    dropped = sum(1 for change in changes_tuple if change.action == "dropped")
+    recomputed = sum(1 for change in changes_tuple if change.action == "recomputed")
+    return {
+        "windows_planned": len(changes_tuple),
+        "windows_dropped": dropped,
+        "windows_recomputed": recomputed,
+    }
 
 
 def _interval_from_key(window_key: str) -> int:
