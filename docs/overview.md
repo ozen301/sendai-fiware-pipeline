@@ -1,6 +1,6 @@
 # Pipeline Overview
 
-This is the maintainer-facing mental model for the Sendai FIWARE pipeline.
+This is the maintainer-facing overview for the Sendai FIWARE pipeline.
 Read this first; the other docs assume the vocabulary defined here.
 
 For the canonical data contract (exact column → attribute mapping,
@@ -23,8 +23,8 @@ entities:
 
 Both products write to the same per-place entities
 (`Blesensor.per3600.<N>` for 60-minute windows, `Blesensor.per300.<N>` for
-5-minute windows). They coexist safely because they own disjoint
-attributes: Product A writes `peopleCount_immedate/near/far` and
+5-minute windows). They coexist safely because their measurement
+attributes are disjoint: Product A writes `peopleCount_immedate/near/far` and
 `peopleOccupancy_immedate/near`, Product B writes `peopleCount_flow` (and
 also `identifcation` and `dateRetrieved`), and the few shared envelope
 attributes (`dateObservedFrom`, `dateObservedTo`) are computed identically
@@ -37,7 +37,70 @@ attribute with a `TimeInstant` NGSI metadata field carrying the source
 window's start time; Comet uses that tag as the history timestamp instead
 of the wall-clock time the POST arrived. That way the history record
 reflects "this measurement is for 10:00–11:00 JST" even if the POST
-actually landed at, say, 13:25.
+actually landed at, for instance, 13:25.
+
+---
+
+## Architecture at a glance
+
+Two independent pipelines, **Product A** (the flow runner) and
+**Product B** (the direction runner), read different tables in the
+same MySQL database and write to the same per-place FIWARE Orion
+entities every 5 minutes. They own disjoint measurement attributes on
+those entities (Product A the `peopleCount_*` / `peopleOccupancy_*`
+counts, Product B `peopleCount_flow`); both also stamp the shared
+`dateObservedFrom` / `dateObservedTo` timestamps, which they compute
+identically from the same source window, so those writes agree. As there is no
+other overlap, the two products coexist without coordination beyond
+their separate state files.
+
+```
+MySQL (bleData2025d)
+  ├── flow_metrics2_per_place2_agg_imputed ──► Product A (run_flow.py)
+  │                                              writes peopleCount_immedate/near/far
+  │                                              and peopleOccupancy_immedate/near
+  │
+  └── direction_metrics2_per_place2_agg    ──► Product B (run_direction.py)
+                                                 writes peopleCount_flow
+
+Both products ──► same Orion entities (jp.sendai.Blesensor.per{300,3600}.<N>)
+                  ──► STH-Comet history (via Orion subscription)
+```
+
+Each product is coordinated across cron runs by its own JSON state
+file (`state/flow.json` / `state/direction.json`). The state file
+records which `(window, entity)` targets have already received a
+successful POST; without it every run would re-POST the same windows
+and create duplicate STH-Comet history rows.
+
+Both runners publish two aggregation intervals — 5-minute and
+60-minute — and are staggered by 2 minutes in cron to spread load:
+
+```
+:00  :02  :04  :05  :06  :07  :09  :10  :12  :14  :15 ...
+      ^         ^         ^         ^         ^
+      A         B         A         B         A         (repeats)
+```
+
+Key timing concepts (see the Vocabulary section for exact definitions):
+
+```
+Timeline for one window (example: 60-min window covering 10:00–11:00 JST)
+
+   10:00 ──── source window starts
+   11:00 ──── source window closes (start + 60 min)
+   13:00 ──── earliest eligible publish (window start + SOURCE_STABILITY_DELAY_HOURS (defaults to 3h))
+   13:02 ──── cron fires → pipeline reads MySQL, POSTs to Orion, writes state
+   (retry) ── partial/failed targets retried every 5 min
+   10:00+72h ─ retry horizon (MAX_LOOKBACK_HOURS_PER3600 = 72h): last chance
+                for the normal run to pick up this window
+```
+
+The **rolling lookback** (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`)
+is the normal-run look-back floor for discovering new windows. The
+**retry horizon** (`MAX_LOOKBACK_HOURS_PER300` / `MAX_LOOKBACK_HOURS_PER3600`,
+both 72h by default) is the outer limit — open windows (i.e., windows that are not fully complete) older than this
+are not retried automatically.
 
 ## Vocabulary
 
@@ -133,9 +196,22 @@ authoritative; the pipeline reads the value verbatim from the
 status and every target's last POST outcome. In `send` mode the file is
 rewritten atomically after each target's POST and once more near the
 end of the run (for retention GC); in `dry-run` mode it is not
-touched. This is the pipeline's memory between cron invocations —
-without it, every run would re-POST every window in its lookback range
-(see "Retry horizon" below) and create duplicate Comet history rows.
+touched.
+
+The state file is the pipeline's memory between cron invocations and
+the mechanism that makes it history-idempotent: because STH-Comet
+records a new time-series row every time a value is re-POSTed, any
+target that has already received an `ok` is permanently skipped on
+subsequent runs, even if the source aggregate changes later. Without
+the state file, every run would re-POST every window in its rolling
+lookback range and fill Comet history with duplicates.
+
+**`null` vs `0`.** For all numeric attributes, `null` means "no
+observation was recorded," and `0` means "observed zero." The two are
+semantically different and the pipeline preserves both: 
+nullable source values are sent as JSON `null`, never coerced to `0`.
+This matters most for `peopleCount_flow` (Product B), where a missing
+value and a confirmed empty movement are distinct cases.
 
 **Source stability delay.** `SOURCE_STABILITY_DELAY_HOURS` (default 3h).
 A window is eligible to publish only if its source `startdate` is at or
@@ -149,6 +225,12 @@ to 10:00, so the latest 60-minute window the pipeline will touch is the
 one *starting* at 10:00 (i.e. 10:00–11:00); the 11:00–12:00 window is
 held back until at least 14:00.
 
+**Rolling lookback.** `REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`
+(default 2h for 5-min windows, 12h for 60-min windows). The minimum
+look-back floor the normal run uses when discovering new windows. A
+window that the state file already knows about (i.e. open) is picked up
+regardless of this floor, until it ages past the retry horizon.
+
 **Retry horizon.** `MAX_LOOKBACK_HOURS_PER300` /
 `MAX_LOOKBACK_HOURS_PER3600` (both 72h by default). The maximum age at
 which an *open window* — one whose state is still `pending` or `partial`
@@ -156,7 +238,7 @@ because some target hasn't reported `ok` yet — is still retried by the
 normal run. In our case, source rows can arrive at MySQL up to 3 days
 late, so both intervals default to 72h regardless of aggregation type.
 Windows older than the horizon are not picked up by the normal run; they
-require an explicit operator backfill.
+require an explicit operator resend (`scripts/resend.py --allow-old`).
 
 ## End-to-end data flow
 

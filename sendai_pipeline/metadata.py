@@ -39,7 +39,9 @@ class SensorPlace:
         interval_min: Aggregation interval in minutes.
         entity_type: FIWARE entity type read from metadata.
         entity_id: FIWARE entity id read from metadata.
-        identifcation: Attribute value for the platform's misspelled field.
+        identifcation: Attribute value for the platform's misspelled field
+            (``identifcation`` is intentionally misspelled — it matches the
+            live platform's attribute name; do not "fix" this spelling).
         active: Whether this metadata row should be used for publishing.
     """
 
@@ -60,7 +62,9 @@ def load_metadata(path: Path) -> list[SensorPlace]:
         path: CSV path to read.
 
     Returns:
-        Validated metadata rows in file order.
+        Validated :class:`SensorPlace` rows in file order.  All rows, including
+        both active and inactive, are returned; callers filter by
+        :func:`active_places` when they only want publishable targets.
 
     Raises:
         MetadataLoadError: If the file is missing, empty, or contains invalid
@@ -103,7 +107,12 @@ def active_places(
     *,
     target_batches: Iterable[str],
 ) -> list[SensorPlace]:
-    """Return active places whose batch is in the requested batch set."""
+    """Return active places whose batch is in the requested batch set.
+
+    Preserves the original iteration order of *places*; no additional sorting
+    is applied.  Callers that need a stable order should sort the result
+    themselves, or rely on the iteration order of the source CSV.
+    """
     batches = set(target_batches)
     return [place for place in places if place.active and place.batch in batches]
 
@@ -113,14 +122,20 @@ def index_by_place_interval(
 ) -> dict[tuple[int, int], SensorPlace]:
     """Index places by ``(place_number, interval_min)``.
 
+    Each ``(place_number, interval_min)`` pair must be unique across *places*;
+    the uniqueness guarantee is what lets transform helpers use a direct
+    ``dict.get`` lookup without resolving ambiguity.
+
     Args:
         places: Metadata rows to index.
 
     Returns:
-        Mapping from place and interval to the matching metadata row.
+        Mapping from ``(place_number, interval_min)`` to the matching row,
+        e.g. ``{(10, 5): <SensorPlace>, (10, 60): <SensorPlace>}``.
 
     Raises:
-        MetadataLoadError: If more than one row has the same key.
+        MetadataLoadError: If more than one row has the same
+            ``(place_number, interval_min)`` key.
     """
     index: dict[tuple[int, int], SensorPlace] = {}
     for place in places:

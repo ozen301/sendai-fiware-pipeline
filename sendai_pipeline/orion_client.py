@@ -369,7 +369,12 @@ class OrionClient:
         return response.json()
 
     def _attrs_url(self, entity_id: str, entity_type: str | None) -> str:
-        """Return the entity attributes endpoint URL."""
+        """Return the NGSI v2 entity attributes endpoint URL.
+
+        Appends ``?type=<entity_type>`` when ``entity_type`` is provided so
+        Orion can unambiguously identify the target entity when multiple
+        entities share the same id under different types.
+        """
         url = f"{self.settings.base_url}/orion/v2.0/entities/{entity_id}/attrs"
         if entity_type is not None:
             url = f"{url}?type={entity_type}"
@@ -399,7 +404,27 @@ class OrionClient:
         response: Any,
         backoff_index: int,
     ) -> tuple[float | None, bool]:
-        """Return retry delay and whether the standard backoff was consumed."""
+        """Determine the retry delay for a failed (non-2xx) response.
+
+        Only 429 and 5xx are retryable; every other status (including a
+        second consecutive 401 — the first one triggers a token refresh in
+        ``update_attrs`` and never reaches here) falls through to the
+        terminal ``(None, False)`` case.
+
+        Returns:
+            A ``(delay, advance_backoff)`` tuple where:
+
+            - ``delay`` is the number of seconds to sleep before the next
+              attempt, or ``None`` if the error is terminal (no retry).
+            - ``advance_backoff`` is ``True`` when the standard exponential
+              backoff index should be incremented after sleeping (i.e. a
+              server-error retry), or ``False`` when a ``Retry-After`` header
+              provided an explicit delay (so the backoff sequence is preserved
+              for subsequent retries).
+
+            Example: a 429 with ``Retry-After: 5`` returns ``(5.0, False)``;
+            a 503 returns ``(self._backoff_delay(backoff_index), True)``.
+        """
         status = response.status_code
         if status == 429:
             retry_after = _parse_retry_after(response.headers.get("Retry-After"))
@@ -413,7 +438,12 @@ class OrionClient:
         return None, False
 
     def _backoff_delay(self, index: int) -> float:
-        """Return the exponential retry delay for a retry index."""
+        """Return the exponential retry delay in seconds for a given index.
+
+        Produces the sequence 1, 2, 4, 8, 16 seconds for indices 0-4, which
+        aligns with ``max_retries=5`` (up to 5 additional attempts after the
+        first failure).
+        """
         return float(2**index)
 
     def _log_post_result(
@@ -429,7 +459,15 @@ class OrionClient:
         dry_run: bool,
         payload_mode: str,
     ) -> str | None:
-        """Emit the terminal POST log record and return any response excerpt."""
+        """Emit the terminal POST log record and return any response excerpt.
+
+        Logs at INFO on success (``post_succeeded``) and ERROR on failure
+        (``post_failed``).  On failure, returns the truncated
+        ``response_excerpt`` string when one is present so callers can surface
+        it in the result dict; returns ``None`` on success, and also on
+        failure in ``hash`` payload mode, where no ``response_excerpt`` field
+        is produced.
+        """
         fields = payload_log_fields(
             body_bytes,
             response_text,

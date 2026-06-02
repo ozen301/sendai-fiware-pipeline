@@ -172,6 +172,8 @@ def diagnose_state(
         )
         for window_key, window in store.iter_open_windows()
     ]
+    # Sort by source_window_start (oldest first), then by window_key as a
+    # tie-breaker, so the output order is fully deterministic.
     diagnoses.sort(key=lambda item: (item.source_window_start, item.window_key))
     logger.info(
         "state doctor reported",
@@ -416,6 +418,8 @@ def _diagnose_window(
     failed_http_statuses: set[int] = set()
     failed_target_ids: list[str] = []
     failed_target_http_statuses: list[int | None] = []
+
+    # Tally per-target statuses to determine the aggregate category below.
     for entity_id in expected:
         target = targets.get(entity_id)
         if not isinstance(target, dict):
@@ -432,6 +436,10 @@ def _diagnose_window(
                 failed_target_http_statuses.append(http_status)
             else:
                 failed_target_http_statuses.append(None)
+
+    # Assign the target-status category: all_ok when every expected target
+    # succeeded, all_failed when every one failed, mixed for anything between
+    # (including pending targets that have not been attempted yet).
     if expected and ok_count == len(expected):
         category = "all_ok"
     elif expected and failed_count == len(expected):
@@ -827,6 +835,13 @@ def _positive_int_env(
     key: str,
     default: int,
 ) -> int:
+    """Return a positive integer environment variable, or *default* if unset.
+
+    Raises:
+        ValueError: If the variable is set to a non-positive integer.  Note
+            that a non-integer value raises ``ValueError`` from ``int()``
+            directly, which propagates to the caller without a custom message.
+    """
     raw = values.get(key)
     if raw is None or raw == "":
         return default
@@ -861,6 +876,8 @@ def _summarize_target_issues(
         )
         for entity_id, windows in windows_by_entity.items()
     ]
+    # Sort by descending count (most-affected targets first), with entity_id
+    # as a tie-breaker to make the order fully deterministic.
     summaries.sort(key=lambda item: (-item.count, item.entity_id))
     return tuple(summaries)
 

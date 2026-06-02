@@ -146,6 +146,10 @@ class WindowStateStore:
     ) -> None:
         """Start or retry a window attempt.
 
+        For new windows, this creates the full window record and snapshots the
+        expected target set.  For retries, it increments ``attempt_count`` and
+        resets ``status`` to ``"pending"``.
+
         Args:
             window_key: Stable key for the source aggregation window.
             interval_min: Source aggregation interval. Derived from the key
@@ -155,9 +159,11 @@ class WindowStateStore:
             source_window_end: Exclusive source window end. Derived from start
                 plus interval when omitted.
             expected_target_ids: Entity IDs expected for this source window.
-                New windows snapshot this set. Retries that provide a non-empty
-                set replace the stored snapshot; retries that omit it preserve
-                the stored snapshot.
+                ``None`` or an empty iterable are both treated as "not
+                provided": new windows store an empty list; retries preserve
+                the stored snapshot.  A non-empty iterable replaces the stored
+                snapshot on a retry, so callers that want to expand the
+                expected set should pass the full new set explicitly.
         """
         timestamp = self._now().isoformat()
         windows = self._windows()
@@ -245,14 +251,24 @@ class WindowStateStore:
     ) -> str:
         """Recompute, store, and return a window's aggregate status.
 
+        The *aggregate status* summarises all target deliveries for the window:
+
+        - ``"complete"`` — every expected target has ``status == "ok"``.
+        - ``"partial"`` — at least one expected target does not have
+          ``status == "ok"`` (either ``"failed"`` or still ``"pending"``).
+
+        Dead-letter promotion is done separately via the repair tool; this
+        method never sets ``"dead_letter"``.
+
         Args:
             window_key: Stable key for the source aggregation window.
             expected_target_ids: Optional expected entity IDs. A non-empty
-                value replaces the stored snapshot; omitting it uses the stored
-                snapshot.
+                value replaces the stored snapshot; ``None`` or an empty
+                iterable uses the stored snapshot.
 
         Returns:
-            The updated aggregate window status.
+            The updated aggregate window status (``"complete"`` or
+            ``"partial"``).
 
         Raises:
             StateValidationError: If the window has not been started or the
@@ -286,7 +302,9 @@ class WindowStateStore:
 
         Args:
             cutoff: Source-window start cutoff. Complete windows older than
-                this timestamp are removed.
+                this timestamp are removed.  Windows whose source start equals
+                the cutoff are kept (strict ``<`` comparison), so the cutoff
+                boundary window is never prematurely dropped.
 
         Returns:
             Number of complete windows removed.
@@ -312,6 +330,10 @@ class WindowStateStore:
     def iter_open_windows(self) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield pending and partial windows sorted by retry anchor time.
 
+        Windows are sorted oldest-first by ``retry_anchor``, so callers that
+        expand the lookback horizon to cover the oldest open window see the
+        most urgent windows first.
+
         The yielded window dictionaries are live state. Callers should treat
         them as read-only.
         """
@@ -325,6 +347,11 @@ class WindowStateStore:
 
     def iter_complete_windows(self) -> Iterator[tuple[str, dict[str, Any]]]:
         """Yield complete windows sorted by source start time, then key.
+
+        Windows are sorted oldest-first by source start time; the key is used
+        as a tie-breaker so the order is fully deterministic.  This ordering
+        lets the supplemental-complete pass in ``run_flow`` process earlier
+        windows first.
 
         The yielded window dictionaries are live state. Callers should treat
         them as read-only.
@@ -347,7 +374,14 @@ class WindowStateStore:
         window_key: str,
         window: Mapping[str, Any] | None = None,
     ) -> datetime:
-        """Return a window's stored or legacy-derived source start time."""
+        """Return a window's stored or legacy-derived source start time.
+
+        Preferred path: reads ``source_window_start`` from the window dict (an
+        ISO-formatted string written by ``begin_window_attempt``).  Fallback
+        path (legacy windows that pre-date the field): derives the start time
+        directly from the ``YYYYMMDD_HHMM`` portion of the window key via
+        ``_derive_source_window_metadata``.
+        """
         data = self._windows().get(window_key) if window is None else window
         if isinstance(data, Mapping):
             raw_start = data.get("source_window_start")
@@ -356,7 +390,14 @@ class WindowStateStore:
         return _derive_source_window_metadata(window_key)["source_window_start"]
 
     def retry_anchor(self, window_key: str, window: Mapping[str, Any]) -> datetime:
-        """Return the timestamp used to size retry lookback for one window."""
+        """Return the timestamp used to size retry lookback for one window.
+
+        The anchor is ``min(first_seen, source_window_start)``.  Taking the
+        minimum ensures that windows first seen very recently but whose source
+        data is old are still reached by a sufficiently wide lookback, and that
+        windows with a recent source start but an old ``first_seen`` (e.g.
+        discovered late) expand the lookback to cover their first attempt time.
+        """
         first_seen = datetime.fromisoformat(str(window["first_seen"]))
         source_start = self.source_window_start(window_key, window)
         return min(first_seen, source_start)
@@ -387,6 +428,59 @@ class WindowStateStore:
         return counts
 
     def _windows(self) -> dict[str, dict[str, Any]]:
+        """Return the live ``windows`` mapping from internal state.
+
+        Each value is a per-window dict with the following keys:
+
+        - ``first_seen`` (str, ISO): timestamp when the window was first
+          observed by ``begin_window_attempt``.
+        - ``last_attempt`` (str, ISO): timestamp of the most recent attempt.
+        - ``attempt_count`` (int): number of times ``begin_window_attempt``
+          has been called for this window.
+        - ``expected_target_ids`` (list[str]): entity IDs expected to be
+          delivered for this window, e.g.
+          ``["jp.sendai.Blesensor.per300.10", "jp.sendai.Blesensor.per300.11"]``.
+        - ``targets`` (dict): per-entity delivery records; each value has
+          ``status``, ``last_attempt_at``, ``last_http_status``, and
+          ``last_payload_sha256``.
+        - ``status`` (str): aggregate window status — one of ``"pending"``,
+          ``"partial"``, ``"complete"``, or ``"dead_letter"``.
+        - ``interval_min`` (int): aggregation interval in minutes.
+        - ``source_window_start`` (str, ISO): inclusive start of the source
+          aggregation window.
+        - ``source_window_end`` (str, ISO): exclusive end of the source
+          aggregation window.
+
+        The last three keys (``interval_min``, ``source_window_start``,
+        ``source_window_end``) are window metadata. Windows written by an
+        older code version may lack them until a later run backfills them
+        via ``_ensure_window_metadata``; readers that need them should go
+        through ``source_window_start`` / ``_window_metadata``, which derive
+        a fallback when the stored value is missing.
+
+        Example::
+
+            {
+                "per300/20240601_1000": {
+                    "first_seen": "2024-06-01T10:05:00+09:00",
+                    "last_attempt": "2024-06-01T10:10:00+09:00",
+                    "attempt_count": 2,
+                    "expected_target_ids": ["jp.sendai.Blesensor.per300.10"],
+                    "targets": {
+                        "jp.sendai.Blesensor.per300.10": {
+                            "status": "ok",
+                            "last_attempt_at": "2024-06-01T10:10:00+09:00",
+                            "last_http_status": 204,
+                            "last_payload_sha256": "abc123...",
+                        }
+                    },
+                    "status": "complete",
+                    "interval_min": 5,
+                    "source_window_start": "2024-06-01T10:00:00+09:00",
+                    "source_window_end": "2024-06-01T10:05:00+09:00",
+                }
+            }
+        """
         return self._state["windows"]
 
     def _window(self, window_key: str) -> dict[str, Any]:
@@ -403,6 +497,17 @@ class WindowStateStore:
         source_window_start: datetime | None,
         source_window_end: datetime | None,
     ) -> dict[str, Any]:
+        """Build the metadata fields stored on a window record.
+
+        When ``interval_min`` or ``source_window_start`` is ``None``, falls
+        back to deriving both from the window key (legacy callers that do not
+        supply these explicitly).  ``source_window_end`` is computed from
+        start plus interval when not provided.
+
+        Returns:
+            Dict with ``interval_min``, ``source_window_start`` (ISO str),
+            and ``source_window_end`` (ISO str).
+        """
         if source_window_start is None or interval_min is None:
             derived = _derive_source_window_metadata(window_key)
             if source_window_start is None:
@@ -427,6 +532,14 @@ class WindowStateStore:
         window: dict[str, Any],
         metadata: Mapping[str, Any],
     ) -> None:
+        """Back-fill missing metadata fields on a legacy window record.
+
+        Writes ``interval_min``, ``source_window_start``, and
+        ``source_window_end`` into *window* only when those keys are absent,
+        so existing values are never overwritten.  The caller-supplied
+        *metadata* dict is applied first; any keys it does not cover are
+        derived from the window key.
+        """
         derived = _derive_source_window_metadata(window_key)
         for key, value in metadata.items():
             if key not in window:

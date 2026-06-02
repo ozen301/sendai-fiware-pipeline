@@ -29,9 +29,17 @@ def transform_flow_rows(
             metadata lookup.
 
     Returns:
-        Payload dictionaries containing ``entity_id``, ``entity_type``, and
-        ``attrs`` keys. Rows with unsupported intervals, configured noise
-        prefixes, unknown metadata keys, or device-type mismatches are omitted.
+        List of payload dicts, one per surviving row.  Each dict has keys
+        ``entity_id``, ``entity_type``, and ``attrs``.  The ``attrs`` dict
+        contains NGSI attribute objects for ``dateObservedFrom``,
+        ``dateObservedTo``, ``peopleCount_immedate`` (note: intentionally
+        misspelled to match the live platform), ``peopleCount_near``,
+        ``peopleCount_far``, ``peopleOccupancy_immedate``, and
+        ``peopleOccupancy_near``; each value follows the shape
+        ``{"type": <ngsi-type>, "value": <val>, "metadata": {"TimeInstant": ...}}``.
+        Rows with unsupported intervals, configured noise prefixes, unknown
+        metadata keys, or device-type mismatches are omitted (dropped rows are
+        not included in the returned list).
     """
     payloads: list[dict[str, Any]] = []
 
@@ -93,6 +101,7 @@ def transform_flow_rows(
 
 
 def _matched_prefix(value: str, prefixes: Iterable[str]) -> str | None:
+    """Return the first prefix that ``value`` starts with, or ``None``."""
     for prefix in prefixes:
         if value.startswith(prefix):
             return prefix

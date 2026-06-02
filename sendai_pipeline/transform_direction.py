@@ -18,6 +18,8 @@ _SOURCE_BATCH_PREFIXES = {
     "sendai202603.": "2026",
 }
 
+# _FlowSide  — one direction side: {"all": <int|None>, "101": <int|None>, ...}
+# _FlowValue — both sides:         {"from": _FlowSide, "to": _FlowSide}
 type _FlowSide = dict[str, int | None]
 type _FlowValue = dict[str, _FlowSide]
 
@@ -56,6 +58,23 @@ def transform_direction_rows(
 ) -> TransformDirectionResult:
     """Transform direction metric rows into Orion-ready attribute payloads.
 
+    Row filter cascade (in order):
+
+    1. **Interval check** — drop rows whose ``interval_min`` is not in
+       ``{5, 60}``.
+    2. **Noise-prefix check** — drop rows where either source place key
+       matches an ``ignored_place_prefixes`` entry (``ALL`` is exempt).
+    3. **Place resolution** — drop rows where either non-``ALL`` side
+       cannot be resolved to a metadata entry (unknown place number, batch
+       mismatch, or unparseable key).
+    4. **Self-loop check** — drop rows where both sides resolve to the
+       same place number.
+    5. **Device-type check** — drop rows whose ``from_device_type`` /
+       ``to_device_type`` do not match the expected type for the oldest
+       active batch of the interval.
+    6. **Accumulate** — surviving rows are merged into per-window
+       ``_FlowValue`` buckets.
+
     Args:
         rows: Source rows returned from a dict-style database cursor.
         metadata_index: Sensor metadata keyed by place number and aggregation
@@ -66,12 +85,35 @@ def transform_direction_rows(
             the current JST wall-clock time is used.
 
     Returns:
-        A ``TransformDirectionResult`` whose ``payloads`` carry ``entity_id``,
-        ``entity_type``, and ``attrs`` keys. Each supported source window emits
-        one payload for every active metadata target in the same interval.
-        Targets with no valid observations receive a ``peopleCount_flow``
-        sentinel with ``null`` all values. ``rows_dropped`` counts source rows
-        the transform filtered out before they could contribute to a payload.
+        A ``TransformDirectionResult`` whose ``payloads`` carry
+        ``entity_id``, ``entity_type``, and ``attrs`` keys.  For example::
+
+            {
+                "entity_id": "jp.sendai.Blesensor.per300.10",
+                "entity_type": "Blesensor.per300",
+                "attrs": {
+                    "peopleCount_flow": {
+                        "type": "StructuredValue",
+                        "value": {"from": {"all": 85}, "to": {"all": None}},
+                        ...
+                    },
+                    ...
+                },
+            }
+
+        Each supported source window emits one payload for every active
+        metadata target in the same interval.  Targets with no valid
+        observations receive a ``peopleCount_flow`` sentinel with
+        ``null`` ``all`` values (``{"from": {"all": None}, "to": {"all": None}}``).
+        ``rows_dropped`` counts source rows the filter cascade rejected, so
+        they contribute no flow value. The payload set is fixed by which
+        ``(startdate, interval)`` source windows get created — one payload per
+        active target per window, carrying the sentinel ``null`` values above
+        where no surviving row fed that target. A window is created as soon as
+        any row clears the interval and noise-prefix filters, so rows rejected
+        at those two early stages can keep a window (and its payloads) from
+        existing at all, while rows rejected at the later stages (place
+        resolution, self-loop, device type) leave the payload set unchanged.
     """
     active_index = {key: place for key, place in metadata_index.items() if place.active}
     active_places_by_interval = _active_places_by_interval(active_index.values())
@@ -292,6 +334,7 @@ def _matched_row_prefix(
 
 
 def _matched_prefix(value: str, prefixes: Iterable[str]) -> str | None:
+    """Return the first prefix that ``value`` starts with, or ``None``."""
     for prefix in prefixes:
         if value.startswith(prefix):
             return prefix
@@ -402,7 +445,13 @@ def _device_types_match(
 
 
 def _flow_for(window: _Window, place_number: int) -> _FlowValue:
-    """Return the mutable flow bucket for a place, seeding the sentinel on first use."""
+    """Return the mutable flow bucket for a place, seeding the sentinel on first use.
+
+    Callers mutate the returned dict directly, e.g.::
+
+        _flow_for(window, 10)["from"]["all"] = 85
+        _flow_for(window, 10)["to"]["101"] = 12
+    """
     return window.flows_by_place.setdefault(place_number, _sentinel_flow())
 
 
@@ -425,6 +474,8 @@ def _attrs(
     timeinstant_value = window.observed_from.isoformat()
 
     return {
+        # "identifcation" is intentionally misspelled — it matches the live
+        # platform's attribute name exactly.  Do not "fix" this spelling.
         "identifcation": {
             "type": "Text",
             "value": place.identifcation,
@@ -457,7 +508,15 @@ def _flow_value(window: _Window, place_number: int) -> _FlowValue:
     """Snapshot a place's flow bucket for payload emission.
 
     Returns a shallow copy so later mutations to the window's internal state
-    can't leak into already-emitted payloads.
+    cannot leak into already-emitted payloads.
+
+    Returns:
+        A ``_FlowValue`` snapshot, e.g.::
+
+            {"from": {"all": 85}, "to": {"all": None}}
+
+        Falls back to a sentinel (all ``None``) when the place has no
+        observations in this window.
     """
     observed = window.flows_by_place.get(place_number)
     if observed is None:

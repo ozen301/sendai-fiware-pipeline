@@ -468,13 +468,16 @@ def payload_log_fields(
 ) -> dict[str, Any]:
     """Build the ``extra`` fields describing a POST payload for logging.
 
-    Payload-mode matrix:
+    Per-mode keys returned:
 
-    - ``hash`` — always emits ``payload_sha256`` + ``payload_bytes`` only.
-    - ``failure`` — emits the hash on 2xx; on failure additionally emits
-      full ``payload`` and ``response_excerpt``.
-    - ``full`` — always emits full ``payload``; ``response_excerpt`` only
-      on failure.
+    - ``hash`` — always: ``payload_mode``, ``ok``, ``payload_sha256``,
+      ``payload_bytes`` (the last two are omitted when ``body_bytes`` is
+      ``None``).
+    - ``failure`` — on 2xx: same as ``hash``; on non-2xx: additionally
+      ``payload`` (truncated body text) and ``response_excerpt`` (when
+      ``response_text`` is not ``None``).
+    - ``full`` — always: same as ``hash`` plus ``payload``; additionally
+      ``response_excerpt`` on non-2xx (same condition as ``failure``).
 
     Oversize ``payload`` / ``response_excerpt`` values are truncated to
     ``payload_max_bytes`` / ``response_max_bytes`` with a visible marker

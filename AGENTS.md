@@ -112,12 +112,25 @@ implementation complete; they must be clean.
 ### Docstrings and Comments
 
 - Use Google-style docstrings for public modules, classes, and
-  functions.
+  functions. State what the function does and why (if not obvious).
+- When a parameter or return value is a `dict`/`list`/tuple whose
+  structure is not self-explanatory, document the keys and give a
+  short concrete example. However, skip it where the signature already
+  makes the shape obvious.
 - Add private-helper docstrings when purpose or behavior is not
   obvious.
-- Do not reference `docs/` paths or section labels from production
-  code, docstrings, comments, or runtime strings. Inline the actual
-  invariant or rationale instead — docs paths drift.
+- For dense or multi-step logic, add a brief lead-in comment that
+  narrates what the block does (the sequence of steps), above any
+  existing inline "why" notes.
+- Referencing a `docs/` file from code, docstrings, or comments is
+  allowed where it genuinely helps the reader. Inlining the invariant
+  or rationale is still fine when that reads better.
+- Writing style: keep prose friendly to non-native English speakers —
+  clear structure and accessible wording — while assuming a
+  technically fluent reader (use technical terms directly, no padding).
+  Clarity and accuracy lead: a well-structured longer sentence is fine
+  when it reads better, and precise technical terms beat
+  simpler but vaguer words. Target precise, professional, easy to read.
 
 ### Configuration
 

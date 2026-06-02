@@ -218,6 +218,13 @@ def run_direction(
 ) -> RunDirectionResult:
     """Publish direction metrics for the eligible reprocessing windows.
 
+    A *reprocessing window* is a source aggregation window whose
+    ``startdate`` falls within the lookback range that ends at the
+    stability cutoff.  A window is *eligible* when its source data is
+    old enough to have settled (controlled by
+    ``source_stability_delay_hours``) and young enough to still be
+    within the maximum lookback horizon.
+
     Args:
         db_connection: Database connection used by ``sendai_pipeline.db``.
         orion: Orion client or test double exposing ``update_attrs``.
@@ -228,7 +235,9 @@ def run_direction(
         now: Clock returning the run timestamp. Called once.
 
     Returns:
-        Run summary and exit code.
+        Run summary including ``exit_code``: ``1`` in send mode when any
+        partial windows, failed POSTs, or open windows remain after the
+        run; ``0`` otherwise (including dry-run).
     """
     run_started_at = _coerce_jst_datetime(now())
     target_batches = sorted(filter_settings.target_direction_batches)
@@ -286,6 +295,8 @@ def run_direction(
         )
 
     if settings.send_mode == "send":
+        # Use 2× the maximum lookback as the GC horizon — same reasoning as
+        # run_flow: keeps a safety margin for windows near the retry boundary.
         cutoff_gc = run_started_at - timedelta(
             hours=2
             * max(
@@ -382,7 +393,12 @@ def _validate_orion_targets(
     active_targets: Iterable[SensorPlace],
     orion: _OrionForDirection,
 ) -> None:
-    """Compare configured metadata targets with the live Orion entity set."""
+    """Compare configured metadata targets with the live Orion entity set.
+
+    Returns ``None`` — this function only logs; it never raises and never
+    blocks the run.  Missing targets do not stop publication because the POST
+    result for each entity is the authoritative delivery outcome.
+    """
     entity_map.validate_targets(
         active_targets,
         cast(orion_client.OrionClient, orion),
@@ -492,6 +508,15 @@ def _process_send_window(
         payload_sha256 = _attrs_sha256(payload["attrs"])
         entity_id = payload["entity_id"]
         prior = state_store.target_record(window_key, entity_id)
+        # Skip-on-unchanged: if the target already has status "ok" and the
+        # payload hash matches, the POST would be a no-op — skip it to avoid
+        # unnecessary traffic and latency.
+        #
+        # Skip-on-drift: if the hash differs but the prior status is "ok",
+        # the source data changed after the successful delivery.  Resending
+        # would overwrite a valid historical value with a revised one, which
+        # STH-Comet stores as duplicate history.  Log the divergence and skip
+        # so that operators can decide whether to force a resend.
         if not force_resend and prior is not None and prior.get("status") == "ok":
             prior_payload_sha256 = prior.get("last_payload_sha256")
             if prior_payload_sha256 == payload_sha256:
@@ -558,11 +583,24 @@ def _effective_expected_target_ids(
     window_key: str,
     configured_expected_target_ids: Iterable[str],
 ) -> list[str]:
-    """Return the target set this attempt must honor for one window."""
+    """Return the target set this attempt must respect for one window.
+
+    Product B pins the expected target set to the first attempt: once a window
+    has stored targets, those are used for all retries regardless of the
+    current active metadata.  This prevents the window from silently growing
+    or shrinking its target set mid-run when metadata changes between attempts.
+
+    When the stored set differs from the current metadata, a warning is emitted
+    so operators can detect configuration drift.  The stored set is still
+    respected — callers should use the repair tool to override it explicitly if
+    needed.
+    """
     configured = sorted(set(configured_expected_target_ids))
     stored = state_store.expected_target_ids(window_key)
     if not stored:
         return configured
+    # The stored set from a previous attempt differs from the current metadata:
+    # warn and keep the stored set to avoid partial-window surprises.
     if stored != configured:
         _lifecycle_logger.warning(
             "window expected targets differ from active metadata",

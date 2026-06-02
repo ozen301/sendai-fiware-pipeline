@@ -34,9 +34,8 @@ explicit ids win and `--place` is rejected with a config error (to
 prevent ambiguity).
 
 **Date range.** `--from` and `--to` accept either a source window key
-(`YYYYMMDD_HHMM`, JST, matching `state_backfill.py`) or an ISO-8601
-timestamp. Bounds are inclusive on both ends. Each tool documents which
-form it expects.
+(`YYYYMMDD_HHMM`, JST) or an ISO-8601 timestamp. Bounds are inclusive
+on both ends. Each tool documents which form it expects.
 
 **Dry-run.** Default. No live writes, no live deletes. Prints the
 planned action(s) and exits 0. `--send` flips to live mode.
@@ -56,29 +55,17 @@ Re-publish source-windows in a specified date range, optionally
 narrowed to a specific place or set of places, by replaying the
 runner-internal `_process_send_window` code path once per window.
 
-### Replaces `state_backfill.py`
+### Note
 
-`scripts/state_backfill.py` is removed; `resend.py` is its successor.
-The single-window case — what `state_backfill.py` did — is recovered
-by passing the same value to `--from` and `--to`:
+`resend.py` can be used for resending one or more windows.
+Pass the same value to `--from` and `--to` to resend exactly one window:
 
 ```sh
-# Old (state_backfill.py, removed):
-uv run python scripts/state_backfill.py flow \
-    --interval-min 60 --source-window 20260524_1000 \
-    --reason "payload fix" --send
-
-# New (resend.py):
 uv run python scripts/resend.py flow \
     --interval-min 60 \
     --from 20260524_1000 --to 20260524_1000 \
     --reason "payload fix" --send
 ```
-
-The troubleshooting playbook in
-[tools_and_troubleshooting.md](tools_and_troubleshooting.md) must be
-updated in the same change to point at `resend.py` for the "single
-window replay" escalation step.
 
 ### CLI
 
@@ -133,9 +120,8 @@ uv run python scripts/resend.py {flow|direction}
    today's behavior.)
 5. Dry-run prints, per window, the planned `(window_key, target_count,
    skipped_by_hash, would_post)` tuple and exits **before any MySQL
-   query, Orion auth token fetch, or Orion HTTP call** — matching the
-   safety property `state_backfill.py` had today (no live side effects,
-   no credentials required in dry-run).
+   query, Orion auth token fetch, or Orion HTTP call** (no live side
+   effects, no credentials required in dry-run).
 
 ### Safety
 
@@ -145,7 +131,8 @@ uv run python scripts/resend.py {flow|direction}
   exit (incl. exception).
 - **STH-Comet caveat:** re-POSTing a value creates a new Comet history
   row even when the Orion value is unchanged. `--force` makes this
-  explicit; without it, the hash-skip behavior matches `state_backfill`.
+  explicit; without it, targets whose stored payload hash matches the
+  new payload are skipped.
 - Range is capped at `MAX_LOOKBACK_HOURS_*` by default; pass
   `--allow-old` to go further back. Operator error here would be
   expensive to undo.
@@ -587,37 +574,19 @@ current behavior. The new `resend.py` script passes `True` when
 ### Logging
 
 Each new script uses the same `LoggingSettings.from_env()` +
-`configure_logging(..., product="<script-stem>")` pattern as
-`state_backfill.py`. Log file is `logs/<script-stem>.log` per the
+`configure_logging(..., product="<script-stem>")` pattern as the
+existing operator scripts. Log file is `logs/<script-stem>.log` per the
 existing convention.
 
 ---
 
 ## Documentation updates after implementation
 
-All four removed scripts (`state_backfill.py`, `check_entity.py`,
-`check_history.py`, `probe_sth_delete_range.py`) appear in multiple
-docs today. Each must be updated in the same change that removes the
-script:
-
-- [tools_and_troubleshooting.md](tools_and_troubleshooting.md):
-  - Remove the `state_backfill.py`, `check_entity.py`, `check_history.py`
-    sections.
-  - Add a new "Resend / Delete" group with one section per new tool,
-    matching the format of the existing `create_entities.py` section.
-  - Update the troubleshooting playbook step that escalates to
-    `state_backfill.py` (it should point at `resend.py`).
-- [README.md](../README.md):
-  - Update the "Common commands" snippet (currently shows
-    `check_entity.py` and `check_history.py`).
-- [docs/overview.md](overview.md):
-  - Update the repo map (currently lists `state_backfill.py`,
-    `check_entity.py`, `check_history.py`).
-- [docs/deployment.md](deployment.md):
-  - Audit for any references to the removed scripts and update.
-
-No changes needed to `pipeline_spec.md` — these are operator tools,
-not part of the data contract.
+The scripts described in this spec (`resend.py`, `show_data.py`,
+`delete_history.py`, `delete_entities.py`) have been implemented and
+the operator reference has moved to
+[tools_and_troubleshooting.md](tools_and_troubleshooting.md). Refer to
+that document for current usage; this spec preserves the design rationale.
 
 ---
 
@@ -634,18 +603,16 @@ not part of the data contract.
    scripts (see next section), not from collapsing the new ones into a
    multiplexer.
 
-## Repo cleanup performed in this change
+## Repo cleanup completed
 
-- **Remove `scripts/state_backfill.py`.** Superseded by `resend.py`
-  (single window = `--from X --to X`).
-- **Remove `scripts/check_entity.py`.** Superseded by
-  `show_data.py --source orion`.
-- **Remove `scripts/check_history.py`.** Superseded by
-  `show_data.py --source comet`.
-- **Remove `scripts/dev/probe_sth_delete_range.py`.** Inconclusive
+Superseded scripts removed during this change:
+
+- `scripts/resend.py` replaces the old single-window replay tool
+  (`--from X --to X`).
+- `show_data.py --source orion` replaces the old entity-check tool.
+- `show_data.py --source comet` replaces the old history-check tool.
+- `scripts/dev/probe_sth_delete_range.py` removed — inconclusive
   probe; swagger is authoritative.
-- **Keep `scripts/dev/probe_sth_delete.py`.** Authoritative
-  live-platform DELETE-reachability check; referenced from this spec.
 
 Net change to `scripts/`: −4 files, +4 files. Files in the directory
 stay the same in count, but each remaining file's purpose is

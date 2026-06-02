@@ -217,6 +217,13 @@ def run_flow(
 ) -> RunFlowResult:
     """Publish flow metrics for the eligible reprocessing windows.
 
+    A *reprocessing window* is a source aggregation window whose
+    ``startdate`` falls within the lookback range that ends at the
+    stability cutoff.  A window is *eligible* when its source data is
+    old enough to have settled (controlled by
+    ``source_stability_delay_hours``) and young enough to still be
+    within the maximum lookback horizon.
+
     Args:
         db_connection: Database connection used by ``sendai_pipeline.db``.
         orion: Orion client or test double exposing ``update_attrs``.
@@ -227,7 +234,9 @@ def run_flow(
         now: Clock returning the run timestamp. Called once.
 
     Returns:
-        Run summary and exit code.
+        Run summary including ``exit_code``: ``1`` in send mode when any
+        partial windows, failed POSTs, or open windows remain after the
+        run; ``0`` otherwise (including dry-run).
     """
     run_started_at = _coerce_jst_datetime(now())
     target_batches = sorted(filter_settings.target_flow_batches)
@@ -286,6 +295,11 @@ def run_flow(
         )
 
     if settings.send_mode == "send":
+        # Use 2× the maximum lookback as the GC horizon so that windows
+        # processed in a previous run at full lookback depth still have
+        # time to appear in the supplemental-complete pass before being
+        # removed.  A 1× cutoff would evict windows the moment they age
+        # past the retry range, leaving no safety margin.
         cutoff_gc = run_started_at - timedelta(
             hours=2
             * max(
@@ -384,9 +398,11 @@ def _validate_orion_targets(
 ) -> None:
     """Compare configured metadata targets with the live Orion entity set.
 
-    The entity-map module logs missing, extra, and potentially truncated
-    target sets. Missing targets do not stop the run because the POST result
-    for each entity is still the authoritative delivery outcome.
+    Returns ``None`` — this function only logs; it never raises and never
+    blocks the run.  The entity-map module logs missing, extra, and
+    potentially truncated target sets.  Missing targets do not stop the
+    run because the POST result for each entity is the authoritative
+    delivery outcome.
     """
     entity_map.validate_targets(
         active_targets,
@@ -528,6 +544,15 @@ def _process_send_window(
         payload_sha256 = _attrs_sha256(payload["attrs"])
         entity_id = payload["entity_id"]
         prior = state_store.target_record(window_key, entity_id)
+        # Skip-on-unchanged: if the target already has status "ok" and the
+        # payload hash matches, the POST would be a no-op — skip it to avoid
+        # unnecessary traffic and latency.
+        #
+        # Skip-on-drift: if the hash differs but the prior status is "ok",
+        # the source data changed after the successful delivery.  Resending
+        # would overwrite a valid historical value with a revised one, which
+        # STH-Comet stores as duplicate history.  Log the divergence and skip
+        # so that operators can decide whether to force a resend.
         if not force_resend and prior is not None and prior.get("status") == "ok":
             prior_payload_sha256 = prior.get("last_payload_sha256")
             if prior_payload_sha256 == payload_sha256:
@@ -652,13 +677,34 @@ def _effective_expected_target_ids(
     *,
     observed_target_ids: Iterable[str],
 ) -> list[str]:
-    """Return the target set this attempt must honor for one window."""
+    """Return the target set this attempt must respect for one window.
+
+    The result is the union of any previously stored expected targets and the
+    targets observed in the current transformation pass.  Stored targets take
+    precedence in the sense that they are never removed — once a target is
+    expected for a window it remains expected for all future retries.  The
+    union ensures that a target that was present in an earlier attempt but
+    absent from the current source rows (e.g. due to a partial DB result) is
+    still tracked as expected, rather than silently dropped.
+
+    Returns:
+        Sorted list of unique entity ID strings, e.g.
+        ``["jp.sendai.Blesensor.per300.10", "jp.sendai.Blesensor.per300.11"]``.
+        An empty list signals that no targets are known for this window; callers
+        should treat this as a no-op and skip the window.
+    """
     stored = state_store.expected_target_ids(window_key)
     return sorted(set(stored or ()).union(observed_target_ids))
 
 
 def _payload_target_ids(payloads: Iterable[Mapping[str, Any]]) -> list[str]:
-    """Return unique target entity IDs observed in transformed payloads."""
+    """Return unique target entity IDs observed in transformed payloads.
+
+    Returns:
+        Sorted list of unique ``entity_id`` strings extracted from the
+        payload dicts, e.g.
+        ``["jp.sendai.Blesensor.per300.10", "jp.sendai.Blesensor.per300.11"]``.
+    """
     return sorted({str(payload["entity_id"]) for payload in payloads})
 
 
@@ -828,7 +874,13 @@ def _oldest_non_complete(state_store: WindowStateStore) -> datetime | None:
 def _group_rows_by_startdate(
     rows: Iterable[_FlowRow],
 ) -> Iterable[tuple[str, list[_FlowRow]]]:
-    """Group DB rows by source window while preserving first-seen order."""
+    """Group DB rows by source window while preserving first-seen order.
+
+    Yields:
+        ``(startdate, rows)`` tuples in the order each ``startdate`` was
+        first encountered in *rows*, e.g.
+        ``("20240601_1000", [row1, row2])``.
+    """
     grouped: dict[str, list[_FlowRow]] = {}
     order: list[str] = []
     for row in rows:
@@ -853,15 +905,17 @@ def _metadata_index_for_interval(
 
 
 def _attrs_sha256(attrs: Mapping[str, Any]) -> str:
-    """Return the canonical payload hash used for unchanged-target skips.
+    """Return the canonical SHA-256 hash of a serialized NGSI attribute dict.
 
     Uses ``sort_keys=True`` + ``separators=(",", ":")`` so two equivalent
-    attribute dicts always produce the same hash. If new envelope fields are
-    added that change every run (a wall-clock timestamp, a randomized
-    identifier, etc.), they must be excluded from ``attrs`` before hashing —
-    otherwise every retry would compute a different hash and the
-    skip-on-unchanged optimization would never fire. See
-    ``run_direction._attrs_sha256`` for the matching pattern in Product B.
+    attribute dicts always produce the same hash regardless of key insertion
+    order.  Flow attributes do not contain a per-run wall-clock timestamp, so
+    the entire ``attrs`` dict is hashed directly — unlike Product B, no keys
+    need to be excluded.  If envelope fields that change every run (e.g. a
+    ``dateRetrieved`` timestamp) are ever added to flow payloads, they must be
+    excluded from ``attrs`` before hashing, or the skip-on-unchanged
+    optimization would never fire.  See ``run_direction._attrs_sha256`` for the
+    matching pattern in Product B, which does exclude ``dateRetrieved``.
     """
     body = json.dumps(attrs, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(body).hexdigest()

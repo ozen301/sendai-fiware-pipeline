@@ -55,33 +55,33 @@ Place `metadata/sensors.csv` in the repo (it is gitignored). The
 pipeline refuses to start if this file is missing or malformed.
 
 The public repository includes `metadata/sensors.example.csv` as a
-small, sanitized shape reference. Copy it only as a starting point:
+shape reference. Copy it only as a starting point:
 
 ```sh
 cp metadata/sensors.example.csv metadata/sensors.csv
 ```
 
 Then replace the rows with the real Sendai deployment metadata before
-creating entities or running the pipelines.
-
-The required header (note `identifcation` is deliberately misspelled
-to match Sendai Orion's existing attribute name):
+creating entities or running the pipelines. The required header (note `identifcation` is deliberately misspelled
+to match Sendai Orion's existing attribute name) is:
 
 ```csv
 place_number,batch,expected_device_type,interval_min,entity_type,entity_id,identifcation,active
 ```
 
-Per-column rules are in [pipeline_spec.md §2](pipeline_spec.md). Either
-maintain the full file by hand, or use the refresh workflow: keep
-`metadata/sensors_stable.csv` plus
+And per-column rules are in [pipeline_spec.md §2](pipeline_spec.md).
+
+For daily operations, if the sensor metadata does not change often,
+we recommend you simply maintain the full `sensors.csv` file by hand.
+Otherwise, you can use the optional refresh workflow:
+keep `metadata/sensors_stable.csv` plus
 `metadata/sensors_refreshable.csv.staged` and run
 
 ```sh
 uv run python scripts/refresh_metadata.py
 ```
 
-to atomically merge them into `metadata/sensors.csv`. If the sensor metadata
-does not change often, maintaining `sensors.csv` by hand is simpler.
+to atomically merge them into `metadata/sensors.csv`. 
 
 ## 5. Bootstrap Orion entities
 
@@ -146,6 +146,24 @@ the description prefix or the structural shape), so re-running is
 safe.
 
 ## 7. Cut over
+
+**Ready to go live? Check these before flipping to `send`:**
+
+- [ ] `metadata/sensors.csv` is present, uses the real sensor data, and
+      `uv run python -m sendai_pipeline.run_flow` (in dry-run) logs
+      `post_succeeded` events (with `dry_run=true`) for the expected
+      entity ids.
+- [ ] Orion entities for every target entity id exist on the platform
+      (§5 complete). The entity-map validation step logs a warning for
+      any missing entity.
+- [ ] STH-Comet subscriptions are live (§6 complete with `--send`).
+      Creating subscriptions **before** the first live POST is required —
+      `skipInitialNotification` means earlier updates are never replayed.
+- [ ] `.env` credentials (`FIWARE_*`, `MYSQL_*`) are correct and
+      dry-run completes without `token_refresh_failed` or
+      MySQL connection errors in `logs/{product}.log`.
+- [ ] Cron is **not yet running** (or is stopped). Cut over by hand
+      first; only enable cron once the manual run succeeds.
 
 In `.env`, set:
 
