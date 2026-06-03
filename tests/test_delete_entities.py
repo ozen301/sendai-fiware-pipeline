@@ -255,13 +255,14 @@ def test_delete_entities_rejects_wildcard_entity_id(
     assert runtime.comet.calls == []
 
 
-def test_delete_entities_rejects_entity_spec_without_type(
+def test_delete_entities_rejects_non_canonical_entity_spec_without_type(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
-    result = _invoke(["--reason", REASON, ENTITY_10], capsys, runtime)
+    result = _invoke(["--reason", REASON, "custom-entity"], capsys, runtime)
 
     assert result != 0
+    assert "--type" not in capsys.readouterr().err
     assert runtime.orion.calls == []
     assert runtime.comet.calls == []
 
@@ -504,6 +505,32 @@ def test_delete_entities_calls_orion_delete_once_per_entity(
     assert runtime.orion.calls == [
         {"entity_id": ENTITY_10, "entity_type": TYPE_3600},
         {"entity_id": ENTITY_11, "entity_type": TYPE_3600},
+    ]
+
+
+def test_delete_entities_bare_canonical_id_infers_entity_type(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(["--reason", REASON, "--send", ENTITY_10], capsys, runtime)
+
+    assert result == 0
+    assert runtime.orion.calls == [{"entity_id": ENTITY_10, "entity_type": TYPE_3600}]
+
+
+def test_delete_entities_inline_entity_type_overrides_inferred_type(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(
+        ["--reason", REASON, "--send", f"{ENTITY_10}:Blesensor.per300"],
+        capsys,
+        runtime,
+    )
+
+    assert result == 0
+    assert runtime.orion.calls == [
+        {"entity_id": ENTITY_10, "entity_type": "Blesensor.per300"}
     ]
 
 

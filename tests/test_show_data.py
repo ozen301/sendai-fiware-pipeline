@@ -8,6 +8,7 @@ import pytest
 import requests
 
 ENTITY_10 = "jp.sendai.Blesensor.per3600.10"
+ENTITY_10_PER300 = "jp.sendai.Blesensor.per300.10"
 ENTITY_11 = "jp.sendai.Blesensor.per3600.11"
 ENTITY_99 = "jp.sendai.Blesensor.per300.99"
 TYPE_3600 = "Blesensor.per3600"
@@ -96,6 +97,7 @@ def metadata_path(tmp_path: Path) -> Path:
                 "place_number,batch,expected_device_type,interval_min,"
                 "entity_type,entity_id,identifcation,active",
                 f"10,2026,M5Stack,60,{TYPE_3600},{ENTITY_10},10,true",
+                f"10,2026,M5Stack,5,{TYPE_300},{ENTITY_10_PER300},10,true",
                 f"11,2026,M5Stack,60,{TYPE_3600},{ENTITY_11},11,true",
                 f"99,2026,M5Stack,5,{TYPE_300},{ENTITY_99},99,true",
                 "",
@@ -171,17 +173,27 @@ def test_show_data_rejects_place_and_entity_id_together(
     assert runtime.orion.calls == []
 
 
-def test_show_data_rejects_place_without_interval_min_or_entity_id(
+def test_show_data_place_without_interval_min_resolves_both_intervals(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
+    runtime.orion.outcomes = [
+        _orion_entity(ENTITY_10),
+        _orion_entity(ENTITY_10_PER300, entity_type=TYPE_300),
+    ]
+
     result = _invoke(
-        ["--source", "orion", "--type", TYPE_3600, "--place", "10"],
+        ["--source", "orion", "--place", "10"],
         capsys,
     )
 
-    assert result != 0
-    assert runtime.orion.calls == []
+    assert result == 0
+    assert [
+        (call["entity_id"], call["entity_type"]) for call in runtime.orion.calls
+    ] == [
+        (ENTITY_10, TYPE_3600),
+        (ENTITY_10_PER300, TYPE_300),
+    ]
 
 
 def _assert_orion_source_rejects_flag(
@@ -358,6 +370,21 @@ def test_show_data_comet_emits_one_json_per_entity_attr_pair(
     ]
 
 
+def test_show_data_comet_infers_type_from_bare_canonical_id(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    runtime.comet.outcomes = [_history(ENTITY_10, "a")]
+
+    result = _invoke(
+        ["--source", "comet", "--entity-id", ENTITY_10, "--attrs", "a"],
+        capsys,
+    )
+
+    assert result == 0
+    assert runtime.comet.calls[0]["entity_type"] == TYPE_3600
+
+
 def test_show_data_comet_passes_through_last_n(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
@@ -517,6 +544,16 @@ def test_show_data_place_resolves_to_entity_id_via_metadata(
     assert runtime.orion.calls[0]["entity_type"] == TYPE_3600
 
 
+def test_show_data_place_without_interval_min_errors_only_when_no_active_row(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(["--source", "orion", "--place", "999"], capsys)
+
+    assert result != 0
+    assert runtime.orion.calls == []
+
+
 def test_show_data_multiple_places_resolve_to_multiple_entities(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
@@ -574,6 +611,21 @@ def test_show_data_entity_id_without_inline_type_uses_default_type(
 
     assert result == 0
     assert runtime.orion.calls[0]["entity_type"] == TYPE_3600
+
+
+def test_show_data_default_type_overrides_inferred_entity_type(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    runtime.orion.outcomes = [_orion_entity(ENTITY_10, entity_type=TYPE_300)]
+
+    result = _invoke(
+        ["--source", "orion", "--type", TYPE_300, "--entity-id", ENTITY_10],
+        capsys,
+    )
+
+    assert result == 0
+    assert runtime.orion.calls[0]["entity_type"] == TYPE_300
 
 
 def test_show_data_flow_attrs_expands_to_seven_product_a_attributes(

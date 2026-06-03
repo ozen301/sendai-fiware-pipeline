@@ -21,6 +21,7 @@ from sendai_pipeline.metadata import (
     active_places,
     index_by_place_interval,
     load_metadata,
+    parse_entity_id,
 )
 from sendai_pipeline.run_direction import (
     JST,
@@ -94,7 +95,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         description="Replay source windows through the product send path.",
     )
     parser.add_argument("product", choices=("flow", "direction"))
-    parser.add_argument("--interval-min", type=int, choices=(5, 60), required=True)
+    parser.add_argument("--interval-min", type=int, choices=(5, 60))
     parser.add_argument("--from", dest="from_window", required=True)
     parser.add_argument("--to", dest="to_window", required=True)
     parser.add_argument("--place", type=int, action="append", default=[])
@@ -128,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
 def _build_plan(args: argparse.Namespace) -> ResendPlan:
     if args.place and args.entity_id:
         raise ResendConfigError("--place and --entity-id are mutually exclusive")
+    interval_min = _resolve_interval_min(args)
     if args.product == "direction" and args.max_imputation_tier is not None:
         raise ResendConfigError("--max-imputation-tier is only valid for flow")
     reason = args.reason.strip()
@@ -136,12 +138,12 @@ def _build_plan(args: argparse.Namespace) -> ResendPlan:
 
     from_dt = _parse_window_arg(args.from_window, flag="--from")
     to_dt = _parse_window_arg(args.to_window, flag="--to")
-    _validate_window_alignment(from_dt, args.interval_min, flag="--from")
-    _validate_window_alignment(to_dt, args.interval_min, flag="--to")
+    _validate_window_alignment(from_dt, interval_min, flag="--from")
+    _validate_window_alignment(to_dt, interval_min, flag="--to")
     if to_dt < from_dt:
         raise ResendConfigError("--to must be greater than or equal to --from")
     if not args.allow_old:
-        _validate_lookback(from_dt, args.interval_min)
+        _validate_lookback(from_dt, interval_min)
 
     filter_settings = FilterSettings.from_env()
     source_max_imputation_tier = (
@@ -166,7 +168,7 @@ def _build_plan(args: argparse.Namespace) -> ResendPlan:
     metadata_index = index_by_place_interval(active_targets)
     interval_metadata = _metadata_for_request(
         metadata_index,
-        interval_min=args.interval_min,
+        interval_min=interval_min,
         place_numbers=args.place,
         entity_ids=args.entity_id,
     )
@@ -175,18 +177,114 @@ def _build_plan(args: argparse.Namespace) -> ResendPlan:
 
     return ResendPlan(
         product=args.product,
-        interval_min=args.interval_min,
+        interval_min=interval_min,
         from_window=args.from_window,
         to_window=args.to_window,
         reason=reason,
         force=bool(args.force),
         send=bool(args.send),
-        windows=tuple(_enumerate_windows(from_dt, to_dt, args.interval_min)),
+        windows=tuple(_enumerate_windows(from_dt, to_dt, interval_min)),
         interval_metadata=interval_metadata,
         source_max_imputation_tier=(
             source_max_imputation_tier if args.product == "flow" else None
         ),
     )
+
+
+def _resolve_interval_min(args: argparse.Namespace) -> int:
+    """Resolve the source aggregation interval from flags and entity ids.
+
+    ``--interval-min`` is optional: when omitted, the interval is inferred
+    from the canonical ``--entity-id`` values (``per300`` -> 5, ``per3600``
+    -> 60; see :func:`sendai_pipeline.metadata.parse_entity_id`). Precedence:
+
+    1. ``--interval-min`` given: it wins, but any ``--entity-id`` whose own
+       interval contradicts it is rejected so a typo cannot resend the wrong
+       series.
+    2. No ``--interval-min`` and no ``--entity-id``: nothing to infer from,
+       so the flag is required (this also covers the ``--place`` path, where
+       a place exists at both intervals and the id carries no interval hint).
+    3. No ``--interval-min`` with ``--entity-id``: every id must yield one
+       interval, and all ids must agree on a single value.
+
+    Returns:
+        The resolved interval in minutes (5 or 60).
+
+    Raises:
+        ResendConfigError: If the flag and ids disagree, if the interval
+            cannot be inferred, or if the ids span multiple intervals.
+    """
+    explicit_interval = args.interval_min
+    entity_ids = tuple(args.entity_id)
+    inferred_intervals = _intervals_from_entity_ids(entity_ids)
+
+    # Case 1: explicit flag wins, but reject ids that contradict it.
+    if explicit_interval is not None:
+        disagreeing = [
+            entity_id
+            for entity_id, inferred_interval in inferred_intervals.items()
+            if inferred_interval is not None and inferred_interval != explicit_interval
+        ]
+        if disagreeing:
+            raise ResendConfigError(
+                "--interval-min disagrees with --entity-id interval(s): "
+                f"{_csv(disagreeing)}"
+            )
+        return int(explicit_interval)
+
+    # Case 2: no flag and no ids to infer from (includes the --place path).
+    if not entity_ids:
+        raise ResendConfigError(
+            "--interval-min is required unless --entity-id is given"
+        )
+
+    # Case 3: infer from ids. Every id must parse to an interval...
+    missing = [
+        entity_id
+        for entity_id, inferred_interval in inferred_intervals.items()
+        if inferred_interval is None
+    ]
+    if missing:
+        raise ResendConfigError(
+            "--interval-min is required when an --entity-id interval cannot be "
+            f"inferred: {_csv(missing)}"
+        )
+
+    # ...and they must all agree, since one resend run targets one interval.
+    concrete_intervals = {
+        inferred_interval
+        for inferred_interval in inferred_intervals.values()
+        if inferred_interval is not None
+    }
+    if len(concrete_intervals) != 1:
+        raise ResendConfigError(
+            "--entity-id values span multiple intervals; pass --interval-min"
+        )
+    return concrete_intervals.pop()
+
+
+def _intervals_from_entity_ids(entity_ids: Iterable[str]) -> dict[str, int | None]:
+    """Map each entity id to the interval inferred from its canonical shape.
+
+    Args:
+        entity_ids: Entity ids to inspect.
+
+    Returns:
+        A mapping whose keys are exactly the given *entity_ids*. Each value is
+        that id's inferred interval in minutes, or ``None`` when the id is
+        non-canonical or carries an unknown type suffix. Keeping every input
+        id as a key lets the caller report exactly which ids failed to infer.
+
+        For example, given the two ids ``"jp.sendai.Blesensor.per300.10"``
+        (canonical) and ``"bad-id"`` (non-canonical), the result is::
+
+            {"jp.sendai.Blesensor.per300.10": 5, "bad-id": None}
+    """
+    intervals: dict[str, int | None] = {}
+    for entity_id in entity_ids:
+        parsed = parse_entity_id(entity_id)
+        intervals[entity_id] = parsed.interval_min if parsed is not None else None
+    return intervals
 
 
 def _dry_run(plan: ResendPlan) -> int:

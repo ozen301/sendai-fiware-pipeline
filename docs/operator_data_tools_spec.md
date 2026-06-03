@@ -22,16 +22,19 @@ For the wider context (pipeline workflow, existing tools), see
 These conventions are shared by all four tools below.
 
 **Entity spec.** Same shape as `create_entities.py`:
-`ENTITY_ID[:ENTITY_TYPE]`. When `:ENTITY_TYPE` is omitted, the operator
-must pass a default via `--type`.
+`ENTITY_ID[:ENTITY_TYPE]`. Canonical Sendai ids such as
+`jp.sendai.Blesensor.per3600.105` infer `ENTITY_TYPE` from the id.
+When inference is unavailable, the operator must pass `:ENTITY_TYPE`;
+tools that expose `--type` also accept it as the default/override.
 
 **Place shorthand.** Several tools accept `--place N` (e.g. `105`)
-and/or `--interval-min {5,60}`. The tool resolves the place number to
-the matching entity id via `metadata/sensors.csv` using the same
-`load_metadata` + `index_by_place_interval` path the runners use. If
-the operator supplies both `--place` and explicit entity ids, the
-explicit ids win and `--place` is rejected with a config error (to
-prevent ambiguity).
+and/or `--interval-min {5,60}`. The tool resolves the place number via
+`metadata/sensors.csv` using the same `load_metadata` +
+`index_by_place_interval` path the runners use. Tools that can safely
+show both intervals may make `--interval-min` optional; tools that
+publish or delete one interval still require a resolved interval. If
+the operator supplies both `--place` and explicit entity ids,
+`--place` is rejected with a config error (to prevent ambiguity).
 
 **Date range.** `--from` and `--to` accept either a source window key
 (`YYYYMMDD_HHMM`, JST) or an ISO-8601 timestamp. Bounds are inclusive
@@ -71,7 +74,7 @@ uv run python scripts/resend.py flow \
 
 ```
 uv run python scripts/resend.py {flow|direction}
-    --interval-min {5|60}
+    [--interval-min {5|60}]
     --from YYYYMMDD_HHMM
     --to   YYYYMMDD_HHMM
     [--place N [--place N ...]]
@@ -84,7 +87,7 @@ uv run python scripts/resend.py {flow|direction}
 | Flag | Required | Purpose |
 |---|---|---|
 | `flow` / `direction` | yes | Which product. |
-| `--interval-min` | yes | `5` or `60`. A single invocation publishes one interval. |
+| `--interval-min` | conditional | `5` or `60`. Required for `--place` or unfiltered runs. Optional with canonical `--entity-id`, where all ids must infer the same interval. A single invocation publishes one interval. |
 | `--from`, `--to` | yes | Source-window keys, JST, inclusive. |
 | `--place` | no | Place number filter. Repeatable. Resolved via metadata. |
 | `--entity-id` | no | Explicit entity id. Repeatable. Mutually exclusive with `--place`. |
@@ -95,8 +98,11 @@ uv run python scripts/resend.py {flow|direction}
 
 ### Behavior
 
-1. Validate args (range is non-empty and aligned to interval; place/
-   entity-id mutual exclusion; `--reason` non-empty; range age vs
+1. Resolve the interval before window validation: explicit
+   `--interval-min` wins, canonical `--entity-id` can infer it, and
+   `--place`/unfiltered runs require the flag. Then validate args
+   (range is non-empty and aligned to interval; place/entity-id mutual
+   exclusion; `--reason` non-empty; range age vs
    `MAX_LOOKBACK_HOURS_*` checked against `--allow-old`).
 2. Enumerate every source window between `--from` and `--to` at
    `--interval-min` step.
@@ -184,14 +190,14 @@ uv run python scripts/show_data.py
 |---|---|
 | `--source orion` | One GET per entity to `/orion/v2.0/entities/<id>`. Current values only. `--from/--to/--last-n` rejected. |
 | `--source comet` | One GET per (entity, attr) to STH-Comet. Historical values. `--from/--to/--last-n` honored. |
-| `--type TYPE` | Default entity type for specs that omit one. |
+| `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. |
 | `--attrs LIST` | Comma-separated attribute selector. |
 | `--flow-attrs` / `--direction-attrs` | Shortcut for the Product A / Product B attribute sets. Mutually exclusive with `--attrs`. |
-| `--place N` | Place number (repeatable). Requires `--interval-min` if no explicit `--entity-id`. Resolved via metadata. |
-| `--entity-id ID` | Explicit entity id (repeatable). Mutually exclusive with `--place`. |
+| `--place N` | Place number (repeatable). With `--interval-min`, selects that interval; without it, resolves every active interval for the place. Mutually exclusive with `--entity-id`. |
+| `--entity-id ID` | Explicit entity id (repeatable). Canonical ids infer entity type. Mutually exclusive with `--place`. |
 | `--from`, `--to` | ISO-8601 or `YYYYMMDD_HHMM`. Comet-only. |
 | `--last-n N` | Comet-only; defaults to `10` if no `--from`/`--to`. |
-| `--interval-min` | Pick interval when expanding `--place`. |
+| `--interval-min` | Optional interval filter when expanding `--place`. |
 | `--pretty` | Render a compact text table instead of JSON. |
 
 ### Replaces `check_entity.py` and `check_history.py`
@@ -257,7 +263,7 @@ row and the run still exits 0.
 - `test_show_comet_emits_one_json_per_entity_attr_pair`
 - `test_show_orion_rejects_from_to_last_n`
 - `test_show_pretty_renders_table_with_known_columns`
-- `test_show_place_requires_interval_min_when_no_entity_id`
+- `test_show_place_without_interval_min_resolves_both_intervals`
 - `test_show_missing_entity_renders_not_found_row_pretty`
 - `test_show_attrs_and_flow_attrs_mutually_exclusive`
 
@@ -309,7 +315,7 @@ Where `ENTITY_SPEC` is `ENTITY_ID[:ENTITY_TYPE]`.
 | Flag | Purpose |
 |---|---|
 | `ENTITY_SPEC` | One or more entities to operate on. |
-| `--type TYPE` | Default entity type for specs that omit one. |
+| `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. |
 | `--attrs LIST` | Comma-separated attribute names. If present, the tool deletes per-attribute (one DELETE per (entity, attr)). |
 | `--flow-attrs` / `--direction-attrs` | Shortcuts. Mutually exclusive with `--attrs`. |
 | (no `--attrs`) | Per-entity delete (one DELETE per entity). |
@@ -319,7 +325,8 @@ Where `ENTITY_SPEC` is `ENTITY_ID[:ENTITY_TYPE]`.
 
 ### Behavior
 
-1. Validate args.
+1. Validate args. Canonical Sendai entity ids infer the entity type;
+   custom ids require `:ENTITY_TYPE` or `--type`.
 2. For each (entity[, attr]) pair, dry-run prints the DELETE URL that
    would be sent and exits.
 3. `--send` issues the actual DELETE. 204 is the success code per
@@ -374,12 +381,12 @@ uv run python scripts/delete_entities.py
     [--attrs LIST | --flow-attrs | --direction-attrs]
     --reason "..."
     [--send]
-    ENTITY_ID:ENTITY_TYPE [...]
+    ENTITY_ID[:ENTITY_TYPE] [...]
 ```
 
 | Flag | Purpose |
 |---|---|
-| `ENTITY_ID:ENTITY_TYPE` | One or more entities. Same shape as `create_entities.py`. |
+| `ENTITY_ID[:ENTITY_TYPE]` | One or more entities. Canonical Sendai ids infer the type; custom ids require inline `:ENTITY_TYPE`. |
 | `--purge-history` | After each successful Orion DELETE, also delete the entity's Comet history. |
 | `--attrs` / `--flow-attrs` / `--direction-attrs` | With `--purge-history`, scope the Comet purge to specific attributes (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed** — silently ignored attrs flags are a footgun. |
 | `--reason` | Required. |
@@ -388,19 +395,21 @@ uv run python scripts/delete_entities.py
 
 ### Behavior
 
-1. Dry-run prints the planned `DELETE /orion/v2.0/entities/<id>?type=<type>`
+1. Validate args. Canonical Sendai entity ids infer the entity type;
+   custom ids require inline `:ENTITY_TYPE`.
+2. Dry-run prints the planned `DELETE /orion/v2.0/entities/<id>?type=<type>`
    per entity, plus the planned Comet DELETE(s) if `--purge-history`,
    and exits.
-2. `--send` issues `DELETE /orion/v2.0/entities/<id>?type=<type>` per
+3. `--send` issues `DELETE /orion/v2.0/entities/<id>?type=<type>` per
    entity. 204 = deleted. 404 = already absent, logged INFO, no-op. Other
    non-2xx = failure for that entity (continue to next).
-3. If `--purge-history` and the Orion DELETE returned 204 *or* 404, run
+4. If `--purge-history` and the Orion DELETE returned 204 *or* 404, run
    the corresponding Comet delete(s) via the same code path as
    `delete_history.py` (extract into a shared helper in
    `sendai_pipeline/comet_client.py`).
-4. Skip the Comet purge step if the Orion DELETE failed (don't compound
+5. Skip the Comet purge step if the Orion DELETE failed (don't compound
    one error with another).
-5. **Comet purge is best-effort.** A Comet purge failure on an entity
+6. **Comet purge is best-effort.** A Comet purge failure on an entity
    whose Orion DELETE already succeeded does NOT make the overall run
    exit non-zero. The failure is logged at WARNING and surfaced in the
    summary, but the operator's primary intent (deleting the Orion

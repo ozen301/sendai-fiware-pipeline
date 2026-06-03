@@ -193,8 +193,8 @@ uv run python scripts/show_data.py
 | Flag / arg | Purpose |
 |---|---|
 | `--source orion` / `comet` | Read current Orion entity JSON or STH-Comet history. |
-| `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Append `:ENTITY_TYPE` per id or supply `--type`. |
-| `--place N` | Resolve place numbers through metadata. Requires `--interval-min`; mutually exclusive with explicit entity ids. |
+| `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Canonical `jp.sendai.Blesensor.per300/per3600.<N>` ids infer the type; append `:ENTITY_TYPE` per id or supply `--type` for custom ids or overrides. |
+| `--place N` | Resolve place numbers through metadata. With `--interval-min`, selects that interval; without it, selects every active interval for the place. Mutually exclusive with explicit entity ids. |
 | `--attrs LIST` | Comma-separated attributes. Required for Comet unless a shortcut is used. |
 | `--flow-attrs` | Shortcut for the seven Product A attributes. |
 | `--direction-attrs` | Shortcut for Product B attributes (`dateObservedFrom`, `dateObservedTo`, `peopleCount_flow`). |
@@ -212,14 +212,13 @@ Examples:
 
 ```sh
 uv run python scripts/show_data.py --source orion --flow-attrs \
-  jp.sendai.Blesensor.per3600.101:Blesensor.per3600
+  jp.sendai.Blesensor.per3600.101
 
-uv run python scripts/show_data.py --source comet --type Blesensor.per300 \
+uv run python scripts/show_data.py --source comet \
   --attrs peopleCount_immedate --last-n 20 \
   jp.sendai.Blesensor.per300.101 jp.sendai.Blesensor.per300.102
 
-uv run python scripts/show_data.py --source orion --place 101 \
-  --interval-min 60 --pretty
+uv run python scripts/show_data.py --source orion --place 101 --pretty
 ```
 
 ### `delete_entities.py`
@@ -235,12 +234,14 @@ uv run python scripts/delete_entities.py
     --reason "..."
     [--send]
     [--i-know-this-is-production]
-    ENTITY_ID:ENTITY_TYPE [...]
+    ENTITY_ID[:ENTITY_TYPE] [...]
 ```
 
 Live deletion refuses catch-all FIWARE scopes unless
 `--i-know-this-is-production` is present. Attribute flags are only
-valid with `--purge-history`.
+valid with `--purge-history`. Canonical Sendai entity ids infer the
+entity type; append `:ENTITY_TYPE` for custom ids or when overriding
+the inferred type.
 
 ### `delete_history.py`
 
@@ -260,7 +261,9 @@ uv run python scripts/delete_history.py
 With no attribute selector, the tool deletes all history for each
 entity. With `--attrs` or a shortcut, it deletes one attribute series
 per entity. Live deletion uses the same catch-all scope guard as
-`delete_entities.py`.
+`delete_entities.py`. Canonical Sendai entity ids infer the entity
+type; append `:ENTITY_TYPE` or pass `--type` for custom ids or
+overrides.
 
 ### `delete_subscriptions.py`
 
@@ -451,7 +454,7 @@ been fixed — i.e. when re-POSTing is correct and meaningful.
 
 ```
 uv run python scripts/resend.py {flow|direction}
-    --interval-min {5|60}
+    [--interval-min {5|60}]
     --from YYYYMMDD_HHMM
     --to   YYYYMMDD_HHMM
     [--place N [--place N ...]]
@@ -465,11 +468,11 @@ uv run python scripts/resend.py {flow|direction}
 | Flag | Purpose |
 |---|---|
 | `flow` / `direction` (positional) | Which product to resend. |
-| `--interval-min 5` / `60` | Source aggregation interval of the windows. |
+| `--interval-min 5` / `60` | Source aggregation interval of the windows. Required for `--place` or unfiltered runs; optional with canonical `--entity-id`, where the interval is inferred from `per300` / `per3600`. |
 | `--from YYYYMMDD_HHMM` | First source window start, JST. Inclusive. |
 | `--to YYYYMMDD_HHMM` | Last source window start, JST. Inclusive. Equal to `--from` replays exactly one window. |
 | `--place N` | Place number filter; repeatable. Resolved through metadata. Mutually exclusive with `--entity-id`. |
-| `--entity-id ID` | Explicit entity id; repeatable. Mutually exclusive with `--place`. |
+| `--entity-id ID` | Explicit entity id; repeatable. Mutually exclusive with `--place`. If `--interval-min` is omitted, all ids must be canonical and resolve to the same interval. |
 | `--reason "..."` | Required. Recorded as audit context in the run log. |
 | `--force` | Bypass the per-target payload-hash skip. By default, targets whose last `ok` payload hash matches the new payload are skipped. |
 | `--allow-old` | Allow `--from` to predate `now − MAX_LOOKBACK_HOURS_*` for the chosen interval. Default refuses old ranges to prevent surprise wide replays. |
@@ -494,8 +497,8 @@ Examples:
 ```sh
 # Single window, dry-run.
 uv run python scripts/resend.py direction \
-  --interval-min 5 \
   --from 20260525_0640 --to 20260525_0640 \
+  --entity-id jp.sendai.Blesensor.per300.105 \
   --reason "payload shape fix"
 
 # Same single window, live.

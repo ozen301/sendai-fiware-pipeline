@@ -14,6 +14,7 @@ from dotenv import find_dotenv, load_dotenv
 from sendai_pipeline.auth import AuthClient, AuthSettings
 from sendai_pipeline.comet_client import CometClient, CometSettings
 from sendai_pipeline.logging_setup import LoggingSettings, configure_logging
+from sendai_pipeline.metadata import parse_entity_id
 from sendai_pipeline.orion_client import OrionSettings
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
@@ -40,7 +41,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Delete Orion entities and optionally purge Comet history.",
     )
-    parser.add_argument("entity_specs", nargs="+", metavar="ENTITY_ID:ENTITY_TYPE")
+    parser.add_argument("entity_specs", nargs="+", metavar="ENTITY_ID[:ENTITY_TYPE]")
     parser.add_argument("--purge-history", action="store_true")
     attrs = parser.add_mutually_exclusive_group()
     attrs.add_argument("--attrs", help="Comma-separated Comet attributes to purge.")
@@ -209,14 +210,74 @@ def delete_one_orion_entity(
 
 
 def _parse_targets(specs: Sequence[str]) -> list[EntityTarget]:
-    """Parse and validate ``ENTITY_ID:ENTITY_TYPE`` specs."""
+    """Parse ``ENTITY_ID[:ENTITY_TYPE]`` specs into delete targets.
+
+    The entity type is optional: an explicit ``:ENTITY_TYPE`` is authoritative,
+    otherwise it is inferred from a canonical entity id (see
+    :func:`sendai_pipeline.metadata.parse_entity_id`).
+
+    Args:
+        specs: Raw ``ENTITY_ID`` or ``ENTITY_ID:ENTITY_TYPE`` strings.
+
+    Returns:
+        One :class:`EntityTarget` per spec, in input order.
+
+    Raises:
+        DeleteEntitiesConfigError: For an empty/wildcard id, an empty inline
+            type, or a non-canonical id whose type cannot be inferred.
+    """
     targets: list[EntityTarget] = []
     for spec in specs:
+        # rpartition on ":" splits off an inline type; no ":" means bare id.
         entity_id, separator, entity_type = spec.rpartition(":")
-        if not separator or entity_id in {"", "*"} or entity_type == "":
+        if not separator:
+            # Bare id: guard against catch-all, then infer the type from it.
+            entity_id = spec
+            if entity_id in {"", "*"}:
+                raise DeleteEntitiesConfigError(f"invalid entity spec: {spec!r}")
+            entity_type = _entity_type_for_spec(entity_id)
+        elif entity_id in {"", "*"} or entity_type == "":
+            # Inline form present but a side is empty/wildcard: reject.
             raise DeleteEntitiesConfigError(f"invalid entity spec: {spec!r}")
+        else:
+            # Explicit inline type wins; note it if it shadows inference.
+            _log_if_type_override(entity_id, entity_type)
         targets.append(EntityTarget(entity_id, entity_type))
     return targets
+
+
+def _entity_type_for_spec(entity_id: str) -> str:
+    """Infer the entity type from a canonical id, or require an inline type.
+
+    Returns:
+        The entity type parsed from *entity_id*.
+
+    Raises:
+        DeleteEntitiesConfigError: If *entity_id* is not canonical, so the
+            operator must supply an inline ``:TYPE`` (this tool has no
+            ``--type`` flag).
+    """
+    parsed = parse_entity_id(entity_id)
+    if parsed is not None:
+        return parsed.entity_type
+    raise DeleteEntitiesConfigError(
+        f"cannot infer entity type for {entity_id!r}; pass an explicit :TYPE"
+    )
+
+
+def _log_if_type_override(entity_id: str, explicit_type: str) -> None:
+    """Log at DEBUG when an inline type differs from the id's inferred type."""
+    parsed = parse_entity_id(entity_id)
+    if parsed is not None and parsed.entity_type != explicit_type:
+        logger.debug(
+            "explicit entity type overrides inferred type",
+            extra={
+                "event": "entity_type_override",
+                "entity_id": entity_id,
+                "inferred_entity_type": parsed.entity_type,
+                "explicit_entity_type": explicit_type,
+            },
+        )
 
 
 def _attrs(args: argparse.Namespace) -> tuple[str, ...] | None:

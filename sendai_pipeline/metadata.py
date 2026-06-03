@@ -22,6 +22,8 @@ _REQUIRED_COLUMNS: tuple[str, ...] = (
 _VALID_BATCHES: frozenset[str] = frozenset({"2023", "2026"})
 _VALID_DEVICE_TYPES: frozenset[str] = frozenset({"Pixel3aUT", "M5Stack"})
 _VALID_INTERVALS: frozenset[int] = frozenset({5, 60})
+_ENTITY_ID_PREFIX = "jp.sendai."
+INTERVAL_BY_TYPE_SUFFIX: dict[str, int] = {"per300": 5, "per3600": 60}
 
 
 class MetadataLoadError(RuntimeError):
@@ -53,6 +55,62 @@ class SensorPlace:
     entity_id: str
     identifcation: str
     active: bool
+
+
+@dataclass(frozen=True)
+class ParsedEntityId:
+    """Entity identity parsed from a canonical Sendai FIWARE entity id.
+
+    Attributes:
+        entity_id: Original entity id string.
+        entity_type: NGSI entity type embedded in the id, e.g.
+            ``"Blesensor.per3600"``.
+        place_number: Numeric place suffix from the id.
+        interval_min: Aggregation interval inferred from the entity type suffix.
+            This is ``None`` when the id has the canonical shape but the type
+            suffix is not one of the known interval suffixes.
+    """
+
+    entity_id: str
+    entity_type: str
+    place_number: int
+    interval_min: int | None
+
+
+def parse_entity_id(entity_id: str) -> ParsedEntityId | None:
+    """Parse a canonical Sendai target entity id.
+
+    The canonical shape is ``jp.sendai.<entity_type>.<place_number>``. Shape
+    failures return ``None`` so callers can keep explicit type or interval
+    escape hatches. If the shape parses but the entity type's last segment is
+    not a known interval suffix, the returned :class:`ParsedEntityId` has
+    ``interval_min=None``.
+
+    Args:
+        entity_id: Entity id to parse.
+
+    Returns:
+        Parsed canonical components, or ``None`` when the id does not have the
+        canonical prefix, a non-empty entity type, and an all-digits place
+        suffix.
+    """
+    # Strip the fixed "jp.sendai." prefix, then split the trailing ".<place>"
+    # off the remainder; what is left is the entity type.
+    if not entity_id.startswith(_ENTITY_ID_PREFIX):
+        return None
+    remainder = entity_id.removeprefix(_ENTITY_ID_PREFIX)
+    entity_type, separator, place_number_text = remainder.rpartition(".")
+    if not separator or entity_type == "" or not place_number_text.isdigit():
+        return None
+    # The interval lives in the type's last segment ("per300" / "per3600");
+    # an unknown segment leaves interval_min as None (shape still valid).
+    type_suffix = entity_type.rsplit(".", maxsplit=1)[-1]
+    return ParsedEntityId(
+        entity_id=entity_id,
+        entity_type=entity_type,
+        place_number=int(place_number_text),
+        interval_min=INTERVAL_BY_TYPE_SUFFIX.get(type_suffix),
+    )
 
 
 def load_metadata(path: Path) -> list[SensorPlace]:

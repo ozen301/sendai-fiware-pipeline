@@ -393,6 +393,71 @@ def test_resend_entity_id_filter_narrows_interval_metadata(
     assert calls[0].interval_entity_ids == [ENTITY_11]
 
 
+def test_resend_entity_id_without_interval_min_infers_interval(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _run_send(
+        tmp_path,
+        metadata_path,
+        monkeypatch,
+        _base_args(interval_min=None, send=True) + ["--entity-id", ENTITY_11],
+    )
+
+    assert calls[0].interval_min == 60
+    assert calls[0].interval_entity_ids == [ENTITY_11]
+
+
+def test_resend_mixed_interval_entity_ids_require_interval_min(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+
+    result = _call_main(
+        resend,
+        _base_args(interval_min=None)
+        + ["--entity-id", ENTITY_10, "--entity-id", ENTITY_99_PER300],
+    )
+
+    assert result != 0
+
+
+def test_resend_interval_min_disagreeing_with_entity_id_errors(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+
+    result = _call_main(
+        resend,
+        _base_args(interval_min=5) + ["--entity-id", ENTITY_10],
+    )
+
+    assert result != 0
+
+
+def test_resend_place_without_interval_min_still_errors(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+
+    result = _call_main(
+        resend,
+        _base_args(interval_min=None) + ["--place", "10"],
+    )
+
+    assert result != 0
+
+
 def test_resend_no_filter_uses_full_active_set(
     tmp_path: Path,
     metadata_path: Path,
@@ -685,7 +750,7 @@ def _resend_module() -> Any:
 def _base_args(
     *,
     product: str = "flow",
-    interval_min: int = 60,
+    interval_min: int | None = 60,
     from_window: str = "20260524_1000",
     to_window: str = "20260524_1000",
     allow_old: bool = True,
@@ -693,8 +758,6 @@ def _base_args(
 ) -> list[str]:
     args = [
         product,
-        "--interval-min",
-        str(interval_min),
         "--from",
         from_window,
         "--to",
@@ -702,6 +765,8 @@ def _base_args(
         "--reason",
         "operator requested resend",
     ]
+    if interval_min is not None:
+        args.extend(["--interval-min", str(interval_min)])
     if allow_old:
         args.append("--allow-old")
     if send:

@@ -13,6 +13,7 @@ from dotenv import find_dotenv, load_dotenv
 from sendai_pipeline.auth import AuthClient, AuthSettings
 from sendai_pipeline.comet_client import CometClient, CometSettings
 from sendai_pipeline.logging_setup import LoggingSettings, configure_logging
+from sendai_pipeline.metadata import parse_entity_id
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
     PRODUCT_B_HISTORY_ATTRS,
@@ -150,17 +151,97 @@ def _parse_targets(
     *,
     default_type: str | None,
 ) -> list[HistoryTarget]:
-    """Parse and validate ``ENTITY_ID[:ENTITY_TYPE]`` specs."""
+    """Parse ``ENTITY_ID[:ENTITY_TYPE]`` specs into history targets.
+
+    The entity type is optional. Precedence is: an explicit ``:ENTITY_TYPE`` on
+    the spec, else the ``--type`` flag (*default_type*), else the type
+    inferred from a canonical entity id (see
+    :func:`sendai_pipeline.metadata.parse_entity_id`).
+
+    Args:
+        specs: Raw ``ENTITY_ID`` or ``ENTITY_ID:ENTITY_TYPE`` strings.
+        default_type: Fallback entity type from ``--type``, used for bare ids
+            when no inline type is given.
+
+    Returns:
+        One :class:`HistoryTarget` per spec, in input order.
+
+    Raises:
+        DeleteHistoryConfigError: For an empty/wildcard id, an empty inline
+            type, or a non-canonical bare id with no ``--type`` to fall back on.
+    """
     targets: list[HistoryTarget] = []
     for spec in specs:
+        # rpartition on ":" splits off an inline type; no ":" means bare id.
         entity_id, separator, entity_type = spec.rpartition(":")
         if not separator:
+            # Bare id: guard against catch-all, then resolve via --type or id.
             entity_id = spec
-            entity_type = default_type or ""
-        if entity_id in {"", "*"} or entity_type == "":
+            if entity_id in {"", "*"}:
+                raise DeleteHistoryConfigError(f"invalid entity spec: {spec!r}")
+            entity_type = _entity_type_for_spec(
+                entity_id,
+                explicit_type=default_type,
+                error_hint="pass an explicit :TYPE or --type",
+            )
+        elif entity_id in {"", "*"} or entity_type == "":
+            # Inline form present but a side is empty/wildcard: reject.
             raise DeleteHistoryConfigError(f"invalid entity spec: {spec!r}")
+        else:
+            # Explicit inline type wins; note it if it shadows inference.
+            _log_if_type_override(entity_id, entity_type)
         targets.append(HistoryTarget(entity_id, entity_type))
     return targets
+
+
+def _entity_type_for_spec(
+    entity_id: str,
+    *,
+    explicit_type: str | None,
+    error_hint: str,
+) -> str:
+    """Resolve the entity type for a bare id from ``--type`` or the id itself.
+
+    An explicit *explicit_type* (the ``--type`` flag) wins and shadows any
+    inferred type; otherwise the type is inferred from the canonical id.
+
+    Args:
+        entity_id: Bare entity id (no inline ``:TYPE``).
+        explicit_type: The ``--type`` flag value, or ``None`` if unset.
+        error_hint: Trailing guidance appended to the error message naming
+            the flags this tool accepts.
+
+    Returns:
+        The resolved entity type.
+
+    Raises:
+        DeleteHistoryConfigError: If no ``--type`` is given and *entity_id*
+            is not canonical, so no type can be inferred.
+    """
+    parsed = parse_entity_id(entity_id)
+    if explicit_type is not None:
+        _log_if_type_override(entity_id, explicit_type)
+        return explicit_type
+    if parsed is not None:
+        return parsed.entity_type
+    raise DeleteHistoryConfigError(
+        f"cannot infer entity type for {entity_id!r}; {error_hint}"
+    )
+
+
+def _log_if_type_override(entity_id: str, explicit_type: str) -> None:
+    """Log at DEBUG when an explicit type differs from the id's inferred type."""
+    parsed = parse_entity_id(entity_id)
+    if parsed is not None and parsed.entity_type != explicit_type:
+        logger.debug(
+            "explicit entity type overrides inferred type",
+            extra={
+                "event": "entity_type_override",
+                "entity_id": entity_id,
+                "inferred_entity_type": parsed.entity_type,
+                "explicit_entity_type": explicit_type,
+            },
+        )
 
 
 def _attrs(args: argparse.Namespace) -> tuple[str, ...] | None:

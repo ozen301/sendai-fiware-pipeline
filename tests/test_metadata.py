@@ -6,10 +6,12 @@ import pytest
 
 from sendai_pipeline.metadata import (
     MetadataLoadError,
+    ParsedEntityId,
     SensorPlace,
     active_places,
     index_by_place_interval,
     load_metadata,
+    parse_entity_id,
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "sensors_minimal.csv"
@@ -55,6 +57,64 @@ def _header() -> str:
 def test_load_metadata_returns_all_rows_from_minimal_fixture() -> None:
     places = load_metadata(FIXTURE_PATH)
     assert len(places) == 5
+
+
+@pytest.mark.parametrize(
+    "entity_id,entity_type,place_number,interval_min",
+    [
+        (
+            "jp.sendai.Blesensor.per3600.10",
+            "Blesensor.per3600",
+            10,
+            60,
+        ),
+        (
+            "jp.sendai.Blesensor.per300.105",
+            "Blesensor.per300",
+            105,
+            5,
+        ),
+    ],
+)
+def test_parse_entity_id_parses_canonical_ids(
+    entity_id: str,
+    entity_type: str,
+    place_number: int,
+    interval_min: int,
+) -> None:
+    parsed = parse_entity_id(entity_id)
+
+    assert parsed == ParsedEntityId(
+        entity_id=entity_id,
+        entity_type=entity_type,
+        place_number=place_number,
+        interval_min=interval_min,
+    )
+
+
+@pytest.mark.parametrize(
+    "entity_id",
+    [
+        "Blesensor.per3600.10",
+        "jp.sendai.Blesensor.per3600.place10",
+        "jp.sendai..10",
+    ],
+)
+def test_parse_entity_id_returns_none_for_non_canonical_shape(
+    entity_id: str,
+) -> None:
+    assert parse_entity_id(entity_id) is None
+
+
+def test_parse_entity_id_parses_unknown_interval_suffix_without_interval() -> None:
+    parsed = parse_entity_id("jp.sendai.Custom.weird.99")
+
+    assert parsed == ParsedEntityId(
+        entity_id="jp.sendai.Custom.weird.99",
+        entity_type="Custom.weird",
+        place_number=99,
+        interval_min=None,
+    )
 
 
 def test_load_metadata_returns_sensor_place_with_typed_fields() -> None:

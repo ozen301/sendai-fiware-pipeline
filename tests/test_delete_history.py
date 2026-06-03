@@ -403,6 +403,45 @@ def test_delete_history_per_entity_uses_inline_entity_type_from_spec(
     ]
 
 
+def test_delete_history_bare_canonical_id_infers_entity_type(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(["--reason", REASON, "--send", ENTITY_10], capsys, runtime)
+
+    assert result == 0
+    assert runtime.comet.calls == [
+        {"method": "entity", "entity_id": ENTITY_10, "entity_type": TYPE_3600}
+    ]
+
+
+def test_delete_history_type_flag_overrides_inferred_entity_type(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(
+        ["--type", "Blesensor.per300", "--reason", REASON, "--send", ENTITY_10],
+        capsys,
+        runtime,
+    )
+
+    assert result == 0
+    assert runtime.comet.calls == [
+        {"method": "entity", "entity_id": ENTITY_10, "entity_type": "Blesensor.per300"}
+    ]
+
+
+def test_delete_history_non_canonical_id_without_type_errors(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(["--reason", REASON, "custom-entity"], capsys, runtime)
+
+    assert result != 0
+    assert "--type" in capsys.readouterr().err
+    assert runtime.comet.calls == []
+
+
 def test_delete_history_per_entity_uses_default_type_when_spec_omits_it(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,

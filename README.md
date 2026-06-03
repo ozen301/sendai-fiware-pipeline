@@ -64,10 +64,10 @@ uv run python -m sendai_pipeline.run_direction
 
 # Inspect an entity in Orion.
 uv run python scripts/show_data.py --source orion --flow-attrs \
-  jp.sendai.Blesensor.per3600.101:Blesensor.per3600
+  jp.sendai.Blesensor.per3600.101
 
 # Inspect STH-Comet history for an attribute.
-uv run python scripts/show_data.py --source comet --type Blesensor.per300 \
+uv run python scripts/show_data.py --source comet \
   --attrs peopleCount_immedate --last-n 20 \
   jp.sendai.Blesensor.per300.101
 

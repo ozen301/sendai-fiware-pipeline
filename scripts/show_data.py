@@ -17,7 +17,11 @@ from dotenv import find_dotenv, load_dotenv
 from sendai_pipeline.auth import AuthClient, AuthSettings
 from sendai_pipeline.comet_client import CometClient, CometSettings, HistoryQuery
 from sendai_pipeline.logging_setup import LoggingSettings, configure_logging
-from sendai_pipeline.metadata import index_by_place_interval, load_metadata
+from sendai_pipeline.metadata import (
+    index_by_place_interval,
+    load_metadata,
+    parse_entity_id,
+)
 from sendai_pipeline.orion_client import OrionClient, OrionSettings
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
@@ -156,7 +160,8 @@ def _validate_source_args(
         for target in targets:
             if target.entity_type is None:
                 raise ShowDataConfigError(
-                    f"missing entity type for target: {target.entity_id}"
+                    f"cannot infer entity type for {target.entity_id!r}; "
+                    "pass an explicit :TYPE or --type"
                 )
 
 
@@ -166,8 +171,6 @@ def _resolve_targets(args: argparse.Namespace) -> list[EntityTarget]:
     if args.place and explicit_specs:
         raise ShowDataConfigError("--place and --entity-id are mutually exclusive")
     if args.place:
-        if args.interval_min is None:
-            raise ShowDataConfigError("--place requires --interval-min")
         return _targets_from_places(args.place, interval_min=args.interval_min)
     if explicit_specs:
         return _parse_entity_specs(explicit_specs, default_type=args.entity_type)
@@ -179,16 +182,47 @@ def _resolve_targets(args: argparse.Namespace) -> list[EntityTarget]:
 def _targets_from_places(
     place_numbers: Sequence[int],
     *,
-    interval_min: int,
+    interval_min: int | None,
 ) -> list[EntityTarget]:
-    """Resolve place numbers through runtime metadata."""
+    """Resolve place numbers to entity targets through runtime metadata.
+
+    Args:
+        place_numbers: Place numbers to resolve.
+        interval_min: Aggregation interval to select. When ``None``
+            (``--interval-min`` omitted), every active interval for the place
+            is returned — usually both the 5-minute and 60-minute entities.
+
+    Returns:
+        Resolved :class:`EntityTarget` rows. With ``interval_min=None`` a
+        single place can expand to multiple targets.
+
+    Raises:
+        ShowDataConfigError: If a place has no active metadata row (at the
+            requested interval, when one is given).
+    """
     places = [
         place for place in load_metadata(_metadata_path_from_env()) if place.active
     ]
+    # Index is keyed by (place_number, interval_min); see metadata module.
     index = index_by_place_interval(places)
 
     targets: list[EntityTarget] = []
     for place_number in place_numbers:
+        # No interval given: take every active interval for this place.
+        if interval_min is None:
+            matched_places = [
+                place for key, place in index.items() if key[0] == place_number
+            ]
+            if not matched_places:
+                raise ShowDataConfigError(
+                    f"no active metadata row for place {place_number}"
+                )
+            targets.extend(
+                EntityTarget(place.entity_id, place.entity_type)
+                for place in matched_places
+            )
+            continue
+        # Interval given: resolve the single matching (place, interval) row.
         place = index.get((place_number, interval_min))
         if place is None:
             raise ShowDataConfigError(
@@ -204,19 +238,96 @@ def _parse_entity_specs(
     *,
     default_type: str | None,
 ) -> list[EntityTarget]:
-    """Parse ``ENTITY_ID[:ENTITY_TYPE]`` command-line specs."""
+    """Parse ``ENTITY_ID[:ENTITY_TYPE]`` command-line specs into targets.
+
+    The entity type is optional. Precedence is: explicit ``:ENTITY_TYPE``, else
+    the ``--type`` flag (*default_type*), else the type inferred from a
+    canonical id (see :func:`sendai_pipeline.metadata.parse_entity_id`).
+
+    Args:
+        specs: Raw ``ENTITY_ID`` or ``ENTITY_ID:ENTITY_TYPE`` strings.
+        default_type: Fallback entity type from ``--type``, used for bare ids
+            when no inline type is given.
+
+    Returns:
+        One :class:`EntityTarget` per spec, in input order.
+
+    Raises:
+        ShowDataConfigError: For an empty id, an empty inline id/type, or a
+            non-canonical bare id with no ``--type`` to fall back on.
+    """
     targets: list[EntityTarget] = []
     for spec in specs:
+        # rpartition on ":" splits off an inline type; no ":" means bare id.
         entity_id, separator, entity_type = spec.rpartition(":")
         if not separator:
+            # Bare id: resolve the type via --type or canonical inference.
             if spec == "":
                 raise ShowDataConfigError("entity id must not be empty")
-            targets.append(EntityTarget(spec, default_type))
+            entity_id = spec
+            entity_type = _entity_type_for_spec(
+                entity_id,
+                explicit_type=default_type,
+                error_hint="pass an explicit :TYPE or --type",
+            )
+            targets.append(EntityTarget(entity_id, entity_type))
             continue
+        # Inline form: both sides must be non-empty; the inline type wins.
         if not entity_id or not entity_type:
             raise ShowDataConfigError(f"invalid entity spec: {spec!r}")
+        _log_if_type_override(entity_id, entity_type)
         targets.append(EntityTarget(entity_id, entity_type))
     return targets
+
+
+def _entity_type_for_spec(
+    entity_id: str,
+    *,
+    explicit_type: str | None,
+    error_hint: str,
+) -> str:
+    """Resolve the entity type for a bare id from ``--type`` or the id itself.
+
+    An explicit *explicit_type* (the ``--type`` flag) wins and shadows any
+    inferred type; otherwise the type is inferred from the canonical id.
+
+    Args:
+        entity_id: Bare entity id (no inline ``:TYPE``).
+        explicit_type: The ``--type`` flag value, or ``None`` if unset.
+        error_hint: Trailing guidance appended to the error message naming
+            the flags this tool accepts.
+
+    Returns:
+        The resolved entity type.
+
+    Raises:
+        ShowDataConfigError: If no ``--type`` is given and *entity_id* is not
+            canonical, so no type can be inferred.
+    """
+    parsed = parse_entity_id(entity_id)
+    if explicit_type is not None:
+        _log_if_type_override(entity_id, explicit_type)
+        return explicit_type
+    if parsed is not None:
+        return parsed.entity_type
+    raise ShowDataConfigError(
+        f"cannot infer entity type for {entity_id!r}; {error_hint}"
+    )
+
+
+def _log_if_type_override(entity_id: str, explicit_type: str) -> None:
+    """Log at DEBUG when an explicit type differs from the id's inferred type."""
+    parsed = parse_entity_id(entity_id)
+    if parsed is not None and parsed.entity_type != explicit_type:
+        logger.debug(
+            "explicit entity type overrides inferred type",
+            extra={
+                "event": "entity_type_override",
+                "entity_id": entity_id,
+                "inferred_entity_type": parsed.entity_type,
+                "explicit_entity_type": explicit_type,
+            },
+        )
 
 
 def _attrs(args: argparse.Namespace) -> str | None:
