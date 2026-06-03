@@ -810,7 +810,9 @@ def _entity_spec(entity_id: str, entity_type: str = TYPE_3600) -> str:
 
 
 def _http_error(status_code: int, text: str) -> requests.HTTPError:
-    response = SimpleNamespace(status_code=status_code, text=text)
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = text.encode("utf-8")
     error = requests.HTTPError(text)
     error.response = response
     return error

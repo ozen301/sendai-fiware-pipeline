@@ -15,12 +15,6 @@ TYPE_3600 = "Blesensor.per3600"
 TYPE_300 = "Blesensor.per300"
 
 
-class FakeHttpResponse:
-    def __init__(self, status_code: int, text: str = "") -> None:
-        self.status_code = status_code
-        self.text = text
-
-
 class FakeAuth:
     def __init__(self, *_args: Any, **_kwargs: Any) -> None:
         self.calls: list[bool] = []
@@ -960,8 +954,11 @@ def _history(entity_id: str, attr: str) -> dict[str, Any]:
 
 
 def _http_error(status_code: int, text: str) -> requests.HTTPError:
+    response = requests.Response()
+    response.status_code = status_code
+    response._content = text.encode("utf-8")
     exc = requests.HTTPError(text)
-    exc.response = FakeHttpResponse(status_code, text)
+    exc.response = response
     return exc
 
 
