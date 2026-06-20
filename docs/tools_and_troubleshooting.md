@@ -461,7 +461,6 @@ uv run python scripts/resend.py {flow|direction}
     [--entity-id ID [--entity-id ID ...]]
     --reason "..."
     [--force]
-    [--allow-old]
     [--send]
 ```
 
@@ -474,17 +473,20 @@ uv run python scripts/resend.py {flow|direction}
 | `--place N` | Place number filter; repeatable. Resolved through metadata. Mutually exclusive with `--entity-id`. |
 | `--entity-id ID` | Explicit entity id; repeatable. Mutually exclusive with `--place`. If `--interval-min` is omitted, all ids must be canonical and resolve to the same interval. |
 | `--reason "..."` | Required. Recorded as audit context in the run log. |
-| `--force` | Bypass the per-target payload-hash skip. By default, targets whose last `ok` payload hash matches the new payload are skipped. |
-| `--allow-old` | Allow `--from` to predate `now − MAX_LOOKBACK_HOURS_*` for the chosen interval. Default refuses old ranges to prevent surprise wide replays. |
+| `--force` | Bypass the per-target skip. By default, any target already `ok` in state is skipped, whether its payload is unchanged or has drifted (see the paragraph below for why a wide range needs `--force`). |
 | `--send` | Perform live Orion writes. Omit for dry-run: prints the planned per-window plan and exits before any MySQL query, Orion token fetch, or Orion HTTP call. |
 
 Resend writes to the same `window_key` as the original publication
 because it's a retry of the original business window, not a synthetic
-replacement. By default, existing per-target `ok` records with
-unchanged payload hashes are skipped (the same code path as normal
-send-mode retries) — so resend is safe to use even when a window is
-already partly complete. Pass `--force` when the intent is to
-redeliver values that haven't changed.
+replacement. By default, any target already `ok` in state is skipped —
+whether its payload is unchanged or has since drifted — using the same
+code path as normal send-mode retries, so resend is safe to use even when
+a window is already partly complete. Pass `--force` when the intent is to
+redeliver regardless of stored status. For a wide range this matters:
+without `--force`, recent in-state windows are skipped while older
+GC-reclaimed windows are re-posted, so the result is non-uniform even
+though the run exits 0 (see ["I need to resend a large range without
+dropping live data"](#i-need-to-resend-a-large-range-without-dropping-live-data)).
 
 For Product A, `--place` / `--entity-id` limits which flow payloads are
 built and POSTed, but it does not shrink a retained window's
@@ -523,6 +525,24 @@ uv run python scripts/resend.py flow \
 > `TimeInstant` re-emission). Use resend judiciously and prefer
 > `state_repair.py recompute_complete` whenever the failure was a
 > bookkeeping bug rather than a missed POST.
+
+> **Lock / live-cron caveat.** `--send` holds the per-product lock for
+> the whole run, no-opping every live tick meanwhile — the same effect as
+> live-cron downtime. For ranges longer than the reprocess floor (≈2h for
+> 5-min data), read ["I need to resend a large range without dropping live
+> data"](#i-need-to-resend-a-large-range-without-dropping-live-data) under
+> Troubleshooting *before* you run.
+
+> **Transient DB errors.** A long `--send` run reuses one MySQL
+> connection across all windows and reconnects automatically on the
+> per-window data fetch if the connection is lost mid-run (an idle
+> timeout, a brief network blip, a failover), so a one-off hiccup no
+> longer aborts the resend. If the run still exits `2` with a connection
+> error, a `--force` re-run of the same chunk is the recovery (duplicate
+> Comet rows are the expected resend cost). Repeated `resend_db_reconnect`
+> warnings in `logs/resend.log` mean the database is persistently
+> unhealthy — fix the DB or network before re-running, rather than
+> retrying into the same outage.
 
 ---
 
@@ -591,8 +611,73 @@ before restarting:
 
 The 72h `MAX_LOOKBACK_HOURS_*` ceilings already permit this without
 changes. Outages longer than 72h need either a higher ceiling for the
-duration of the recovery, or explicit `resend.py … --allow-old` runs for
+duration of the recovery, or explicit `resend.py … --send` runs for
 each lost window.
+
+### "I need to resend a large range without dropping live data"
+
+`resend.py --send` holds the per-product lock (`state/<product>.lock`)
+for the whole run. While it runs, every live 5-minute tick for that
+product no-ops — it takes the lock non-blocking and fails. This is
+**operationally identical to live-cron downtime**: live windows that
+elapse during the run are permanently unpublished once they age past the
+reprocess floor (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`,
+default 2h / 12h). See "Resuming after a planned downtime longer than
+`REPROCESS_HOURS_*`" above for why these never-seen windows are not
+auto-recovered — the danger
+threshold is the reprocess floor, *not* the 72h `MAX_LOOKBACK_HOURS_*`.
+The same caution applies to any long-running tool that holds the
+per-product lock, such as `state_repair.py … --apply`.
+
+Before you run a large backfill, set the required flags and know the
+gotchas:
+
+1. **`--force`** — required for a *uniform* re-publish. Without it, a
+   target already `ok` in state is skipped while a target with no stored
+   record is posted, so a wide range comes out non-uniform (recent windows
+   skipped, older GC-reclaimed windows re-posted) even though the run
+   reports success. See the `--force` row in the `resend.py` reference
+   above.
+2. **Two interval passes** — one invocation publishes one interval. To
+   cover everything, run it twice: once `--interval-min 5` (per300) and
+   once `--interval-min 60` (per3600), each with `--force`.
+3. **Clear dead-letter windows first.** If the range contains a window an
+   operator previously dead-lettered, the run aborts up front (exit 2),
+   listing the offending keys, before posting anything. GC never reclaims
+   dead-letters, so an *old* range can still hold them. Resolve with
+   `state_repair.py` (see its reference above) or narrow the range, then
+   re-run.
+4. **Don't trust exit 0 alone.** The run exits 1 only when a POST fails, so
+   a window left `partial` because an expected target had no data still
+   exits 0. Check `windows_partial` in the `resend_summary` log line (or
+   grep `window_partial` WARNINGs in `logs/resend.log`).
+
+Then keep the live cron from starving — pick one of two approaches:
+
+- **Chunk with gaps** (preferred for an unattended range). Split the
+  range and run it in pieces, leaving at least one cron interval (≥5 min)
+  idle between chunks so a live tick can take the lock and publish current
+  windows. Keep each chunk's *expected hold* under the reprocess floor
+  (≈2h for 5-min data) so no live window ages out before the next live
+  tick fires. Window count is only a rough proxy for hold time — watch
+  the actual run duration, not just the range size.
+- **Maintenance window** (preferred for one big backfill). Run the resend
+  as planned downtime, then republish whatever it shadowed with the
+  floor-widening recovery in "Resuming after a planned downtime longer
+  than `REPROCESS_HOURS_*`": temporarily raise `REPROCESS_HOURS_*` to
+  cover the resend's wall-clock
+  duration, let one or two cron cycles catch up, then restore the
+  steady-state values.
+
+A skipped live tick prints a one-line contention notice to stderr
+(captured by cron), so you can confirm after the fact which ticks a
+resend displaced.
+
+If a resend is hard-killed (`SIGKILL` or an OOM kill), it can leave a
+`state/.<product>.json.*.tmp` file behind. State is written to that temp
+file and then renamed over the real file atomically (`os.replace`), so
+after any normal process failure the real state file is intact and the
+leftover `.tmp` is never read — it is safe to delete before re-running.
 
 ### "An old `partial` window keeps showing up in `state_doctor.py` after I deactivated a place"
 

@@ -56,7 +56,8 @@ summary.
 
 Re-publish source-windows in a specified date range, optionally
 narrowed to a specific place or set of places, by replaying the
-runner-internal `_process_send_window` code path once per window.
+runner-internal `_process_send_window` code path for windows with
+source rows.
 
 ### Note
 
@@ -92,8 +93,7 @@ uv run python scripts/resend.py {flow|direction}
 | `--place` | no | Place number filter. Repeatable. Resolved via metadata. |
 | `--entity-id` | no | Explicit entity id. Repeatable. Mutually exclusive with `--place`. |
 | `--reason` | yes | Audit string; written to every log record this run emits. |
-| `--force` | no | Bypass the per-target payload-hash skip. Default: skip targets whose last `ok` payload hash matches the new payload. |
-| `--allow-old` | no | Allow `--from` to predate `now − MAX_LOOKBACK_HOURS_*` for `--interval-min`. Default: refuse. |
+| `--force` | no | Bypass the per-target skip. Default: skip any target already `ok` in state (whether its payload matches or has drifted); see the `--force` Safety note for why a uniform backfill needs it. |
 | `--send` | no | Live writes. Default: dry-run. |
 
 ### Behavior
@@ -102,12 +102,36 @@ uv run python scripts/resend.py {flow|direction}
    `--interval-min` wins, canonical `--entity-id` can infer it, and
    `--place`/unfiltered runs require the flag. Then validate args
    (range is non-empty and aligned to interval; place/entity-id mutual
-   exclusion; `--reason` non-empty; range age vs
-   `MAX_LOOKBACK_HOURS_*` checked against `--allow-old`).
+   exclusion; `--reason` non-empty). There is no age cap on the range.
 2. Enumerate every source window between `--from` and `--to` at
    `--interval-min` step.
-3. For each window, call the same `_process_send_window` the cron
-   runners use, but with **`interval_metadata` filtered to the
+3. In `--send` mode, prepare the run and then process each window:
+   - **Dead-letter pre-flight (before opening the MySQL connection).** Load
+     the state store and check the enumerated windows: if any is already
+     `dead_letter` in state, abort the whole run (exit 2), listing every
+     offending window key, before any source-row select or Orion POST. A
+     dead-letter records a deliberate operator decision that a window is
+     unrecoverable; refusing up front — rather than aborting mid-run when
+     `begin_window_attempt` first reaches such a window — avoids wasted work
+     and names all blockers at once (clear them with `state_repair.py`, or
+     narrow the range, then re-run). The scan covers every enumerated key
+     regardless of source rows, so a dead-letter window with no source rows
+     — which the per-window step below would otherwise skip silently — is
+     still reported.
+   - **No-source-row skip.** For each enumerated window, select its source
+     rows; if a window has no source rows, skip it before calling
+     `_process_send_window`: no `begin_window_attempt`, no state entry, no
+     save, and no cadence-counter advance. This matches the live runners,
+     which only process windows that have source rows. For direction this
+     prevents permanent `partial` growth from empty windows; for flow it
+     avoids re-touching an existing window that the live path would never
+     revisit.
+   - **Dry-run is unchanged:** it runs no pre-flight, makes no MySQL query,
+     cannot know which windows are empty, and keeps printing the planned
+     range.
+4. For each window with source rows, call the same
+   `_process_send_window` the cron runners use, but with
+   **`interval_metadata` filtered to the
    place/entity-id selection** so the transform step builds payloads
    only for the requested targets. For Product A, completion state still
    follows the normal observed-target rule (`stored ∪ observed`) and a
@@ -118,36 +142,219 @@ uv run python scripts/resend.py {flow|direction}
    constructing payloads; filtering state bookkeeping alone would still
    POST to every active target — that's the opposite of what `--place`
    means to an operator.)
-4. `--force` flips the per-target skip: pass a flag through
+5. `--force` flips the per-target skip: pass a flag through
    `_process_send_window` that causes the hash-skip check to be
    bypassed for this run. (Implementation detail: add a
    `force_resend: bool = False` kwarg to `_process_send_window` in both
    `run_flow.py` and `run_direction.py`; default `False` preserves
    today's behavior.)
-5. Dry-run prints, per window, the planned `(window_key, target_count,
+6. Dry-run prints, per window, the planned `(window_key, target_count,
    skipped_by_hash, would_post)` tuple and exits **before any MySQL
    query, Orion auth token fetch, or Orion HTTP call** (no live side
    effects, no credentials required in dry-run).
+7. **State persistence cadence (`--send`).** Resend does **not** persist
+   state after every target POST. The shared `_process_send_window`
+   rewrites the whole state file on each target by default — durability
+   for the cron runners' small rolling lookback, where the cost is
+   negligible. Across a multi-day resend that same per-target save
+   rewrites a large (production: ~16 MB) state file once per target —
+   O(windows × targets) full rewrites, which dominate runtime. Resend
+   instead suppresses the per-target save and flushes on a coarse
+   per-window cadence: it persists once every `_RESEND_SAVE_EVERY`
+   processed windows (module constant, default `100`) and once more at
+   the end of the run when any processed window or final GC removal
+   remains unflushed. The cadence counter
+   advances once per processed window with source rows — including a
+   window whose source rows are filtered to zero POST targets, which is
+   still processed and can still become `partial` — so any in-memory
+   state change such a window makes is flushed by the cadence rather than
+   left stranded until a later window's save. A no-source-row window is
+   skipped before processing and does not advance the cadence counter.
+   (Implementation detail: add a `persist_each_target: bool = True` kwarg
+   to `_process_send_window` in both `run_flow.py` and `run_direction.py`,
+   guarding the in-loop `state_store.save()`; default `True` preserves
+   the cron runners' per-target durability. Resend passes `False` and
+   owns the cross-window flush cadence. Suppressing the per-target save
+   changes only *when* the store is written to disk, not *what* it
+   contains: the same `record_target` / `recompute_status` mutations the
+   per-target-save path performs still occur, so the final on-disk state
+   is identical to that path for a completed run.) `_RESEND_SAVE_EVERY` is an internal I/O-batching knob,
+   not deployment-tuned configuration, so it is a module constant rather
+   than an env var.
+8. **State GC (`--send`).** Resend reclaims complete windows older than
+   the same horizon the live runners use:
+   `run_started_at − 2×max(MAX_LOOKBACK_HOURS_PER300,
+   MAX_LOOKBACK_HOURS_PER3600)`. Capture `run_started_at` once near the
+   top of the run and reuse it for every GC call; do not recompute a
+   moving `datetime.now()`. Compute the horizon over both intervals
+   because the shared state file holds both `per300` and `per3600`
+   windows, and apply the same non-negative validation the live settings
+   objects apply to both lookback values. Run
+   `gc_complete_before(cutoff)` before each cadence `store.save()` and
+   once before the final flush. Because `gc_complete_before` mutates only
+   the in-memory store, the final flush runs when the cadence counter is
+   greater than zero or when the final GC removed any entries. GC is
+   unconditional in `--send` mode, has no separate `--gc` flag, and does
+   not run in dry-run. It removes only complete windows older than the
+   cutoff; partial failed deliveries and any window inside the horizon
+   remain in state. Resent windows older than the horizon are reclaimed
+   on exit, so they do not linger in `state_doctor`/`show` output.
+9. **DB reconnect on the per-window select (`--send`).** Resend opens one
+   MySQL connection at run start and reuses it for every per-window
+   select. Over a multi-hour run that connection can be dropped
+   server-side (an idle `wait_timeout`, a brief network partition, or a
+   server failover). When a per-window select fails because the
+   connection was lost, resend reopens the connection and retries the
+   select, rather than aborting the whole run on the first transient
+   blip. Specifically:
+   - **Only a genuine connection loss triggers a reconnect.** The retry
+     fires for `pymysql.err.InterfaceError` (socket already closed) or
+     `pymysql.err.OperationalError` whose MySQL error code is `2006`
+     (`CR_SERVER_GONE_ERROR`) or `2013` (`CR_SERVER_LOST`). Every other
+     database error (a bad column, a programming error, a data error)
+     re-raises immediately and aborts the run — a bare `OperationalError`
+     catch would wrongly mask those. (Implementation detail: the
+     predicate lives in `db.py` as `is_connection_lost_error(exc)`,
+     beside the 2006/2013 codes the selector tests already pin, so
+     `scripts/resend.py` does not import `pymysql` directly.)
+   - **Reconnect means a fresh connection, not `ping(reconnect=True)`**
+     (deprecated in PyMySQL). On a caught connection-loss error resend
+     closes the dead handle defensively (a close that itself raises on a
+     dead socket is swallowed, so it never replaces the real error),
+     opens a new connection through the same path used at run start, and
+     retries the select. A fresh connection is safe because each select
+     is self-contained: `connect` uses `autocommit`, there is no open
+     transaction or session state to carry across, and the new
+     connection re-applies all connection settings.
+   - **Retries are bounded.** Resend reconnects at most
+     `_RESEND_DB_RECONNECT_ATTEMPTS` times per select (module constant,
+     default `2` → 3 total tries) with a 1 s fixed backoff between
+     attempts. When the attempts are exhausted, resend re-raises, so a
+     **sustained** outage still aborts the run with exit 2 — the same
+     terminal behavior as before this guard. `_RESEND_DB_RECONNECT_ATTEMPTS`
+     and the backoff are internal reliability knobs, not deployment-tuned
+     configuration, so they are module constants rather than env vars.
+   - **Scope is the select only.** The reconnect wraps the per-window
+     source-row select, not the Orion POST path; POST failures keep their
+     existing handling. The live cron runners (`run_direction` /
+     `run_flow`) are unaffected: each cron process opens its own
+     connection, does its work in a few minutes, and exits, so a dropped
+     connection simply fails one tick and the next tick reconnects — they
+     do not need and must not get this in-run retry, which is why it lives
+     in resend rather than in the shared `db.select_*` helpers.
 
 ### Safety
 
-- The same per-product lock the cron runners take is acquired for the
-  whole invocation. A long range can hold the lock long enough to push
-  back the next cron tick; that's expected. The lock is released on
-  exit (incl. exception).
+- **A long `--send` run starves the live cron like downtime.** The same
+  per-product lock the cron runners take is held (blocking `LOCK_EX`) for
+  the whole invocation. While it is held, every live 5-minute tick for
+  that product takes the lock non-blocking, fails, and no-ops — so a long
+  resend is operationally **equivalent to live-cron downtime** for its
+  duration. Live windows that elapse during the hold are **permanently
+  unpublished** once they age past the live runner's lookback. With no
+  older open window to widen it, that lookback is the **reprocess floor**
+  (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`, default 2h / 12h),
+  **not** the 72h `MAX_LOOKBACK_HOURS_*` — dynamic lookback only widens for
+  windows already in state, and these were never seen. Before a long run,
+  follow "I need to resend a large range without dropping live data" in
+  [tools_and_troubleshooting.md](tools_and_troubleshooting.md) (chunk with
+  gaps, or run as a maintenance window and apply the downtime recovery).
+  The lock is released on exit (incl. exception).
 - **STH-Comet caveat:** re-POSTing a value creates a new Comet history
   row even when the Orion value is unchanged. `--force` makes this
   explicit; without it, targets whose stored payload hash matches the
   new payload are skipped.
-- Range is capped at `MAX_LOOKBACK_HOURS_*` by default; pass
-  `--allow-old` to go further back. Operator error here would be
-  expensive to undo.
+- **`--force` is required for a *uniform* backfill.** Without it, the
+  per-target skip is applied by each target's stored status: a target that
+  is already `ok` is skipped (whether its payload matches or has drifted),
+  while a target with no stored record — for example one whose window was
+  already reclaimed by GC — is posted. Across a range wider than the live
+  GC horizon this is **non-uniform**: recent in-state windows are skipped
+  (no new Comet row) while older reclaimed windows are re-posted (a new
+  Comet row), yet the run still exits 0 and looks uniform. Pass `--force`
+  whenever the intent is a uniform re-publish of the whole range.
+- **Exit 0 does not imply every window is `complete`.** The run exits 1
+  only when a POST fails. Two no-failed-POST cases still leave a window
+  short of `complete`, and neither is a delivery failure — both signal a
+  configuration or source-data gap a bare re-run will not fix — so neither
+  changes the exit code:
+  - An expected target with source rows but **no payload** (its rows were
+    filtered out, or it had no data this window): the window finishes
+    `partial`, emits a per-window `window_partial` WARNING, and is counted
+    in the `resend_summary` `windows_partial` field.
+  - A **new flow window whose effective target set is empty**: it returns
+    before any state update, so it posts nothing, emits no `window_partial`
+    WARNING, and is counted as neither `windows_partial` nor
+    `windows_complete`. Watch for it via the per-window
+    `resend_window_processed` records (zero posts) rather than the
+    aggregate counts.
+- **A dead-letter window in range aborts the run (exit 2).** The dead-letter
+  pre-flight (Behavior step 3) refuses the run up front, before any POST,
+  and lists every offending key. Clear them with `state_repair.py` or
+  narrow the range, then re-run.
+- **No age cap on the range.** Resend publishes exactly the `--from` /
+  `--to` range you name; there is no `MAX_LOOKBACK_HOURS_*` ceiling on how
+  far back it may reach. The guardrail against an over-wide replay is
+  dry-run (the default): it prints one line per planned window — each with
+  its target count and would-post count — before any live write, so you can
+  gauge how large the range is before adding `--send`.
+- Empty source-row windows are skipped before state mutation. This
+  prevents permanent `partial` accumulation for windows the live runners
+  would never create.
+- **Durability tradeoff of the coarse save cadence.** Because state is
+  flushed every `_RESEND_SAVE_EVERY` processed windows rather than after
+  each target (see Behavior step 7), a true crash or hard kill
+  (SIGKILL, power loss) can lose at most `_RESEND_SAVE_EVERY` windows of
+  *recorded* delivery progress. A handled abort, such as exhausted DB
+  reconnects, best-effort flushes completed windows before exit; if that
+  flush fails, the original error still decides the exit code. A re-run
+  re-POSTs only progress that did not reach disk, creating extra STH-Comet
+  rows — already the expected cost of a resend (see the STH-Comet caveat
+  above), and bounded by the cadence and by chunked operation. Because
+  resend suppresses the per-target save, every cadence flush follows a
+  full `recompute_status`, so a hard kill cannot leave a flushed window
+  with recorded targets but a stale aggregate status on disk; it only drops
+  the unflushed in-memory windows, which the re-run reprocesses. (This
+  applies to resend; the live runners keep per-target saves and are
+  unaffected by this reasoning.)
+- **A hard kill can orphan a `.tmp` file.** `save()` writes a uniquely
+  named temporary file and renames it over the state file atomically
+  (`os.replace`), so after any normal process failure the on-disk state is
+  intact. A `SIGKILL` between the write and the rename can leave a
+  `state/.<product>.json.*.tmp` file behind; it is never read and is safe
+  to delete.
+- In-resend GC (see Behavior step 8) bounds mid-run state growth and
+  returns complete old windows to the live runner's baseline on exit.
+- **A transient DB blip no longer aborts a long run.** A dropped
+  connection on a per-window select is recovered by a bounded reconnect
+  (see Behavior step 9), so a single network or server hiccup mid-resend
+  does not throw away the chunk. Only a **sustained** outage (reconnects
+  exhausted) still aborts with exit 2; the recovery is to re-run the
+  chunk with `--force` (duplicate STH-Comet rows are the expected resend
+  cost). A repeated `resend_db_reconnect` storm in the log signals the DB
+  itself is unhealthy, not a one-off blip.
 
 ### Log events
 
 - `resend_requested` (run start; carries args + resolved entity ids).
-- `resend_window_processed` (per window; status counts).
-- `resend_summary` (run end).
+- `resend_window_processed` (per processed source-row window; status
+  counts).
+- `resend_window_empty` (DEBUG; per skipped no-source-row window).
+- `resend_gc` (INFO; carries product, interval, reason, GC cutoff, and
+  reclaimed-window count).
+- `resend_db_reconnect` (WARNING; per reconnect attempt on a dropped
+  connection; carries product, interval, reason, the window key, attempt
+  number, and the error class — never the DSN or password).
+- `resend_db_reconnect_exhausted` (ERROR; `logger.exception` when the
+  bounded reconnect attempts are exhausted, just before the run aborts;
+  carries product, interval, reason, the window key, and attempt count so
+  the operator knows which chunk to re-run).
+- `resend_summary` (run end; includes `windows_empty` for skipped
+  no-source-row windows, `windows_gc` for complete windows reclaimed by
+  resend GC, and `windows_partial` / `windows_complete` for the windows
+  whose aggregate status was recomputed. A new flow window with an empty
+  effective target set returns before recomputation and is in neither count
+  — see the exit-code note under Safety).
 
 ### Tests
 
@@ -157,7 +364,38 @@ uv run python scripts/resend.py {flow|direction}
 - `test_resend_force_bypasses_hash_skip`
 - `test_resend_rejects_place_and_entity_id_together`
 - `test_resend_requires_reason`
-- `test_resend_old_window_rejected_without_allow_old`
+- `test_resend_accepts_old_range`
+- `test_resend_skips_window_with_no_source_rows`
+- `test_resend_empty_window_not_persisted_as_partial`
+- `test_resend_summary_reports_empty_window_count`
+- `test_resend_filtered_to_empty_window_still_creates_partial`
+- `test_resend_persists_on_window_cadence_not_per_target`
+- `test_resend_final_state_matches_per_target_baseline`
+- `test_resend_gc_removes_complete_windows_older_than_horizon`
+- `test_resend_gc_keeps_complete_windows_inside_horizon`
+- `test_resend_gc_keeps_partial_windows`
+- `test_resend_gc_cutoff_uses_max_of_both_intervals`
+- `test_resend_gc_runs_periodically_and_finally`
+- `test_resend_dry_run_does_not_gc`
+- `test_resend_reconnects_after_dropped_connection_and_continues`
+- `test_resend_reconnect_retries_are_bounded_then_aborts`
+- `test_resend_does_not_reconnect_on_non_connection_operational_error`
+- `test_resend_does_not_reconnect_on_non_connection_db_error`
+- `test_resend_reconnect_preserves_progress`
+- `test_resend_final_close_on_dead_handle_does_not_raise`
+- `test_resend_dry_run_unaffected_by_reconnect_logic`
+- `test_resend_summary_reports_partial_and_complete_window_counts`
+- `test_resend_partial_window_keeps_exit_code_zero`
+- `test_resend_dry_run_summary_reports_zero_partial_complete`
+- `test_resend_aborts_before_posting_when_range_contains_dead_letter`
+- `test_resend_preflight_lists_all_dead_letter_windows`
+- `test_resend_preflight_aborts_on_dead_letter_with_no_source_rows`
+- `test_resend_preflight_allows_range_with_no_dead_letter`
+
+The shared kwarg also carries its own contract in the runner test
+modules: `_process_send_window` saves once per posted target by default
+and skips the in-loop save when `persist_each_target=False`, for both
+`run_flow` and `run_direction`.
 
 ---
 
@@ -601,9 +839,11 @@ that document for current usage; this spec preserves the design rationale.
 
 ## Decided design choices
 
-1. **`--allow-old` for resend.** Tool refuses ranges older than
-   `MAX_LOOKBACK_HOURS_*` by default; operator must pass `--allow-old`
-   to override.
+1. **No age gate on resend (removed `--allow-old`).** An earlier design
+   refused ranges older than `MAX_LOOKBACK_HOURS_*` unless `--allow-old`
+   was passed. That gate was removed: the threshold borrowed a live-runner
+   lookback knob unrelated to manual-resend safety, and it blocked even a
+   dry-run preview of an old range. Dry-run-by-default is the guardrail.
 2. **`--i-know-this-is-production` guardrail on `delete_history.py`.**
    Included.
 3. **Four separate tools, not a unified `data.py`.** Matches the

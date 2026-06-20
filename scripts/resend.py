@@ -5,6 +5,7 @@ import fcntl
 import logging
 import os
 import sys
+import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -62,6 +63,9 @@ _MAX_LOOKBACK_ENV: dict[int, str] = {
     5: "MAX_LOOKBACK_HOURS_PER300",
     60: "MAX_LOOKBACK_HOURS_PER3600",
 }
+_RESEND_SAVE_EVERY = 100
+_RESEND_DB_RECONNECT_ATTEMPTS = 2
+_RESEND_DB_RECONNECT_BACKOFF_SECONDS = 1
 _WINDOW_FORMAT = "%Y%m%d_%H%M"
 
 
@@ -102,7 +106,6 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--entity-id", action="append", default=[])
     parser.add_argument("--reason", required=True)
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--allow-old", action="store_true")
     parser.add_argument("--send", action="store_true")
     parser.add_argument("--max-imputation-tier", type=_non_negative_int)
     return parser.parse_args(argv)
@@ -142,8 +145,6 @@ def _build_plan(args: argparse.Namespace) -> ResendPlan:
     _validate_window_alignment(to_dt, interval_min, flag="--to")
     if to_dt < from_dt:
         raise ResendConfigError("--to must be greater than or equal to --from")
-    if not args.allow_old:
-        _validate_lookback(from_dt, interval_min)
 
     filter_settings = FilterSettings.from_env()
     source_max_imputation_tier = (
@@ -308,16 +309,32 @@ def _dry_run(plan: ResendPlan) -> int:
             count_would_create=target_count,
             dry_run=True,
         )
-    _log_summary(plan, windows_seen=len(plan.windows), posts_ok=0, posts_failed=0)
+    _log_summary(
+        plan,
+        windows_seen=len(plan.windows),
+        posts_ok=0,
+        posts_failed=0,
+        windows_partial=0,
+        windows_complete=0,
+    )
     return 0
 
 
 def _send_resend(plan: ResendPlan) -> int:
+    run_started_at = datetime.now(JST)
     _log_requested(plan)
     posts_ok = 0
     posts_failed = 0
+    windows_empty = 0
+    windows_gc = 0
+    run_windows_partial = 0
+    run_windows_complete = 0
 
-    db_connection = _connect_db()
+    state_path = PRODUCT_STATE_PATHS[cast("Any", plan.product)]
+    store = WindowStateStore.load(state_path)
+    _abort_on_dead_letter_windows(plan, store)
+
+    db_connection = None
     try:
         filter_settings = FilterSettings.from_env()
         auth_client = auth.AuthClient(auth.AuthSettings.from_env())
@@ -325,53 +342,131 @@ def _send_resend(plan: ResendPlan) -> int:
             orion_client.OrionSettings.from_env(),
             auth=auth_client,
         )
-        store = WindowStateStore.load(PRODUCT_STATE_PATHS[cast("Any", plan.product)])
+        db_connection = _connect_db()
+        gc_cutoff = _resend_gc_cutoff(run_started_at)
 
-        for startdate in plan.windows:
-            counts = _counts_for_product(plan.product)
-            rows = _select_rows(
-                plan.product,
-                db_connection,
-                interval_min=plan.interval_min,
-                startdate=startdate,
-                max_imputation_tier=plan.source_max_imputation_tier,
-            )
-            _process_window(
-                plan,
-                window_key=_window_key(plan.product, plan.interval_min, startdate),
-                startdate=startdate,
-                rows=rows,
-                orion=orion,
-                state_store=store,
-                filter_settings=filter_settings,
-                counts=counts,
-            )
-            posts_ok += counts.posts_ok
-            posts_failed += counts.posts_failed
-            _log_window_processed(
-                plan,
-                window_key=_window_key(plan.product, plan.interval_min, startdate),
-                rows=len(rows),
-                posts_ok=counts.posts_ok,
-                posts_failed=counts.posts_failed,
-                rows_dropped=counts.rows_dropped,
-                count_skipped=0,
-                count_would_create=len(plan.expected_target_ids),
-                dry_run=False,
-            )
-        store.save()
+        counter = 0
+        try:
+            for startdate in plan.windows:
+                counts = _counts_for_product(plan.product)
+                window_key = _window_key(plan.product, plan.interval_min, startdate)
+                rows, db_connection = _select_rows_with_reconnect(
+                    plan,
+                    db_connection,
+                    window_key=window_key,
+                    startdate=startdate,
+                )
+                if not rows:
+                    windows_empty += 1
+                    _log_window_empty(plan, window_key=window_key)
+                    continue
+
+                _process_window(
+                    plan,
+                    window_key=window_key,
+                    startdate=startdate,
+                    rows=rows,
+                    orion=orion,
+                    state_store=store,
+                    filter_settings=filter_settings,
+                    counts=counts,
+                    persist_each_target=False,
+                )
+                posts_ok += counts.posts_ok
+                posts_failed += counts.posts_failed
+                run_windows_partial += counts.windows_partial
+                run_windows_complete += counts.windows_complete
+                _log_window_processed(
+                    plan,
+                    window_key=window_key,
+                    rows=len(rows),
+                    posts_ok=counts.posts_ok,
+                    posts_failed=counts.posts_failed,
+                    rows_dropped=counts.rows_dropped,
+                    count_skipped=0,
+                    count_would_create=len(plan.expected_target_ids),
+                    dry_run=False,
+                )
+                counter += 1
+                if counter >= _RESEND_SAVE_EVERY:
+                    removed = _run_resend_gc(plan, store, gc_cutoff)
+                    windows_gc += removed
+                    store.save()
+                    counter = 0
+        except Exception:
+            _best_effort_save(store)
+            raise
+        removed = _run_resend_gc(plan, store, gc_cutoff)
+        windows_gc += removed
+        if counter > 0 or removed > 0:
+            store.save()
     finally:
-        close = getattr(db_connection, "close", None)
-        if close is not None:
-            close()
+        if db_connection is not None:
+            _close_db_connection(db_connection)
 
     _log_summary(
         plan,
         windows_seen=len(plan.windows),
         posts_ok=posts_ok,
         posts_failed=posts_failed,
+        windows_empty=windows_empty,
+        windows_gc=windows_gc,
+        windows_partial=run_windows_partial,
+        windows_complete=run_windows_complete,
     )
     return 0 if posts_failed == 0 else 1
+
+
+def _abort_on_dead_letter_windows(
+    plan: ResendPlan,
+    store: WindowStateStore,
+) -> None:
+    """Abort live resend when requested windows include dead-letter state."""
+    dead_letter_keys: list[str] = []
+    for startdate in plan.windows:
+        window_key = _window_key(plan.product, plan.interval_min, startdate)
+        if store.window_status(window_key) == "dead_letter":
+            dead_letter_keys.append(window_key)
+    if dead_letter_keys:
+        raise ResendConfigError(
+            f"resend range contains dead-letter window(s): {_csv(dead_letter_keys)}"
+        )
+
+
+def _resend_gc_cutoff(run_started_at: datetime) -> datetime:
+    """Return the stable complete-window GC cutoff for a resend run."""
+    max_hours = max(_max_lookback_hours(5), _max_lookback_hours(60))
+    horizon_hours = max(0, 2 * max_hours)
+    return run_started_at - timedelta(hours=horizon_hours)
+
+
+def _run_resend_gc(
+    plan: ResendPlan,
+    store: WindowStateStore,
+    cutoff: datetime,
+) -> int:
+    """Reclaim old complete windows and log the per-call result."""
+    removed = store.gc_complete_before(cutoff)
+    logger.info(
+        "resend gc completed",
+        extra={
+            "event": "resend_gc",
+            "product": plan.product,
+            "interval_min": plan.interval_min,
+            "reason": plan.reason,
+            "cutoff": cutoff.isoformat(),
+            "windows_gc": removed,
+        },
+    )
+    return removed
+
+
+def _best_effort_save(store: WindowStateStore) -> None:
+    """Try to flush resend progress without replacing the original failure."""
+    try:
+        store.save()
+    except Exception:
+        return
 
 
 def _metadata_for_request(
@@ -433,6 +528,7 @@ def _process_window(
     state_store: WindowStateStore,
     filter_settings: FilterSettings,
     counts: Any,
+    persist_each_target: bool,
 ) -> None:
     process = (
         process_flow_window if plan.product == "flow" else process_direction_window
@@ -449,6 +545,7 @@ def _process_window(
         expected_target_ids=plan.expected_target_ids,
         counts=counts,
         force_resend=plan.force,
+        persist_each_target=persist_each_target,
     )
 
 
@@ -482,6 +579,75 @@ def _select_rows(
             upper_bound=sql_bound(source_start),
         )
     )
+
+
+def _select_rows_with_reconnect(
+    plan: ResendPlan,
+    db_connection: Any,
+    *,
+    window_key: str,
+    startdate: str,
+) -> tuple[list[Mapping[str, Any]], Any]:
+    """Select one resend window, reopening MySQL after dropped connections."""
+    connection = db_connection
+    for failed_attempts in range(_RESEND_DB_RECONNECT_ATTEMPTS + 1):
+        try:
+            rows = _select_rows(
+                plan.product,
+                connection,
+                interval_min=plan.interval_min,
+                startdate=startdate,
+                max_imputation_tier=plan.source_max_imputation_tier,
+            )
+        except Exception as exc:
+            if not db.is_connection_lost_error(exc):
+                raise
+            if failed_attempts >= _RESEND_DB_RECONNECT_ATTEMPTS:
+                logger.exception(
+                    "db reconnect exhausted before resend select",
+                    extra={
+                        "event": "resend_db_reconnect_exhausted",
+                        "product": plan.product,
+                        "interval_min": plan.interval_min,
+                        "reason": plan.reason,
+                        "window": window_key,
+                        "attempts": _RESEND_DB_RECONNECT_ATTEMPTS,
+                    },
+                )
+                _close_db_connection(connection)
+                raise
+
+            attempt = failed_attempts + 1
+            logger.warning(
+                "db reconnect before resend select",
+                extra={
+                    "event": "resend_db_reconnect",
+                    "product": plan.product,
+                    "interval_min": plan.interval_min,
+                    "reason": plan.reason,
+                    "window": window_key,
+                    "attempt": attempt,
+                    "error_class": exc.__class__.__name__,
+                },
+            )
+            _close_db_connection(connection)
+            time.sleep(_RESEND_DB_RECONNECT_BACKOFF_SECONDS)
+            connection = _connect_db()
+        else:
+            return rows, connection
+
+    raise AssertionError("unreachable resend reconnect state")
+
+
+def _close_db_connection(db_connection: Any) -> None:
+    """Close a MySQL handle without letting dead-socket close errors escape."""
+    close = getattr(db_connection, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        return
 
 
 def _connect_db() -> Any:
@@ -534,27 +700,20 @@ def _validate_window_alignment(
         raise ResendConfigError(f"{flag} is not aligned to {interval_min} minutes")
 
 
-def _validate_lookback(from_dt: datetime, interval_min: int) -> None:
-    now = datetime.now(JST)
-    max_hours = _max_lookback_hours(interval_min)
-    if from_dt < now - timedelta(hours=max_hours):
-        raise ResendConfigError(
-            f"--from is older than MAX_LOOKBACK_HOURS for interval {interval_min}; "
-            "pass --allow-old to continue"
-        )
-
-
 def _max_lookback_hours(interval_min: int) -> int:
     key = _MAX_LOOKBACK_ENV[interval_min]
     value = os.environ.get(key)
     if value is None or value == "":
         return 72
     try:
-        return int(value)
+        parsed = int(value)
     except ValueError as exc:
         raise ResendConfigError(
             f"environment variable must be an integer: {key}"
         ) from exc
+    if parsed < 0:
+        raise ResendConfigError(f"environment variable must be non-negative: {key}")
+    return parsed
 
 
 def _enumerate_windows(
@@ -615,12 +774,29 @@ def _log_window_processed(
     )
 
 
+def _log_window_empty(plan: ResendPlan, *, window_key: str) -> None:
+    logger.debug(
+        "resend window empty",
+        extra={
+            "event": "resend_window_empty",
+            "product": plan.product,
+            "interval_min": plan.interval_min,
+            "window": window_key,
+            "reason": plan.reason,
+        },
+    )
+
+
 def _log_summary(
     plan: ResendPlan,
     *,
     windows_seen: int,
     posts_ok: int,
     posts_failed: int,
+    windows_partial: int,
+    windows_complete: int,
+    windows_empty: int = 0,
+    windows_gc: int = 0,
 ) -> None:
     logger.info(
         "resend summary",
@@ -631,6 +807,10 @@ def _log_summary(
             "windows_seen": windows_seen,
             "posts_ok": posts_ok,
             "posts_failed": posts_failed,
+            "windows_empty": windows_empty,
+            "windows_gc": windows_gc,
+            "windows_partial": windows_partial,
+            "windows_complete": windows_complete,
             "reason": plan.reason,
             "dry_run": not plan.send,
         },

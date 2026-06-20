@@ -232,6 +232,14 @@ class WindowStateStore:
         target = window.get("targets", {}).get(entity_id)
         return target if isinstance(target, dict) else None
 
+    def window_status(self, window_key: str) -> str | None:
+        """Return a window's aggregate status, or ``None`` if absent."""
+        window = self._windows().get(window_key)
+        if window is None:
+            return None
+        status = window.get("status")
+        return status if isinstance(status, str) else None
+
     def expected_target_ids(self, window_key: str) -> list[str] | None:
         """Return a window's stored expected target snapshot, if present."""
         window = self._windows().get(window_key)

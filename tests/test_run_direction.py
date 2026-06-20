@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -562,6 +562,147 @@ def test_run_direction_send_mode_posts_one_payload_per_target_and_completes_wind
     assert len(records(caplog, "window_complete")) == 1
 
 
+def test_process_send_window_default_saves_per_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    targets = [place(place_number=10), place(place_number=11)]
+    rows = [
+        direction_row(
+            from_group_place_id="sendai202603.10",
+            to_group_place_id="sendai202603.11",
+            count=12,
+        )
+    ]
+    store = state_store(tmp_path, Clock([NOW] * 10))
+    save_count = 0
+    real_save = store.save
+
+    def save_spy() -> None:
+        nonlocal save_count
+        save_count += 1
+        real_save()
+
+    monkeypatch.setattr(store, "save", save_spy)
+
+    run_direction_module._process_send_window(
+        "per3600/20260523_0900",
+        interval_min=60,
+        startdate="20260523_0900",
+        rows_for_window=cast(Any, rows),
+        orion=FakeOrionClient(),
+        state_store=store,
+        filter_settings=filter_settings(),
+        interval_metadata=index_by_place_interval(
+            active_places(targets, target_batches=["2026"])
+        ),
+        expected_target_ids=entity_ids(targets),
+        counts=run_direction_module._RunCounts(),
+    )
+
+    assert save_count == 2
+
+
+def test_process_send_window_no_persist_zero_in_loop_saves(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    targets = [place(place_number=10), place(place_number=11)]
+    rows = [
+        direction_row(
+            from_group_place_id="sendai202603.10",
+            to_group_place_id="sendai202603.11",
+            count=12,
+        )
+    ]
+    store = state_store(tmp_path, Clock([NOW] * 10))
+    save_count = 0
+
+    def save_spy() -> None:
+        nonlocal save_count
+        save_count += 1
+
+    monkeypatch.setattr(store, "save", save_spy)
+
+    run_direction_module._process_send_window(
+        "per3600/20260523_0900",
+        interval_min=60,
+        startdate="20260523_0900",
+        rows_for_window=cast(Any, rows),
+        orion=FakeOrionClient(results=[{"status": 502, "ok": False}]),
+        state_store=store,
+        filter_settings=filter_settings(),
+        interval_metadata=index_by_place_interval(
+            active_places(targets, target_batches=["2026"])
+        ),
+        expected_target_ids=entity_ids(targets),
+        counts=run_direction_module._RunCounts(),
+        persist_each_target=False,
+    )
+
+    window = store.as_dict()["windows"]["per3600/20260523_0900"]
+    assert save_count == 0
+    assert window["status"] == "partial"
+    assert sorted(window["targets"]) == sorted(entity_ids(targets))
+    assert window["targets"][targets[0].entity_id]["status"] == "failed"
+    assert window["targets"][targets[1].entity_id]["status"] == "ok"
+
+
+def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
+    targets = [place(place_number=10), place(place_number=11)]
+    rows = [
+        direction_row(
+            from_group_place_id="sendai202603.10",
+            to_group_place_id="sendai202603.11",
+            count=12,
+        )
+    ]
+    interval_metadata = index_by_place_interval(
+        active_places(targets, target_batches=["2026"])
+    )
+    default_store = WindowStateStore(
+        tmp_path / "default" / "direction.json",
+        now=Clock([NOW] * 10),
+    )
+    deferred_store = WindowStateStore(
+        tmp_path / "deferred" / "direction.json",
+        now=Clock([NOW] * 10),
+    )
+
+    run_direction_module._process_send_window(
+        "per3600/20260523_0900",
+        interval_min=60,
+        startdate="20260523_0900",
+        rows_for_window=cast(Any, rows),
+        orion=FakeOrionClient(results=[{"status": 502, "ok": False}]),
+        state_store=default_store,
+        filter_settings=filter_settings(),
+        interval_metadata=interval_metadata,
+        expected_target_ids=entity_ids(targets),
+        counts=run_direction_module._RunCounts(),
+    )
+    default_store.save()
+
+    run_direction_module._process_send_window(
+        "per3600/20260523_0900",
+        interval_min=60,
+        startdate="20260523_0900",
+        rows_for_window=cast(Any, rows),
+        orion=FakeOrionClient(results=[{"status": 502, "ok": False}]),
+        state_store=deferred_store,
+        filter_settings=filter_settings(),
+        interval_metadata=interval_metadata,
+        expected_target_ids=entity_ids(targets),
+        counts=run_direction_module._RunCounts(),
+        persist_each_target=False,
+    )
+    deferred_store.save()
+
+    assert json.loads(default_store.path.read_text(encoding="utf-8")) == json.loads(
+        deferred_store.path.read_text(encoding="utf-8")
+    )
+
+
 def test_run_direction_send_mode_writes_people_count_flow_attribute(
     tmp_path: Path,
 ) -> None:
@@ -964,10 +1105,11 @@ def test_main_uses_direction_lock_path(
     assert not (tmp_path / "state" / "flow.lock").exists()
 
 
-def test_main_flock_contention_returns_zero_silently(
+def test_main_flock_contention_returns_zero_and_warns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(tmp_path)
     set_required_main_env(monkeypatch, tmp_path)
@@ -987,6 +1129,10 @@ def test_main_flock_contention_returns_zero_silently(
         code = run_direction_main(argv=[])
 
     assert code == 0
+    assert (
+        "[sendai-pipeline] direction run skipped: lock held by another process"
+        in capsys.readouterr().err
+    )
     assert caplog.records == []
 
 

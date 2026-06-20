@@ -238,7 +238,7 @@ because some target hasn't reported `ok` yet — is still retried by the
 normal run. In our case, source rows can arrive at MySQL up to 3 days
 late, so both intervals default to 72h regardless of aggregation type.
 Windows older than the horizon are not picked up by the normal run; they
-require an explicit operator resend (`scripts/resend.py --allow-old`).
+require an explicit operator resend (`scripts/resend.py … --send`).
 
 ## End-to-end data flow
 

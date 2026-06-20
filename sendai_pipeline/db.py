@@ -57,6 +57,24 @@ class DbConfigError(DbError):
     """Raised when required database configuration is missing or invalid."""
 
 
+def is_connection_lost_error(exc: BaseException) -> bool:
+    """Return whether a PyMySQL exception means the connection was lost.
+
+    Args:
+        exc: Exception raised by a database operation.
+
+    Returns:
+        ``True`` for PyMySQL closed-socket errors, server-gone errors, and
+        server-lost errors; ``False`` for all other exceptions.
+    """
+    if isinstance(exc, pymysql.err.InterfaceError):
+        return True
+    if not isinstance(exc, pymysql.err.OperationalError):
+        return False
+    code = exc.args[0] if exc.args else None
+    return code in {2006, 2013}
+
+
 @dataclass
 class DbSettings:
     """Configuration for MySQL database connections."""

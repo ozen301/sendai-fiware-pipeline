@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -345,6 +346,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
+            print(
+                "[sendai-pipeline] flow run skipped: lock held by another process",
+                file=sys.stderr,
+            )
             return 0
 
         logging_settings = LoggingSettings.from_env()
@@ -501,6 +506,7 @@ def _process_send_window(
     counts: _RunCounts,
     force_resend: bool = False,
     skip_if_no_new_target: bool = False,
+    persist_each_target: bool = True,
 ) -> bool:
     """Post one source window and update persistent per-target state.
 
@@ -595,7 +601,8 @@ def _process_send_window(
             http_status=int(result.get("status", 0)),
             payload_sha256=payload_sha256,
         )
-        state_store.save()
+        if persist_each_target:
+            state_store.save()
 
     status = state_store.recompute_status(window_key, effective_expected_target_ids)
     if status == "complete":
