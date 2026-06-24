@@ -5,9 +5,9 @@ FIWARE pipeline. For the public-facing project description and
 operator-facing docs, start at [README.md](README.md), which carries
 the full documentation index.
 
-Do not commit credentials, private hostnames, restricted reference
-material, `ref_docs/`, runtime output, logs, state, metadata
-snapshots, token caches, or `.env` / `*.env` files. Private local
+Do not commit **excluded content**: credentials, private hostnames,
+restricted reference material, `ref_docs/`, runtime output, logs,
+state, metadata snapshots, token caches, or `.env` / `*.env` files. Private local
 reference material may exist under `ref_docs/` (gitignored, possibly
 absent in another checkout); ask the user for specific documents if
 you need one.
@@ -19,16 +19,19 @@ you need one.
 - Dependencies live in `pyproject.toml`.
 - Prefer production code under `sendai_pipeline/`; operator CLI shims
   go under `scripts/`.
-- Keep implementation aligned with [docs/pipeline_spec.md](docs/pipeline_spec.md).
-  When the spec and code drift, fix one or the other deliberately —
-  don't let the drift persist.
+- Keep implementation aligned with [docs/pipeline_spec.md](docs/pipeline_spec.md),
+  the canonical data contract. The spec is authoritative for that data
+  contract; the code is authoritative for *how* it is implemented. If
+  they disagree on the contract itself, treat it as a defect: decide
+  deliberately which side is right and fix the other, rather than
+  letting the drift persist.
 - AI agents should not commit without explicit authorization. Leave
   changes for the user to review and commit manually.
 
 ## Workflow
 
 New features follow Spec → Tests → Implementation → CI validation →
-drift detection:
+drift prevention:
 
 1. **Spec:** Write or update the behavioral/architectural contract.
    Human reviews before implementation.
@@ -38,51 +41,74 @@ drift detection:
    context. Human reviews before committing.
 4. **CI validation:** Automated checks confirm the contract still
    holds.
-5. **Drift detection:** Keep code and spec in sync as either changes.
+5. **Drift prevention:** When a change touches a documented contract
+   (a column→attribute mapping, payload shape, filter rule, or
+   entity-id convention), update `docs/pipeline_spec.md` in the same
+   change so code and spec do not silently diverge. Human or cross-agent
+   review should verify they still agree.
 
 ### Cross-Agent Validation
 
-Prefer cross-model validation when both Codex and Claude Code are
-available: one agent authors (the **Author**), the other reviews
-(the **Reviewer**), and a **Commander** accepts findings and hands
-the post-review artifact to the human. The Commander is typically
-the Author or the Reviewer — the role is about authority over the
-final hand-off, not a third agent. Do not ask an agent to review
-its own artifact, and avoid recursive review loops — a delegated
-author or reviewer should not call another agent unless explicitly
-asked.
+Use cross-agent validation actively for complicated or high-stakes
+work, not only for code. A plan or design for a critical or complex
+change, a spec, a non-trivial refactor, or a hard diagnosis can go
+through review as readily as an implementation. The more consequential
+or non-obvious the work is, the stronger the case for a second
+model's review before you commit to a direction. Prefer cross-model
+validation when both Codex and Claude Code are available.
 
-When sending diffs or files between agents for review, send only
-ordinary source code, tests, documentation, and configuration. Do
-**not** send `.env` / `*.env`, credentials, private hostnames,
-restricted reference material, `ref_docs/` content, runtime output,
-logs, state, metadata snapshots, or token caches. If a diff mixes
-ordinary code with excluded content, send only a minimized subset.
+The process uses three roles:
 
-If Claude invokes Codex through `codex:rescue`, choose reasoning
-effort explicitly:
+- **Author:** produces the artifact under review.
+- **Reviewer:** critiques the artifact and returns findings.
+- **Commander:** holds authority over the final hand-off to the human.
+  This is usually the Author or the Reviewer, not a separate third
+  agent.
 
-- **medium:** routine tasks, straightforward edits, well-understood
-  problems.
-- **high:** non-obvious logic, debugging, API integration, or
-  extra-care reviews.
-- **xhigh:** architecture decisions, multi-step planning, or work
-  with significant consequences if wrong.
+Two guardrails apply: never ask an agent to review its own artifact,
+and avoid recursive agent delegation. A delegated Author or Reviewer
+should not call another agent unless explicitly asked.
 
-When a Codex thread starts read-only (e.g. a review pass) and you
-later need write access, use `--fresh --write`, not `--resume --write`.
-The sandbox is fixed at thread birth — `--resume` inherits the
-read-only sandbox of the dead thread and `apply_patch` will be
-rejected. `--fresh` opens a new thread with the correct sandbox from
-the start.
+Review is **iterative, not single-pass**. Each round:
+
+1. The Commander sends the artifact to the Reviewer; the Reviewer
+   returns findings.
+2. The Commander accepts, applies, or deliberately declines each
+   finding, recording why when declining; the Author makes the edits.
+3. The Commander sends the updated artifact back for the next round.
+
+Repeat until the Reviewer raises no new substantive issues. Converge
+in a bounded number of rounds. If findings are not settling, stop and
+surface the disagreement to the human rather than looping indefinitely.
+Reuse the Reviewer's session across rounds so it keeps prior context;
+re-review stays read-only, so resuming is safe.
+
+Whenever you send diffs or files to another agent, send only ordinary
+source code, tests, documentation, and configuration. Do **not** send
+any of the excluded content listed above. If a diff mixes ordinary
+code with excluded content, send only a minimized subset.
+
+When working with Codex:
+
+- Choose reasoning effort explicitly: **medium** for routine,
+  well-understood tasks; **high** for non-obvious logic, debugging,
+  API integration, or extra-care reviews; **xhigh** for architecture
+  decisions, multi-step planning, or work with significant
+  consequences if wrong.
+- A Codex thread's sandbox is fixed when the thread is created. The
+  `codex:*` skills expose this through their `task` command: a
+  read-only thread, such as a review pass, that later needs to write
+  must start fresh with `--fresh --write`, not `--resume --write`
+  (resuming inherits the original thread's read-only sandbox, so
+  `apply_patch` is rejected).
 
 ### Implementation Delegation
 
 When delegating implementation to another agent, pass only the
-reviewed test files (as the authoritative spec), relevant constraints
-(style, logging, configuration, library choices), and the permitted
-edit area. Do not include your implementation approach — independent
-authoring is the goal.
+reviewed test files (the implementation contract for this delegation),
+relevant constraints (style, logging, configuration, library choices),
+and the permitted edit area. Do not include your implementation
+approach: independent authoring is the goal.
 
 ## Code Style
 
@@ -125,8 +151,8 @@ implementation complete; they must be clean.
 - Referencing a `docs/` file from code, docstrings, or comments is
   allowed where it genuinely helps the reader. Inlining the invariant
   or rationale is still fine when that reads better.
-- Writing style: keep prose friendly to non-native English speakers —
-  clear structure and accessible wording — while assuming a
+- Writing style: keep prose friendly to non-native English speakers
+  (clear structure and accessible wording) while assuming a
   technically fluent reader (use technical terms directly, no padding).
   Clarity and accuracy lead: a well-structured longer sentence is fine
   when it reads better, and precise technical terms beat
@@ -168,7 +194,7 @@ near a similar existing event if you're unsure.
 Use `logger.exception` inside `except` blocks. Never log secrets
 (`Authorization` headers, bearer tokens, consumer key/secret, DB
 password). `logging_setup.SecretsFilter` redacts known secret keys
-and bearer tokens as defense-in-depth — see that module for the
+and bearer tokens as defense-in-depth. See that module for the
 current key/regex list. The contract is that secrets never reach a
 log call in the first place; the filter is a backstop, not a
 permission.
@@ -183,7 +209,7 @@ permission.
 The default suite must run with no live MySQL, FIWARE, or `.env`.
 Gate any test that needs a real backend with
 `@pytest.mark.integration` + `RUN_INTEGRATION_TESTS=1`. Committed
-fixtures must be small and sanitized — no credentials, private
+fixtures must be small and sanitized: no credentials, private
 hostnames, or restricted reference content.
 
 ### Commit Messages
