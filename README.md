@@ -10,14 +10,14 @@ sensors. Those measurements land in a private database. This pipeline
 reads them on a schedule and republishes them in two forms onto
 Sendai's FIWARE platform so other applications can use them:
 
-- *Product A:* **Per-place counts** — how many distinct devices the sensor saw
+- *Product A:* **Per-place counts**: how many distinct devices the sensor saw
   near it in a given time window, and how many were present on
   average over that window.
-- *Product B:* **Inter-place flow** — for each pair of sensors, how many distinct
+- *Product B:* **Inter-place flow**: for each pair of sensors, how many distinct
   devices moved from one to the other in the same window.
 
 Two independent pipelines run every five minutes. Product A publishes
-per-place counts, while Product B publishes inter-place flow, both writing to the
+per-place counts, while Product B publishes inter-place flow; both write to the
 same FIWARE entities. Both pipelines publish 5-minute and 60-minute aggregates
 and feed the FIWARE platform's time-series history service so that
 values are queryable both as "current" (via *Orion API*) and "historical" (via *STH-Comet API*).
@@ -81,18 +81,18 @@ Full per-script reference in
 
 ## Repository layout
 
-- `sendai_pipeline/` — production package (the only thing cron runs).
-- `scripts/` — operator-facing CLI shims (entity bootstrap, state
+- `sendai_pipeline/`: production package (the only thing cron runs).
+- `scripts/`: operator-facing CLI shims (entity bootstrap, state
   inspection, repair, replay).
-- `docs/` — the docs linked above.
-- `tests/` — pytest suite (one file per module).
-- `metadata/`, `state/`, `logs/`, `ref_docs/`, `.env` —
+- `docs/`: the docs linked above.
+- `tests/`: pytest suite (one file per module).
+- `metadata/`, `state/`, `logs/`, `ref_docs/`, `.env`:
   **gitignored.** Runtime data, credentials, and local-only reference
   material. Do not commit.
 
 ## Requirements
 
-[`uv`](https://docs.astral.sh/uv/) installed on the host — it manages
+[`uv`](https://docs.astral.sh/uv/) installed on the host. It manages
 the Python version and dependencies for this project. Run every
 command through `uv run`. The pipeline host also needs network access
 to the private MySQL server, Sendai's Orion base URL, and the WSO2

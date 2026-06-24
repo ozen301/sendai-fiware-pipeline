@@ -1,7 +1,7 @@
 # Operator Tools and Troubleshooting
 
-Every CLI under `scripts/` that an operator might invoke — what it
-does, when to use it, and how — plus a symptom-keyed troubleshooting
+Every CLI under `scripts/` that an operator might invoke: what it
+does, when to use it, and how, plus a symptom-keyed troubleshooting
 playbook at the bottom. For the deployment flow that uses some of
 these, see [deployment.md](deployment.md). For environment variables
 referenced below, see [configuration.md](configuration.md).
@@ -32,7 +32,7 @@ doc](#troubleshooting).
 ### `create_entities.py`
 
 Create one or more Orion entities. Use before publishing to any
-entity for the first time — NGSI `POST .../attrs` updates existing
+entity for the first time. NGSI `POST .../attrs` updates existing
 entities and never creates them.
 
 ```
@@ -46,13 +46,13 @@ uv run python scripts/create_entities.py [--send] ENTITY_ID:ENTITY_TYPE [...]
 
 The plan and outcome go to `logs/create_entities.log` at INFO. The
 script posts to `/orion/v2.0/entities` with no Orion `options` query
-parameter — in particular, it does **not** set `options=upsert`, which
+parameter; in particular, it does **not** set `options=upsert`, which
 would tell Orion to overwrite any existing entity. Instead, the script
 treats `201` as created and `409`/`422` as already-existing-on-platform
 and skips them, so an existing entity is never replaced. Safe to
 re-run.
 
-Example — create the per-3600 and per-300 entities for places 101–102:
+Example: create the per-3600 and per-300 entities for places 101-102:
 
 ```sh
 uv run python scripts/create_entities.py --send \
@@ -78,7 +78,7 @@ uv run python scripts/create_sth_subscriptions.py [--product a|b|all] [--send] [
 | `--send` | Perform live creation. Omit for dry-run (default). |
 | `--no-show-body` | In dry-run, suppress printing the redacted body. |
 
-Reads `COMET_NOTIFY_URL` from `.env`. The creator is idempotent — it
+Reads `COMET_NOTIFY_URL` from `.env`. The creator is idempotent: it
 skips existing subscriptions matched on either the per-product
 description prefix or the subscription's structural shape.
 
@@ -87,21 +87,21 @@ description prefix or the subscription's structural shape.
 > is on by default, so updates that happened before the subscription
 > existed are not replayed into Comet.
 
-Example — typical operator flow (inspect both products, then create
+Example: typical operator flow (inspect both products, then create
 both for real):
 
 ```sh
 # Dry-run: print the redacted subscription bodies for both products.
 uv run python scripts/create_sth_subscriptions.py
 
-# Looks right — create both subscriptions on the platform.
+# Looks right; create both subscriptions on the platform.
 uv run python scripts/create_sth_subscriptions.py --send
 ```
 
 **Changing a subscription's trigger attribute or shape.** Because the
 creator is idempotent on the description prefix, re-running it after
 you change a trigger attribute in code will **not** replace a live
-subscription whose shape has drifted — it will see the old one as
+subscription whose shape has drifted; it will see the old one as
 "exists" and skip. You have to delete the live subscription first:
 
 ```sh
@@ -149,11 +149,11 @@ The script also diffs the merged result against the previous
 `metadata/sensors.csv` and emits per-row `metadata_row_added`,
 `metadata_row_removed`, and `metadata_row_changed` log events for the
 audit trail. If a row in the *stable seed* changed (it normally
-shouldn't), a `WARNING`-level `stable_seed_changed` event fires —
-review those before assuming the refresh is correct.
+shouldn't), a `WARNING`-level `stable_seed_changed` event fires.
+Review those before assuming the refresh is correct.
 
 > **Staged-file schema requirement.** The staged file (currently the
-> 2026 batch) **must** carry an `ID` column — not `identifcation`. If
+> 2026 batch) **must** carry an `ID` column, not `identifcation`. If
 > the staged file is missing `ID`, or has `ID` and `identifcation` both
 > present, the script exits with a validation error and does not write
 > `metadata/sensors.csv`. If you have a complete file that already uses
@@ -305,7 +305,7 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 The runners persist a per-window state file under `state/` so they
 know which targets have already received an `ok` POST. When a window
 sticks in `pending` or `partial` and the normal retry isn't clearing
-it, use these tools — in order — to inspect, repair, and (only as a
+it, use these tools, in order, to inspect, repair, and (only as a
 last resort) replay.
 
 ### `state_doctor.py`
@@ -332,15 +332,15 @@ counts, open-window diagnostics, ranked failed target summaries,
 and failed HTTP status counts. Each open-window row includes fields
 including:
 
-- `window` — the window key, e.g. `per3600/20260524_1000`.
-- `status` — `pending` or `partial`.
-- `interval_min`, `first_seen`, `source_window_start`, `source_window_end` — window timing context.
-- `target_status_category` — `all_failed`, `all_ok`, or `mixed`.
-- `expected_target_source` — `stored` when the v2 expected-target snapshot is present, `derived` for legacy rows that fell back to currently-recorded target keys (treat `derived` as diagnostic only).
-- `target_count` / `ok_count` / `failed_count` — aggregate counts across the window's expected targets.
-- `failed_http_statuses` — distinct HTTP status codes seen on `failed` targets.
-- `failed_target_ids` — expected target IDs whose retained target record is `failed`.
-- `retry_reachable` — whether the window is still inside the configured retry horizon (`MAX_LOOKBACK_HOURS_*`).
+- `window`: the window key, e.g. `per3600/20260524_1000`.
+- `status`: `pending` or `partial`.
+- `interval_min`, `first_seen`, `source_window_start`, `source_window_end`: window timing context.
+- `target_status_category`: `all_failed`, `all_ok`, or `mixed`.
+- `expected_target_source`: `stored` when the v2 expected-target snapshot is present, `derived` for legacy rows that fell back to currently-recorded target keys (treat `derived` as diagnostic only).
+- `target_count` / `ok_count` / `failed_count`: aggregate counts across the window's expected targets.
+- `failed_http_statuses`: distinct HTTP status codes seen on `failed` targets.
+- `failed_target_ids`: expected target IDs whose retained target record is `failed`.
+- `retry_reachable`: whether the window is still inside the configured retry horizon (`MAX_LOOKBACK_HOURS_*`).
 
 In `--pretty` mode, the status overview is one stacked bar using
 distinct symbols: `█` = `complete`, `▒` = `partial`, `◆` = `pending`,
@@ -383,7 +383,7 @@ uv run python scripts/state_repair.py {flow|direction}
 Examples:
 
 ```sh
-# Stale partial whose expected targets are all already ok — dry-run then apply.
+# Stale partial whose expected targets are all already ok: dry-run then apply.
 uv run python scripts/state_repair.py flow \
   --window per3600/20260523_2200 \
   --action recompute_complete
@@ -399,7 +399,7 @@ uv run python scripts/state_repair.py flow \
   --expected-target-id jp.sendai.Blesensor.per3600.102 \
   --apply
 
-# Unrecoverable window — dead-letter with audit reason.
+# Unrecoverable window: dead-letter with audit reason.
 uv run python scripts/state_repair.py direction \
   --window per300/20260525_0640 \
   --action dead_letter \
@@ -419,7 +419,7 @@ recomputes the aggregate status, and drops windows that recorded no
 targets. `dead_letter` windows are left untouched. Dry-run is the
 default; `--apply` mutates state under the flow product lock, writes a
 timestamped `.bak` backup under `state/`, and reloads-and-verifies the
-result. Flow-only — there is no `product` argument and direction state
+result. Flow-only: there is no `product` argument and direction state
 is never touched.
 
 ```
@@ -450,7 +450,7 @@ re-run.
 Re-run one or more source windows end-to-end: fetch source rows from
 MySQL, build payloads, and POST them to Orion. Use **only** when the
 source data is still available in MySQL and a payload/data bug has
-been fixed — i.e. when re-POSTing is correct and meaningful.
+been fixed, i.e. when re-POSTing is correct and meaningful.
 
 ```
 uv run python scripts/resend.py {flow|direction}
@@ -478,8 +478,8 @@ uv run python scripts/resend.py {flow|direction}
 
 Resend writes to the same `window_key` as the original publication
 because it's a retry of the original business window, not a synthetic
-replacement. By default, any target already `ok` in state is skipped —
-whether its payload is unchanged or has since drifted — using the same
+replacement. By default, any target already `ok` in state is skipped
+(whether its payload is unchanged or has since drifted) using the same
 code path as normal send-mode retries, so resend is safe to use even when
 a window is already partly complete. Pass `--force` when the intent is to
 redeliver regardless of stored status. For a wide range this matters:
@@ -527,8 +527,8 @@ uv run python scripts/resend.py flow \
 > bookkeeping bug rather than a missed POST.
 
 > **Lock / live-cron caveat.** `--send` holds the per-product lock for
-> the whole run, no-opping every live tick meanwhile — the same effect as
-> live-cron downtime. For ranges longer than the reprocess floor (≈2h for
+> the whole run, no-opping every live tick meanwhile, which is the same
+> effect as live-cron downtime. For ranges longer than the reprocess floor (≈2h for
 > 5-min data), read ["I need to resend a large range without dropping live
 > data"](#i-need-to-resend-a-large-range-without-dropping-live-data) under
 > Troubleshooting *before* you run.
@@ -541,7 +541,7 @@ uv run python scripts/resend.py flow \
 > error, a `--force` re-run of the same chunk is the recovery (duplicate
 > Comet rows are the expected resend cost). Repeated `resend_db_reconnect`
 > warnings in `logs/resend.log` mean the database is persistently
-> unhealthy — fix the DB or network before re-running, rather than
+> unhealthy; fix the DB or network before re-running, rather than
 > retrying into the same outage.
 
 ---
@@ -553,7 +553,7 @@ are escalations only if the earlier one rules out the simpler cause.
 
 ### "A window is stuck `partial` and not clearing"
 
-1. `state_doctor.py {flow|direction}` — read which targets failed
+1. `state_doctor.py {flow|direction}`: read which targets failed
    and check `target_status_category` /
    `expected_target_source` / `retry_reachable`.
 2. If `target_status_category=all_ok` and `expected_target_source=stored`:
@@ -594,7 +594,7 @@ with `resend.py … --send`. If not, the gap is permanent.
 The runner's normal rolling lookback is `REPROCESS_HOURS_*` (default
 2h for 5-min windows, 12h for 60-min windows). After a longer
 shutdown, that floor isn't wide enough to discover the windows that
-elapsed during downtime — dynamic lookback only widens for windows
+elapsed during downtime; dynamic lookback only widens for windows
 the state file already knows about, not for never-seen ones.
 
 For an outage of `D` hours, temporarily widen the reprocess floor
@@ -618,13 +618,13 @@ each lost window.
 
 `resend.py --send` holds the per-product lock (`state/<product>.lock`)
 for the whole run. While it runs, every live 5-minute tick for that
-product no-ops — it takes the lock non-blocking and fails. This is
+product no-ops: it takes the lock non-blocking and fails. This is
 **operationally identical to live-cron downtime**: live windows that
 elapse during the run are permanently unpublished once they age past the
 reprocess floor (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`,
 default 2h / 12h). See "Resuming after a planned downtime longer than
 `REPROCESS_HOURS_*`" above for why these never-seen windows are not
-auto-recovered — the danger
+auto-recovered: the danger
 threshold is the reprocess floor, *not* the 72h `MAX_LOOKBACK_HOURS_*`.
 The same caution applies to any long-running tool that holds the
 per-product lock, such as `state_repair.py … --apply`.
@@ -632,13 +632,13 @@ per-product lock, such as `state_repair.py … --apply`.
 Before you run a large backfill, set the required flags and know the
 gotchas:
 
-1. **`--force`** — required for a *uniform* re-publish. Without it, a
+1. **`--force`**: required for a *uniform* re-publish. Without it, a
    target already `ok` in state is skipped while a target with no stored
    record is posted, so a wide range comes out non-uniform (recent windows
    skipped, older GC-reclaimed windows re-posted) even though the run
    reports success. See the `--force` row in the `resend.py` reference
    above.
-2. **Two interval passes** — one invocation publishes one interval. To
+2. **Two interval passes**: one invocation publishes one interval. To
    cover everything, run it twice: once `--interval-min 5` (per300) and
    once `--interval-min 60` (per3600), each with `--force`.
 3. **Clear dead-letter windows first.** If the range contains a window an
@@ -652,14 +652,14 @@ gotchas:
    exits 0. Check `windows_partial` in the `resend_summary` log line (or
    grep `window_partial` WARNINGs in `logs/resend.log`).
 
-Then keep the live cron from starving — pick one of two approaches:
+Then keep the live cron from starving: pick one of two approaches:
 
 - **Chunk with gaps** (preferred for an unattended range). Split the
   range and run it in pieces, leaving at least one cron interval (≥5 min)
   idle between chunks so a live tick can take the lock and publish current
   windows. Keep each chunk's *expected hold* under the reprocess floor
   (≈2h for 5-min data) so no live window ages out before the next live
-  tick fires. Window count is only a rough proxy for hold time — watch
+  tick fires. Window count is only a rough proxy for hold time; watch
   the actual run duration, not just the range size.
 - **Maintenance window** (preferred for one big backfill). Run the resend
   as planned downtime, then republish whatever it shadowed with the
@@ -677,7 +677,7 @@ If a resend is hard-killed (`SIGKILL` or an OOM kill), it can leave a
 `state/.<product>.json.*.tmp` file behind. State is written to that temp
 file and then renamed over the real file atomically (`os.replace`), so
 after any normal process failure the real state file is intact and the
-leftover `.tmp` is never read — it is safe to delete before re-running.
+leftover `.tmp` is never read, so it is safe to delete before re-running.
 
 ### "An old `partial` window keeps showing up in `state_doctor.py` after I deactivated a place"
 

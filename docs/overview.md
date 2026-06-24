@@ -14,10 +14,10 @@ MySQL database and republishes them as NGSI v2 attribute updates on the
 Sendai FIWARE Orion broker. Two independent jobs share the same target
 entities:
 
-- **Product A — `run_flow`** publishes per-place pedestrian counts and stay
+- **Product A (`run_flow`)** publishes per-place pedestrian counts and stay
   times (the `peopleCount_immedate/near/far` and
   `peopleOccupancy_immedate/near` attributes).
-- **Product B — `run_direction`** publishes inter-place flow ("回遊性") as a
+- **Product B (`run_direction`)** publishes inter-place flow ("回遊性") as a
   single `peopleCount_flow` structured attribute carrying each place's
   in/out movement counts.
 
@@ -28,7 +28,7 @@ attributes are disjoint: Product A writes `peopleCount_immedate/near/far` and
 `peopleOccupancy_immedate/near`, Product B writes `peopleCount_flow` (and
 also `identifcation` and `dateRetrieved`), and the few shared envelope
 attributes (`dateObservedFrom`, `dateObservedTo`) are computed identically
-from the same source window — so when both products write them for the
+from the same source window, so when both products write them for the
 same window, the value is the same either way.
 
 Downstream, Sendai's STH-Comet history service subscribes to Orion and
@@ -36,7 +36,7 @@ stores every published value as a time series. The pipeline tags each
 attribute with a `TimeInstant` NGSI metadata field carrying the source
 window's start time; Comet uses that tag as the history timestamp instead
 of the wall-clock time the POST arrived. That way the history record
-reflects "this measurement is for 10:00–11:00 JST" even if the POST
+reflects "this measurement is for 10:00-11:00 JST" even if the POST
 actually landed at, for instance, 13:25.
 
 ---
@@ -73,8 +73,8 @@ records which `(window, entity)` targets have already received a
 successful POST; without it every run would re-POST the same windows
 and create duplicate STH-Comet history rows.
 
-Both runners publish two aggregation intervals — 5-minute and
-60-minute — and are staggered by 2 minutes in cron to spread load:
+Both runners publish two aggregation intervals (5-minute and
+60-minute) and are staggered by 2 minutes in cron to spread load:
 
 ```
 :00  :02  :04  :05  :06  :07  :09  :10  :12  :14  :15 ...
@@ -85,7 +85,7 @@ Both runners publish two aggregation intervals — 5-minute and
 Key timing concepts (see the Vocabulary section for exact definitions):
 
 ```
-Timeline for one window (example: 60-min window covering 10:00–11:00 JST)
+Timeline for one window (example: 60-min window covering 10:00-11:00 JST)
 
    10:00 ──── source window starts
    11:00 ──── source window closes (start + 60 min)
@@ -99,7 +99,7 @@ Timeline for one window (example: 60-min window covering 10:00–11:00 JST)
 The **rolling lookback** (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`)
 is the normal-run look-back floor for discovering new windows. The
 **retry horizon** (`MAX_LOOKBACK_HOURS_PER300` / `MAX_LOOKBACK_HOURS_PER3600`,
-both 72h by default) is the outer limit — open windows (i.e., windows that are not fully complete) older than this
+both 72h by default) is the outer limit. Open windows (i.e., windows that are not fully complete) older than this
 are not retried automatically.
 
 ## Vocabulary
@@ -114,7 +114,7 @@ exclusively through `POST /orion/v2.0/entities/<id>/attrs`, which appends or
 updates attributes on an existing entity without touching the others.
 
 **Entity.** A single addressable thing in Orion. For us, one per
-(place, interval) — e.g. `jp.sendai.Blesensor.per3600.105` is "place
+(place, interval). For example, `jp.sendai.Blesensor.per3600.105` is "place
 105, 60-minute aggregates."
 
 **Attribute.** A named field on an entity (e.g. `peopleCount_immedate`).
@@ -144,26 +144,26 @@ history timestamp instead of the wall-clock arrival time. Result: Comet's
 history is indexed by *when the measurement is for* rather than *when we
 happened to send it*.
 
-**Target.** A single `(entity_id, window)` pair — i.e. "what we're going
+**Target.** A single `(entity_id, window)` pair, i.e. "what we're going
 to POST." Each window has many targets, one per active entity in the
 matching interval.
 
 **Window status.** The aggregate state of one window across all its
 targets:
-- `pending` — a fresh attempt is in flight. Set at the start of every
+- `pending`: a fresh attempt is in flight. Set at the start of every
   retry, so prior `ok` or `failed` target records may still be present
   underneath; the aggregate is only re-derived after the run finishes.
-- `partial` — the run finished with at least one expected target not yet
+- `partial`: the run finished with at least one expected target not yet
   `ok` (still missing, `pending`, or `failed`). The window is still
   eligible for the next run's retry.
-- `complete` — every entity id in `expected_target_ids` has a recorded
+- `complete`: every entity id in `expected_target_ids` has a recorded
   `ok`. What goes *into* `expected_target_ids` differs by product
   (observed-union for Product A, fixed roster for Product B); see "Record
   outcome" below.
-- `dead_letter` — operator-marked unrecoverable. Never retried.
+- `dead_letter`: operator-marked unrecoverable. Never retried.
 
 **Target status.** Per-target outcome: `ok` / `failed` / `pending`. Once
-`ok`, that target is terminal for that window — normal retries never
+`ok`, that target is terminal for that window. Normal retries never
 re-POST it, even if the source aggregate later drifts. This is what
 makes the pipeline history-idempotent under STH-Comet subscriptions
 (re-POSTing a value would create a duplicate Comet row).
@@ -184,8 +184,8 @@ and `TARGET_DIRECTION_BATCHES` select which batches each product
 publishes for.
 
 **`identifcation` (misspelled).** A metadata column and NGSI attribute
-name. The misspelling matches what the live Sendai broker expects — do
-not "fix" it. Its value is the place number as a string — `"1"`, `"2"`,
+name. The misspelling matches what the live Sendai broker expects, so do
+not "fix" it. Its value is the place number as a string: `"1"`, `"2"`,
 … for the 2023 batch and `"101"`, `"102"`, … for the 2026 batch (i.e.
 the final dot-separated component of the entity id). The metadata CSV is
 authoritative; the pipeline reads the value verbatim from the
@@ -217,12 +217,12 @@ value and a confirmed empty movement are distinct cases.
 A window is eligible to publish only if its source `startdate` is at or
 before `run_started_at − delay`, floored to the interval boundary. The
 aim is to wait until the raw BLE sensor data has actually reached MySQL
-and the source aggregator has finished computing the window —
-publishing earlier risks sending an incomplete or inaccurate snapshot
+and the source aggregator has finished computing the window.
+Publishing earlier risks sending an incomplete or inaccurate snapshot
 that will silently disagree with the value a later re-aggregation would
 have produced. Example: at 13:25 JST with a 3h delay, the cutoff floors
 to 10:00, so the latest 60-minute window the pipeline will touch is the
-one *starting* at 10:00 (i.e. 10:00–11:00); the 11:00–12:00 window is
+one *starting* at 10:00 (i.e. 10:00-11:00); the 11:00-12:00 window is
 held back until at least 14:00.
 
 **Rolling lookback.** `REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`
@@ -233,8 +233,8 @@ regardless of this floor, until it ages past the retry horizon.
 
 **Retry horizon.** `MAX_LOOKBACK_HOURS_PER300` /
 `MAX_LOOKBACK_HOURS_PER3600` (both 72h by default). The maximum age at
-which an *open window* — one whose state is still `pending` or `partial`
-because some target hasn't reported `ok` yet — is still retried by the
+which an *open window*, one whose state is still `pending` or `partial`
+because some target hasn't reported `ok` yet, is still retried by the
 normal run. In our case, source rows can arrive at MySQL up to 3 days
 late, so both intervals default to 72h regardless of aggregation type.
 Windows older than the horizon are not picked up by the normal run; they
@@ -297,20 +297,20 @@ The five stages in plain words:
 1. **Window selection.** The run identifies which source aggregation
    windows are eligible to publish *this run*. A window is eligible when
    its `startdate` is at or before `run_started_at −
-   SOURCE_STABILITY_DELAY_HOURS` (default 3h), floored to the interval
-   — otherwise the source aggregator may still be revising it. The SQL
+   SOURCE_STABILITY_DELAY_HOURS` (default 3h), floored to the interval.
+   Otherwise the source aggregator may still be revising it. The SQL
    query fetches rows for every eligible window in the lookback range,
    not just the open ones; per-target skipping happens later in stage 4,
    right before the POST (any target already recorded `ok` for that
    window in the state file is not re-POSTed). `pending` and `partial`
    windows remain in scope as long as they are still inside the retry
    horizon (`MAX_LOOKBACK_HOURS_PER300` / `MAX_LOOKBACK_HOURS_PER3600`,
-   both 72h by default — source rows can arrive at MySQL up to 3 days
+   both 72h by default, since source rows can arrive at MySQL up to 3 days
    late).
 
 2. **Source read.** One MySQL query per interval fetches all rows for
    the eligible windows. The pipeline uses each table's natural composite
-   key — `(startdate, group_place_id, device_type, interval_min)` for
+   key: `(startdate, group_place_id, device_type, interval_min)` for
    Product A; the from/to/device-type variants for Product B. Product A
    also applies the source-quality gate in SQL: only rows with
    `imputation_tier <= SOURCE_MAX_IMPUTATION_TIER` are fetched, defaulting
@@ -328,7 +328,7 @@ The five stages in plain words:
    3. drop if no metadata row matches `(place_number, interval_min)`;
    4. drop if the row's `device_type` doesn't match the metadata's
       `expected_device_type` (the source stores parallel `M5Stack` and
-      `Pixel3aUT` rows; this picks the right one — `M5Stack` for the
+      `Pixel3aUT` rows; this picks the right one: `M5Stack` for the
       2026 batch, `Pixel3aUT` for the 2023 batch).
 
    *Product B* (`transform_direction.py`), per row, against both
@@ -338,7 +338,7 @@ The five stages in plain words:
       (the literal `ALL` is exempt; it's a real aggregation key);
    3. resolve each non-`ALL` side via metadata, with the source-side
       batch (derived from the `sendai2023.` / `sendai202603.` prefix)
-      required to match the metadata batch — drop if either side fails
+      required to match the metadata batch, dropping if either side fails
       to resolve;
    4. drop self-loops (`from == to`), while keeping cross-batch pairs
       when both sides resolve;
@@ -350,7 +350,7 @@ The five stages in plain words:
 
    Survivors are paired with their metadata row, which provides the
    destination entity id, entity type, and `identifcation` text (the
-   misspelled place identifier — just the place number as a string,
+   misspelled place identifier, just the place number as a string,
    e.g. `"105"`). Product B additionally aggregates surviving rows by
    destination place to build the nested `peopleCount_flow` structure,
    and emits a sentinel `{"from": {"all": null}, "to": {"all": null}}`
@@ -359,12 +359,12 @@ The five stages in plain words:
 4. **POST to Orion.** One POST per `(entity, window)` to
    `/orion/v2.0/entities/<entity_id>/attrs?type=<entity_type>` with
    OAuth2 client-credentials auth. Retries use exponential backoff on
-   `5xx`, `429`, and network errors — the client sleeps 1s, then 2s, 4s,
+   `5xx`, `429`, and network errors: the client sleeps 1s, then 2s, 4s,
    8s, 16s between successive attempts and then gives up. (`429`
    honors the server's `Retry-After` header if present, otherwise uses
    the standard backoff.) A single `401` triggers a forced token
    refresh and one extra retry. Other `4xx` responses are fatal for
-   that POST (no retry — it's a payload/config bug, not a transient
+   that POST (no retry, because it's a payload/config bug, not a transient
    failure).
 
 5. **Record outcome.** Each POST result is written back to the
@@ -379,7 +379,7 @@ The five stages in plain words:
      set **unioned with** the targets that produced a valid payload this
      run. A per-place sensor that legitimately saw nobody emits no source
      row, so that entity is simply never part of the window's expected
-     set — it does not block completion. The window therefore completes
+     set, so it does not block completion. The window therefore completes
      against the targets it actually saw. A late row for a target that
      was not seen yet is picked up by send-mode targeted supplemental
      discovery (re-query the retained complete windows by exact
@@ -394,12 +394,12 @@ The five stages in plain words:
    In both cases the window goes to `complete` once every id in its
    expected set has a recorded `ok`; otherwise it stays `partial`.
 
-### A row's life — worked example (Product A)
+### A row's life: worked example (Product A)
 
 A single 60-minute row in `flow_metrics2_per_place2_agg_imputed`:
 
 ```
-startdate         = "20260524_1000"        # JST window 10:00–11:00
+startdate         = "20260524_1000"        # JST window 10:00-11:00
 group_place_id    = "sendai202603.105"
 device_type       = "M5Stack"
 interval_min      = 60
@@ -420,8 +420,8 @@ After filter & map:
   `entity_id = jp.sendai.Blesensor.per3600.105`,
   `entity_type = Blesensor.per3600`, `batch = 2026`,
   `expected_device_type = M5Stack`,
-  `identifcation = "105"` (the place number as a string — Product B
-  posts this; Product A does not).
+  `identifcation = "105"` (the place number as a string, which Product B
+  posts and Product A does not).
 - Device type matches (`M5Stack == M5Stack`).
 
 POST body sent to Orion (the `TimeInstant` metadata on each attribute
@@ -444,7 +444,7 @@ POST /orion/v2.0/entities/jp.sendai.Blesensor.per3600.105/attrs?type=Blesensor.p
 
 State record after this single POST returned 204, assuming every other
 active 60-minute target in the same window also got an `ok` earlier in
-the run (truncated for readability — the real `targets` map contains
+the run (truncated for readability; the real `targets` map contains
 one entry per id in `expected_target_ids`):
 
 ```json
@@ -466,7 +466,7 @@ one entry per id in `expected_target_ids`):
 
 For Product A, `expected_target_ids` is the union of any
 previously-stored expected set and the targets this window produced a
-valid payload for this run — *not* the full active-metadata roster. A
+valid payload for this run, *not* the full active-metadata roster. A
 per-place sensor that saw nobody produces no source row, so its entity
 is simply absent from this set and does not hold the window in
 `partial`. The window reaches `complete` once every id in the set has a
@@ -485,7 +485,7 @@ rows into per-place `peopleCount_flow` structures before posting. Key
 differences from Product A:
 
 - **Each row has two place keys** (`from_group_place_id`,
-  `to_group_place_id`) — a movement is from one place to another. Both
+  `to_group_place_id`). A movement is from one place to another. Both
   sides must pass metadata resolution. Cross-batch pairs (a 2023 place
   paired with a 2026 place) are sent when both sides resolve.
 - **The literal string `ALL` is a real aggregation key**, not a noise
@@ -493,7 +493,7 @@ differences from Product A:
   destination entity's `peopleCount_flow.from.all` (meaning "total
   unique BLEIDs that came into this place from anywhere"), and vice
   versa for `to.all`. The pipeline never sums pairwise rows to
-  approximate `all` — the source already provides the deduplicated
+  approximate `all`. The source already provides the deduplicated
   unique-BLEID total.
 - **The source table stores parallel rows** under both
   `(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every per-place
@@ -501,7 +501,7 @@ differences from Product A:
   active target batch and applies it to both `ALL` and pairwise rows, so
   the nested inter-place values and the deduplicated totals use the same
   source population. The device-type filter is therefore a required
-  disambiguator — omitting it would double-count every movement.
+  disambiguator; omitting it would double-count every movement.
 - **Targets with no observations still receive a payload** with sentinel
   `peopleCount_flow = {"from": {"all": null}, "to": {"all": null}}`.
   This keeps Comet history continuous even when a place was silent for
@@ -552,9 +552,9 @@ sendai-fiware-pipeline-dev/
 │   ├── state_repair.py           # repair aggregate status / dead-letter
 │   ├── migrate_flow_state.py     # one-off: migrate flow state to observed-target completion
 │   ├── resend.py                 # replay one or a range of source windows
-│   └── dev/                      # REPL/notebook probes — not production
+│   └── dev/                      # REPL/notebook probes, not production
 │
-# Note: `create_entities` and `sth_subscriptions` each have two files —
+# Note: `create_entities` and `sth_subscriptions` each have two files:
 # the module under `sendai_pipeline/` does the work, the file under
 # `scripts/` is just the CLI entry point. See
 # [tools_and_troubleshooting.md](tools_and_troubleshooting.md) for

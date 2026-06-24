@@ -16,7 +16,7 @@ uv sync
 ```
 
 Run every command in this guide as `uv run python …`. Do not activate
-`.venv` and call `python` directly — `uv run` keeps Python and
+`.venv` and call `python` directly; `uv run` keeps Python and
 dependencies pinned to `uv.lock`.
 
 ## 3. Configure `.env`
@@ -41,7 +41,7 @@ The most important values are the **rollout gates** at the bottom of
 | `FLOW_SEND_MODE` | `dry-run` | Product A: `dry-run` logs payloads but does not POST them; `send` performs the live POSTs. |
 | `DIRECTION_SEND_MODE` | `dry-run` | Product B: same semantics. |
 
-The target batch variables are empty by default — meaning the matching
+The target batch variables are empty by default, meaning the matching
 runner exits early without selecting targets, contacting Orion, or
 logging any payload. The send modes default to `dry-run`, which logs the
 would-be POST body but does not perform the attribute-update POST (the
@@ -122,7 +122,7 @@ operation is safe to re-run.
 Do this **before** any live POST. Subscriptions ship with
 `options=skipInitialNotification`, which means Orion will not replay
 any *existing* attribute value into Comet when the subscription is
-created — only attribute updates that happen *after* the subscription
+created. Only attribute updates that happen *after* the subscription
 exists are forwarded. Creating subscriptions before the first live
 send guarantees those cutover windows appear in Comet history.
 
@@ -157,7 +157,7 @@ safe.
       (§5 complete). The entity-map validation step logs a warning for
       any missing entity.
 - [ ] STH-Comet subscriptions are live (§6 complete with `--send`).
-      Creating subscriptions **before** the first live POST is required —
+      Creating subscriptions **before** the first live POST is required;
       `skipInitialNotification` means earlier updates are never replayed.
 - [ ] `.env` credentials (`FIWARE_*`, `MYSQL_*`) are correct and
       dry-run completes without `token_refresh_failed` or
@@ -190,8 +190,8 @@ After the first cron cycle runs, verify with
 time.
 
 > **Note (sanity-check dry-run).** If you want to inspect a would-be
-> POST body before going live — useful after a code change, or on a
-> new platform deployment — leave the send modes at `dry-run` and set
+> POST body before going live (useful after a code change, or on a
+> new platform deployment), leave the send modes at `dry-run` and set
 > `TARGET_FLOW_BATCHES=2026` and/or `TARGET_DIRECTION_BATCHES=2026`.
 > The runner will log the full payload to `logs/{product}.log` without
 > POSTing to Orion. (It still makes read-only `GET` calls to Orion for
@@ -216,10 +216,10 @@ SHELL=/bin/bash
 REPO=/home/sendai/sendai-fiware-pipeline
 UV=/usr/local/bin/uv
 
-# Product A — per-place counts. Every 5 minutes at :02/:07/:12/…
+# Product A: per-place counts. Every 5 minutes at :02/:07/:12/…
 2-59/5 * * * * cd $REPO && $UV run python -m sendai_pipeline.run_flow >> $REPO/logs/cron.flow.log 2>&1
 
-# Product B — inter-place flow. Every 5 minutes at :04/:09/:14/… (staggered).
+# Product B: inter-place flow. Every 5 minutes at :04/:09/:14/… (staggered).
 4-59/5 * * * * cd $REPO && $UV run python -m sendai_pipeline.run_direction >> $REPO/logs/cron.direction.log 2>&1
 
 # Optional: refresh runtime metadata daily at 04:30 JST.

@@ -1,4 +1,4 @@
-# Sendai FIWARE — MySQL → Orion Pipeline Spec
+# Sendai FIWARE Pipeline Spec
 
 Canonical data contract for the pipeline: exact column → attribute
 mappings, filter rules, payload shapes, and the operational rules that
@@ -10,15 +10,15 @@ platform:
 
 | # | Source MySQL table | What gets sent | Target Orion entity |
 |---|---|---|---|
-| **A** | `bleData2025d.flow_metrics2_per_place2_agg_imputed` | Per-place pedestrian counts and stay times (gap-filled superset of `flow_metrics2_per_place2_agg`) | `jp.sendai.Blesensor.per3600.<N>` (60-min) and `jp.sendai.Blesensor.per300.<N>` (5-min) — **one entity per place** |
-| **B** | `bleData2025d.direction_metrics2_per_place2_agg` | Place-to-place flow ("回遊性") | **Same per-place entities as Product A** — Product B adds the `peopleCount_flow` attribute on each (see §4.3) |
+| **A** | `bleData2025d.flow_metrics2_per_place2_agg_imputed` | Per-place pedestrian counts and stay times (gap-filled superset of `flow_metrics2_per_place2_agg`) | `jp.sendai.Blesensor.per3600.<N>` (60-min) and `jp.sendai.Blesensor.per300.<N>` (5-min), **one entity per place** |
+| **B** | `bleData2025d.direction_metrics2_per_place2_agg` | Place-to-place flow ("回遊性") | **Same per-place entities as Product A**; Product B adds the `peopleCount_flow` attribute on each (see §4.3) |
 
 ## Contents
 
 - §1 Infrastructure
 - §2 Common rules (apply to both products)
-- §3 Product A — per-place counts
-- §4 Product B — inter-place flow
+- §3 Product A: per-place counts
+- §4 Product B: inter-place flow
 - §5 Endpoint and example POST
 
 ---
@@ -29,11 +29,11 @@ platform:
 
 The source MySQL server lives on a private network and is reachable only
 from authorised hosts. Connection host, database name,
-and the read account are kept out of this committed spec — see `.env` or
+and the read account are kept out of this committed spec; see `.env` or
 the team's secrets store. The pipeline is expected to run on a host that
 is already on the same network.
 
-### FIWARE side — common headers for every POST
+### FIWARE side: common headers for every POST
 
 Every Orion POST carries:
 
@@ -59,7 +59,7 @@ where this lives in the code).
 Entity IDs, entity types, install batches, expected device types, and
 the misspelled `identifcation` attribute value are all loaded from
 `metadata/sensors.csv`. The pipeline reads this file at startup and does
-**not** reconstruct entity ids or types from any pattern — even if
+**not** reconstruct entity ids or types from any pattern, even if
 today's data follows one. Orion's `GET /v2.0/entities?type=…` is used
 only to *validate* that metadata targets exist on the platform; missing
 platform entities are logged, but the metadata file remains
@@ -81,7 +81,7 @@ Only `interval_min ∈ {5, 60}` rows are published. `interval_min = 1`
 rows exist in the source tables for further aggregation but are never
 sent.
 
-### 2.2 Noise prefixes — dropped silently
+### 2.2 Noise prefixes: dropped silently
 
 Some `group_place_id` rows are internal artifacts that the operator
 wants neither emitted nor flagged. The configured prefixes are:
@@ -97,7 +97,7 @@ slip past the prefix filter but find no matching metadata entry produce
 a separate `DEBUG`-level `unknown_place_interval` event. Keeping the
 two event names distinct preserves a structured signal for genuine
 metadata gaps (e.g. a `sendai2023.99` row with no metadata entry)
-without forcing them through a WARN channel — operators can filter on
+without forcing them through a WARN channel. Operators can filter on
 the event name when triaging.
 
 The prefix list is operator-configurable via `IGNORED_PLACE_PREFIXES`
@@ -128,8 +128,8 @@ derive `place_number`):
 
 | Prefix | Install batch |
 |---|---|
-| `sendai2023.` | 2023設置 (places 1–28) |
-| `sendai202603.` | 2026年3月設置 (places 101–112, 201–210) |
+| `sendai2023.` | 2023設置 (places 1-28) |
+| `sendai202603.` | 2026年3月設置 (places 101-112, 201-210) |
 
 ### 2.4 Device-type filtering (batch disambiguation)
 
@@ -139,11 +139,11 @@ right one:
 
 | Place number range | Install batch | Use rows where `device_type =` |
 |---|---|---|
-| 1 – 28 | 2023設置 | `Pixel3aUT` |
-| 101 – 112, 201 – 210 | 2026年3月設置 | `M5Stack` |
+| 1-28 | 2023設置 | `Pixel3aUT` |
+| 101-112, 201-210 | 2026年3月設置 | `M5Stack` |
 
 This filter is a **required disambiguator** for both products, not just
-a cross-batch exclusion — omitting it would double-count.
+a cross-batch exclusion; omitting it would double-count.
 
 ### 2.5 NGSI attribute types
 
@@ -199,10 +199,10 @@ rows.
 
 A window is `complete` once every entity id in its expected target set
 has a recorded `ok`. The two products build that expected set
-differently — Product A unions it from the targets actually observed
-(§3.2), Product B fixes it to the active-metadata roster (§4) — so a
-silent Product A place that emits no source row never holds its window
-in `partial`.
+differently: Product A unions it from the targets actually observed
+(§3.2), Product B fixes it to the active-metadata roster (§4). As a
+result, a silent Product A place that emits no source row never holds its
+window in `partial`.
 
 Once STH-Comet subscriptions are enabled, correction by normal repost
 is not history-idempotent. Treat Comet deletion/replay as an operator
@@ -216,10 +216,10 @@ update path.
 |---|---|
 | Schedule | Cron (or systemd timer), every 5 minutes. |
 | Source stability delay | Process windows whose `startdate` is at or before `now − SOURCE_STABILITY_DELAY_HOURS` (default 3h). Separate from the 72h retry horizon. |
-| Catch-up | Each run reprocesses a rolling lookback against the per-window state store. Missed or failed targets are picked up on the next run **while their window is still inside the lookback**. The lookback widens to cover open windows already in state, but only up to `MAX_LOOKBACK_HOURS_*`. Windows the runner never saw — e.g. while the cron was down or the per-product lock was held by a long resend — are *not* auto-recovered once they age past the reprocess floor (`REPROCESS_HOURS_*`); republish them per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). |
+| Catch-up | Each run reprocesses a rolling lookback against the per-window state store. Missed or failed targets are picked up on the next run **while their window is still inside the lookback**. The lookback widens to cover open windows already in state, but only up to `MAX_LOOKBACK_HOURS_*`. Windows the runner never saw (e.g. while the cron was down or the per-product lock was held by a long resend) are *not* auto-recovered once they age past the reprocess floor (`REPROCESS_HOURS_*`); republish them per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). |
 | Retry | Exponential backoff on `5xx` and network errors (1s, 2s, 4s, 8s, 16s). On `429`, the client honors a `Retry-After` header when present and otherwise falls back to the same backoff. Single `401` triggers a forced token refresh and one extra retry. Other `4xx` is fatal for that POST. |
 | Token refresh | OAuth2 client-credentials; proactive on expiry and on `401`. |
-| Logging | One structured line per POST in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE` — `hash` (always hash only), `failure` (default — hash on success, body excerpt on failure), or `full` (always body). |
+| Logging | One structured line per POST in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE`: `hash` (always hash only), `failure` (default: hash on success, body excerpt on failure), or `full` (always body). |
 
 ### 2.11 Rollout gates
 
@@ -229,11 +229,11 @@ current target configuration is `TARGET_FLOW_BATCHES=2023,2026` and
 
 ---
 
-## 3. Data Product A — Per-place counts
+## 3. Data Product A: Per-place counts
 
 Target entity types: `Blesensor.per3600.<N>` (60-min), `Blesensor.per300.<N>` (5-min).
 
-### 3.1 Source schema — `flow_metrics2_per_place2_agg_imputed`
+### 3.1 Source schema: `flow_metrics2_per_place2_agg_imputed`
 
 A gap-filled superset of `flow_metrics2_per_place2_agg`. Original and
 imputed rows are eligible only up to the configured imputation tier:
@@ -320,14 +320,14 @@ The same column names (`flow_gt_mXX`, `stay_gt_mXX`) are used for both
 
 ---
 
-## 4. Data Product B — Inter-place flow
+## 4. Data Product B: Inter-place flow
 
 Target entities: the **same per-place entities as Product A**
 (`Blesensor.per3600.<N>` for 60-min, `Blesensor.per300.<N>` for 5-min).
 Product B contributes a single `peopleCount_flow` attribute plus the
 shared envelope.
 
-### 4.1 Source schema — `direction_metrics2_per_place2_agg`
+### 4.1 Source schema: `direction_metrics2_per_place2_agg`
 
 Load-bearing columns:
 
@@ -346,7 +346,7 @@ Per-row order (matches `transform_direction.py`):
 1. Drop if `interval_min ∉ {5, 60}`.
 2. Drop if **either** `from_group_place_id` or `to_group_place_id`
    matches an `IGNORED_PLACE_PREFIXES` entry. The literal `'ALL'` is
-   exempt — it is a real aggregation key (see §4.3).
+   exempt; it is a real aggregation key (see §4.3).
 3. Resolve each non-`ALL` side via metadata. The source-side batch
    (derived from the `sendai2023.` / `sendai202603.` prefix) must
    match the metadata batch. Drop if either side fails to resolve.
@@ -431,7 +431,7 @@ not the JSON key.
 
 ### 4.4 Full body example (60-min, single entity)
 
-2024-07-20 10:00–11:00 JST, place 3 — entity
+2024-07-20 10:00-11:00 JST, place 3, entity
 `jp.sendai.Blesensor.per3600.3`. Every attribute carries the same
 `TimeInstant` metadata value (the window start, §2.6); shown in full on
 the first attribute and elided as `{…}` on the rest for readability:
@@ -472,11 +472,11 @@ POST {url_orion_v20_entities}/{metadata.entity_id}/attrs
 ```
 
 Product A and Product B issue separate POSTs to the same entity for the
-same window — A writes its count/occupancy attributes, B writes
-`peopleCount_flow` and `identifcation` / `dateRetrieved`, the shared
+same window: A writes its count/occupancy attributes, B writes
+`peopleCount_flow` and `identifcation` / `dateRetrieved`, and the shared
 `dateObserved*` envelope computes identically from both sides.
 
-### Example curl (Product B — 60-min, place 3)
+### Example curl (Product B, 60-min, place 3)
 
 ```sh
 curl -X POST \
@@ -504,7 +504,7 @@ Orion subscriptions with:
 - `notification.metadata: ["TimeInstant"]`.
 - `subject.condition.notifyOnMetadataChange: true` (placed in the
   condition, not the notification, so a `TimeInstant`-only change on
-  the trigger attribute still fires the subscription — without this,
+  the trigger attribute still fires the subscription. Without this,
   two consecutive windows publishing the same trigger value would be
   silently dropped from Comet history).
 - `subject.condition.attrs` set to a product-exclusive attribute so

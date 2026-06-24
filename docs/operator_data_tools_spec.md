@@ -50,7 +50,7 @@ summary.
 
 ---
 
-## 1. Resend — `scripts/resend.py`
+## 1. Resend: `scripts/resend.py`
 
 ### Goal
 
@@ -111,12 +111,12 @@ uv run python scripts/resend.py {flow|direction}
      `dead_letter` in state, abort the whole run (exit 2), listing every
      offending window key, before any source-row select or Orion POST. A
      dead-letter records a deliberate operator decision that a window is
-     unrecoverable; refusing up front — rather than aborting mid-run when
-     `begin_window_attempt` first reaches such a window — avoids wasted work
+     unrecoverable; refusing up front (rather than aborting mid-run when
+     `begin_window_attempt` first reaches such a window) avoids wasted work
      and names all blockers at once (clear them with `state_repair.py`, or
      narrow the range, then re-run). The scan covers every enumerated key
      regardless of source rows, so a dead-letter window with no source rows
-     — which the per-window step below would otherwise skip silently — is
+     (which the per-window step below would otherwise skip silently) is
      still reported.
    - **No-source-row skip.** For each enumerated window, select its source
      rows; if a window has no source rows, skip it before calling
@@ -140,7 +140,7 @@ uv run python scripts/resend.py {flow|direction}
    set; an existing window keeps its stored first-attempt snapshot. (The
    transforms iterate `interval_metadata`/the metadata index when
    constructing payloads; filtering state bookkeeping alone would still
-   POST to every active target — that's the opposite of what `--place`
+   POST to every active target, which is the opposite of what `--place`
    means to an operator.)
 5. `--force` flips the per-target skip: pass a flag through
    `_process_send_window` that causes the hash-skip check to be
@@ -154,19 +154,19 @@ uv run python scripts/resend.py {flow|direction}
    effects, no credentials required in dry-run).
 7. **State persistence cadence (`--send`).** Resend does **not** persist
    state after every target POST. The shared `_process_send_window`
-   rewrites the whole state file on each target by default — durability
-   for the cron runners' small rolling lookback, where the cost is
-   negligible. Across a multi-day resend that same per-target save
-   rewrites a large (production: ~16 MB) state file once per target —
+   rewrites the whole state file on each target by default. This gives
+   durability for the cron runners' small rolling lookback, where the
+   cost is negligible. Across a multi-day resend that same per-target save
+   rewrites a large (production: ~16 MB) state file once per target:
    O(windows × targets) full rewrites, which dominate runtime. Resend
    instead suppresses the per-target save and flushes on a coarse
    per-window cadence: it persists once every `_RESEND_SAVE_EVERY`
    processed windows (module constant, default `100`) and once more at
    the end of the run when any processed window or final GC removal
    remains unflushed. The cadence counter
-   advances once per processed window with source rows — including a
+   advances once per processed window with source rows (including a
    window whose source rows are filtered to zero POST targets, which is
-   still processed and can still become `partial` — so any in-memory
+   still processed and can still become `partial`), so any in-memory
    state change such a window makes is flushed by the cadence rather than
    left stranded until a later window's save. A no-source-row window is
    skipped before processing and does not advance the cadence counter.
@@ -212,7 +212,7 @@ uv run python scripts/resend.py {flow|direction}
      `pymysql.err.OperationalError` whose MySQL error code is `2006`
      (`CR_SERVER_GONE_ERROR`) or `2013` (`CR_SERVER_LOST`). Every other
      database error (a bad column, a programming error, a data error)
-     re-raises immediately and aborts the run — a bare `OperationalError`
+     re-raises immediately and aborts the run; a bare `OperationalError`
      catch would wrongly mask those. (Implementation detail: the
      predicate lives in `db.py` as `is_connection_lost_error(exc)`,
      beside the 2006/2013 codes the selector tests already pin, so
@@ -230,7 +230,7 @@ uv run python scripts/resend.py {flow|direction}
      `_RESEND_DB_RECONNECT_ATTEMPTS` times per select (module constant,
      default `2` → 3 total tries) with a 1 s fixed backoff between
      attempts. When the attempts are exhausted, resend re-raises, so a
-     **sustained** outage still aborts the run with exit 2 — the same
+     **sustained** outage still aborts the run with exit 2, the same
      terminal behavior as before this guard. `_RESEND_DB_RECONNECT_ATTEMPTS`
      and the backoff are internal reliability knobs, not deployment-tuned
      configuration, so they are module constants rather than env vars.
@@ -239,7 +239,7 @@ uv run python scripts/resend.py {flow|direction}
      existing handling. The live cron runners (`run_direction` /
      `run_flow`) are unaffected: each cron process opens its own
      connection, does its work in a few minutes, and exits, so a dropped
-     connection simply fails one tick and the next tick reconnects — they
+     connection simply fails one tick and the next tick reconnects; they
      do not need and must not get this in-run retry, which is why it lives
      in resend rather than in the shared `db.select_*` helpers.
 
@@ -248,13 +248,13 @@ uv run python scripts/resend.py {flow|direction}
 - **A long `--send` run starves the live cron like downtime.** The same
   per-product lock the cron runners take is held (blocking `LOCK_EX`) for
   the whole invocation. While it is held, every live 5-minute tick for
-  that product takes the lock non-blocking, fails, and no-ops — so a long
+  that product takes the lock non-blocking, fails, and no-ops, so a long
   resend is operationally **equivalent to live-cron downtime** for its
   duration. Live windows that elapse during the hold are **permanently
   unpublished** once they age past the live runner's lookback. With no
   older open window to widen it, that lookback is the **reprocess floor**
   (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`, default 2h / 12h),
-  **not** the 72h `MAX_LOOKBACK_HOURS_*` — dynamic lookback only widens for
+  **not** the 72h `MAX_LOOKBACK_HOURS_*`; dynamic lookback only widens for
   windows already in state, and these were never seen. Before a long run,
   follow "I need to resend a large range without dropping live data" in
   [tools_and_troubleshooting.md](tools_and_troubleshooting.md) (chunk with
@@ -267,16 +267,16 @@ uv run python scripts/resend.py {flow|direction}
 - **`--force` is required for a *uniform* backfill.** Without it, the
   per-target skip is applied by each target's stored status: a target that
   is already `ok` is skipped (whether its payload matches or has drifted),
-  while a target with no stored record — for example one whose window was
-  already reclaimed by GC — is posted. Across a range wider than the live
+  while a target with no stored record (for example one whose window was
+  already reclaimed by GC) is posted. Across a range wider than the live
   GC horizon this is **non-uniform**: recent in-state windows are skipped
   (no new Comet row) while older reclaimed windows are re-posted (a new
   Comet row), yet the run still exits 0 and looks uniform. Pass `--force`
   whenever the intent is a uniform re-publish of the whole range.
 - **Exit 0 does not imply every window is `complete`.** The run exits 1
   only when a POST fails. Two no-failed-POST cases still leave a window
-  short of `complete`, and neither is a delivery failure — both signal a
-  configuration or source-data gap a bare re-run will not fix — so neither
+  short of `complete`, and neither is a delivery failure (both signal a
+  configuration or source-data gap a bare re-run will not fix), so neither
   changes the exit code:
   - An expected target with source rows but **no payload** (its rows were
     filtered out, or it had no data this window): the window finishes
@@ -295,8 +295,8 @@ uv run python scripts/resend.py {flow|direction}
 - **No age cap on the range.** Resend publishes exactly the `--from` /
   `--to` range you name; there is no `MAX_LOOKBACK_HOURS_*` ceiling on how
   far back it may reach. The guardrail against an over-wide replay is
-  dry-run (the default): it prints one line per planned window — each with
-  its target count and would-post count — before any live write, so you can
+  dry-run (the default): it prints one line per planned window (each with
+  its target count and would-post count) before any live write, so you can
   gauge how large the range is before adding `--send`.
 - Empty source-row windows are skipped before state mutation. This
   prevents permanent `partial` accumulation for windows the live runners
@@ -309,8 +309,8 @@ uv run python scripts/resend.py {flow|direction}
   reconnects, best-effort flushes completed windows before exit; if that
   flush fails, the original error still decides the exit code. A re-run
   re-POSTs only progress that did not reach disk, creating extra STH-Comet
-  rows — already the expected cost of a resend (see the STH-Comet caveat
-  above), and bounded by the cadence and by chunked operation. Because
+  rows. This is already the expected cost of a resend (see the STH-Comet
+  caveat above), and is bounded by the cadence and by chunked operation. Because
   resend suppresses the per-target save, every cadence flush follows a
   full `recompute_status`, so a hard kill cannot leave a flushed window
   with recorded targets but a stale aggregate status on disk; it only drops
@@ -344,7 +344,7 @@ uv run python scripts/resend.py {flow|direction}
   reclaimed-window count).
 - `resend_db_reconnect` (WARNING; per reconnect attempt on a dropped
   connection; carries product, interval, reason, the window key, attempt
-  number, and the error class — never the DSN or password).
+  number, and the error class, never the DSN or password).
 - `resend_db_reconnect_exhausted` (ERROR; `logger.exception` when the
   bounded reconnect attempts are exhausted, just before the run aborts;
   carries product, interval, reason, the window key, and attempt count so
@@ -353,8 +353,8 @@ uv run python scripts/resend.py {flow|direction}
   no-source-row windows, `windows_gc` for complete windows reclaimed by
   resend GC, and `windows_partial` / `windows_complete` for the windows
   whose aggregate status was recomputed. A new flow window with an empty
-  effective target set returns before recomputation and is in neither count
-  — see the exit-code note under Safety).
+  effective target set returns before recomputation and is in neither count;
+  see the exit-code note under Safety).
 
 ### Tests
 
@@ -399,7 +399,7 @@ and skips the in-loop save when `persist_each_target=False`, for both
 
 ---
 
-## 2. Show — `scripts/show_data.py`
+## 2. Show: `scripts/show_data.py`
 
 ### Goal
 
@@ -474,7 +474,7 @@ jp.sendai.Blesensor.per3600.102       peopleCount_immedate       33          202
 ```
 
 For Comet output, multiple history rows per attribute render as
-multiple table rows. Rows are grouped per `(entity, recvTime)` — rows
+multiple table rows. Rows are grouped per `(entity, recvTime)`: rows
 arriving in one Orion → Comet notification share a `recvTime`, so the
 group corresponds to one POST. Groups are ordered by their measurement
 window: the value of the co-arriving `dateObservedFrom` attribute when
@@ -507,7 +507,7 @@ row and the run still exits 0.
 
 ---
 
-## 3. Delete Comet — `scripts/delete_history.py`
+## 3. Delete Comet: `scripts/delete_history.py`
 
 ### Goal
 
@@ -516,9 +516,9 @@ attributes, using the Comet DELETE endpoints documented in
 `scratch/swagger.json`:
 
 - `DELETE /comet/v1.0/contextEntities/type/<type>/id/<id>/attributes/<attr>`
-  — wipe one attribute on one entity.
+  wipes one attribute on one entity.
 - `DELETE /comet/v1.0/contextEntities/type/<type>/id/<id>`
-  — wipe all attributes on one entity.
+  wipes all attributes on one entity.
 
 **The service-wide `DELETE /contextEntities` shape is intentionally not
 exposed.** A single operator typo would erase all history under the
@@ -530,8 +530,8 @@ needed, do it by curl with explicit operator sign-off.
 DELETE shape. The CLI therefore does not accept range flags; operators
 must accept whole-attribute or whole-entity granularity. (The earlier
 `scripts/dev/probe_sth_delete_range.py` probe is removed in this
-change because its result was inconclusive — only 2 history rows
-landed, below its 3-row gate — and keeping it would imply range delete
+change because its result was inconclusive (only 2 history rows
+landed, below its 3-row gate) and keeping it would imply range delete
 might work, which the swagger contradicts. The non-range probe
 `scripts/dev/probe_sth_delete.py` stays as the authoritative
 live-platform check that DELETE itself is reachable.)
@@ -583,7 +583,7 @@ Where `ENTITY_SPEC` is `ENTITY_ID[:ENTITY_TYPE]`.
   (`FIWARE_SERVICE=""` or `FIWARE_SERVICE_PATH="/"`) **unless** the
   operator also passes `--i-know-this-is-production`. Dry-run is
   always allowed.
-- Dry-run performs **no auth/token/network calls** — it only prints the
+- Dry-run performs **no auth/token/network calls**; it only prints the
   planned URLs.
 
 ### Log events
@@ -604,7 +604,7 @@ Where `ENTITY_SPEC` is `ENTITY_ID[:ENTITY_TYPE]`.
 
 ---
 
-## 4. Delete Orion entities — `scripts/delete_entities.py`
+## 4. Delete Orion entities: `scripts/delete_entities.py`
 
 ### Goal
 
@@ -626,7 +626,7 @@ uv run python scripts/delete_entities.py
 |---|---|
 | `ENTITY_ID[:ENTITY_TYPE]` | One or more entities. Canonical Sendai ids infer the type; custom ids require inline `:ENTITY_TYPE`. |
 | `--purge-history` | After each successful Orion DELETE, also delete the entity's Comet history. |
-| `--attrs` / `--flow-attrs` / `--direction-attrs` | With `--purge-history`, scope the Comet purge to specific attributes (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed** — silently ignored attrs flags are a footgun. |
+| `--attrs` / `--flow-attrs` / `--direction-attrs` | With `--purge-history`, scope the Comet purge to specific attributes (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed**; silently ignored attrs flags are a footgun. |
 | `--reason` | Required. |
 | `--send` | Live deletes. Default: dry-run. |
 | `--i-know-this-is-production` | Required for `--send` when `FIWARE_SERVICE=""` or `FIWARE_SERVICE_PATH="/"`. Same guard `delete_history.py` uses; applies to the chained Comet purge as well. |
@@ -657,7 +657,7 @@ uv run python scripts/delete_entities.py
 ### Ordering rationale
 
 Orion first, then Comet. If Orion still has the entity, future pipeline
-runs would re-publish to it and immediately re-populate Comet — wiping
+runs would re-publish to it and immediately re-populate Comet; wiping
 Comet first would create a brief inconsistency for no benefit. Deleting
 Orion first stops new publications; the Comet purge then has a stable
 target.
@@ -680,7 +680,7 @@ target.
 
 ---
 
-## 5. Delete Orion subscriptions — `scripts/delete_subscriptions.py`
+## 5. Delete Orion subscriptions: `scripts/delete_subscriptions.py`
 
 ### Goal
 
@@ -740,7 +740,7 @@ uv run python scripts/delete_subscriptions.py
 - Refuses live `--send` against a catch-all FIWARE service/path
   (`FIWARE_SERVICE=""` or `FIWARE_SERVICE_PATH="/"`) without
   `--i-know-this-is-production`. Dry-run is always allowed.
-- Dry-run still performs the GET pre-fetch — operators want to see the
+- Dry-run still performs the GET pre-fetch; operators want to see the
   description before authorizing the delete. Dry-run therefore needs
   auth/network access, unlike `delete_entities.py` whose dry-run is
   purely offline. (Trade-off: dry-run is no longer fully offline, but
@@ -779,15 +779,15 @@ the same way `CometClient` carries both create and delete of entity
 history):
 
 - `get_subscription(subscription_id, *, settings, auth, session=None) -> dict | None`
-  — returns the parsed subscription, or `None` on 404. 401 triggers
+  returns the parsed subscription, or `None` on 404. 401 triggers
   one forced-refresh retry; other non-2xx raises `requests.HTTPError`.
 - `delete_subscription(subscription_id, *, settings, auth, session=None) -> int`
-  — returns the HTTP status (204 or 404). 401 triggers one
+  returns the HTTP status (204 or 404). 401 triggers one
   forced-refresh retry; other non-2xx raises `requests.HTTPError`.
 
 Both reuse `_headers(...)` already in the module and accept any
 settings object exposing the fields `_headers` reads (`base_url`,
-`service`, `service_path`, `verify_tls`, `timeout`) — typed as
+`service`, `service_path`, `verify_tls`, `timeout`), typed as
 `settings: Any`. Both `StHSubscriptionSettings` and
 `OrionSettings` qualify; the delete CLI uses `OrionSettings` since
 it has no need for `COMET_NOTIFY_URL`.
@@ -800,7 +800,7 @@ Two pieces of new pipeline-side code; both must be import-safe in
 dry-run (no FIWARE creds required for dry-run is the established
 pattern in `create_entities.py`).
 
-### `sendai_pipeline/comet_client.py` — extend
+### `sendai_pipeline/comet_client.py`: extend
 
 Add two methods to `CometClient`:
 
@@ -811,7 +811,7 @@ Each returns the HTTP status; raises `requests.HTTPError` only on
 non-204/404 results (404 is returned as `404` for the caller to count).
 401 triggers one forced-refresh retry, matching `get_history`.
 
-### `sendai_pipeline/run_flow.py` / `run_direction.py` — extend
+### `sendai_pipeline/run_flow.py` / `run_direction.py`: extend
 
 Add `force_resend: bool = False` kwarg to `_process_send_window` (or
 the equivalent skip-check helper). Default `False` preserves all
@@ -860,7 +860,7 @@ Superseded scripts removed during this change:
   (`--from X --to X`).
 - `show_data.py --source orion` replaces the old entity-check tool.
 - `show_data.py --source comet` replaces the old history-check tool.
-- `scripts/dev/probe_sth_delete_range.py` removed — inconclusive
+- `scripts/dev/probe_sth_delete_range.py` removed: inconclusive
   probe; swagger is authoritative.
 
 Net change to `scripts/`: −4 files, +4 files. Files in the directory

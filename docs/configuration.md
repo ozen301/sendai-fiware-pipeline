@@ -17,7 +17,7 @@ For the deployment workflow that uses these, see
 | `FIWARE_CONSUMER_SECRET` | **required** | OAuth2 client-credentials consumer secret. Same requirement as the key. |
 | `FIWARE_TOKEN_URL` | `${FIWARE_BASE_URL}/oauth2/token` | Override the OAuth2 token endpoint if WSO2 is hosted elsewhere. |
 | `FIWARE_TOKEN_SCOPE` | `default` | OAuth2 scope requested at token exchange. |
-| `FIWARE_TOKEN_CACHE_PATH` | `state/token.json` | Where the OAuth access token is cached between runs so back-to-back cron jobs don't refresh it on every invocation. Because the two product runners can fire within seconds of each other, the code uses a sibling lock file (the cache path with its extension replaced by `.lock` — e.g. `state/token.lock` for the default cache path) to serialize refreshes, and writes the token via a temp file + atomic rename. The path must be on a local filesystem that supports file locks (most do — avoid NFS / network shares). |
+| `FIWARE_TOKEN_CACHE_PATH` | `state/token.json` | Where the OAuth access token is cached between runs so back-to-back cron jobs don't refresh it on every invocation. Because the two product runners can fire within seconds of each other, the code uses a sibling lock file (the cache path with its extension replaced by `.lock`, e.g. `state/token.lock` for the default cache path) to serialize refreshes, and writes the token via a temp file + atomic rename. The path must be on a local filesystem that supports file locks (most do; avoid NFS / network shares). |
 | `FIWARE_TOKEN_REFRESH_MARGIN_SECONDS` | `60` | Refresh the cached access token this many seconds before its stated expiry, to avoid using a token that expires mid-request. |
 | `FIWARE_TOKEN_TIMEOUT_SECONDS` | `10` | HTTP timeout (seconds) for the OAuth2 token-exchange request. |
 | `FIWARE_TIMEOUT_SECONDS` | `10` | HTTP timeout (seconds) for all FIWARE platform requests: Orion (`POST .../attrs`, `GET .../entities`), STH-Comet reads via `comet_client.py`, entity bootstrap, and subscription creation. |
@@ -27,7 +27,7 @@ For the deployment workflow that uses these, see
 
 ## STH-Comet subscriptions
 
-Only `scripts/create_sth_subscriptions.py` reads these — the runners do
+Only `scripts/create_sth_subscriptions.py` reads these; the runners do
 not.
 
 | Variable | Default | Purpose |
@@ -69,7 +69,7 @@ not run `scripts/refresh_metadata.py`.
 | `TARGET_DIRECTION_BATCHES` | unset → **no direction batches publish** | Comma-separated list of install batches to publish for Product B direction (e.g. `2023,2026`). Empty / unset is a safe default. Every entry must appear as a `batch` value in the metadata CSV; a typo fails the direction run before any SQL or POST. |
 | `FLOW_SEND_MODE` | `dry-run` | Product A POST gate. `dry-run` builds and logs the payload but does not POST to `/orion/v2.0/entities/<id>/attrs`; `send` performs those live POSTs. Note: dry-run still makes read-only `GET` calls to Orion to validate that the configured target entities exist (the entity-map check), so Orion is contacted either way once `TARGET_FLOW_BATCHES` is non-empty. |
 | `DIRECTION_SEND_MODE` | `dry-run` | Product B POST gate. Same semantics as `FLOW_SEND_MODE`. |
-| `IGNORED_PLACE_PREFIXES` | `quick.,test` | Comma-separated prefixes used to filter source rows: any row whose `group_place_id` column (Product A) or whose `from_group_place_id` / `to_group_place_id` column (Product B) starts with one of these prefixes is excluded from publishing. Excluded rows produce a `DEBUG`-level `ignored_place_prefix` log event and nothing else — no Orion POST, no WARN. Empty / unset applies the default. Set to a single comma to disable noise filtering entirely. The literal `'ALL'` is never matched. |
+| `IGNORED_PLACE_PREFIXES` | `quick.,test` | Comma-separated prefixes used to filter source rows: any row whose `group_place_id` column (Product A) or whose `from_group_place_id` / `to_group_place_id` column (Product B) starts with one of these prefixes is excluded from publishing. Excluded rows produce a `DEBUG`-level `ignored_place_prefix` log event and nothing else: no Orion POST, no WARN. Empty / unset applies the default. Set to a single comma to disable noise filtering entirely. The literal `'ALL'` is never matched. |
 | `SOURCE_MAX_IMPUTATION_TIER` | `2` | Product A source-quality gate. Rows from `flow_metrics2_per_place2_agg_imputed` publish only when `imputation_tier <= SOURCE_MAX_IMPUTATION_TIER`; the default keeps tiers `0`, `1`, and `2`, matching the rule "smaller than 3." Empty / unset applies the default. Values must be non-negative integers. `scripts/resend.py flow --max-imputation-tier N` can override this for one explicit resend; Product B source selection does not apply this setting. |
 
 ## Window timing and retry horizons
@@ -91,7 +91,7 @@ interval, or the run aborts at startup.
 |---|---|---|
 | `LOG_LEVEL` | `INFO` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. |
 | `LOG_FORMAT` | `json` | `json` (one JSON object per line, production) or `text` (human-readable, for local dev). |
-| `LOG_PAYLOAD_MODE` | `failure` | Per-POST body verbosity. `hash` always logs only a SHA-256 + byte count. `failure` logs hash on success and a body excerpt on failure. `full` always logs the body excerpt — use only for dry-run verification. Body excerpts are always capped by `LOG_PAYLOAD_MAX_BYTES`, even in `full` mode. |
+| `LOG_PAYLOAD_MODE` | `failure` | Per-POST body verbosity. `hash` always logs only a SHA-256 + byte count. `failure` logs hash on success and a body excerpt on failure. `full` always logs the body excerpt; use only for dry-run verification. Body excerpts are always capped by `LOG_PAYLOAD_MAX_BYTES`, even in `full` mode. |
 | `LOG_PAYLOAD_MAX_BYTES` | `16384` | Cap on logged request-body bytes (UTF-8). Applies to all `LOG_PAYLOAD_MODE` settings that emit a body. |
 | `LOG_RESPONSE_MAX_BYTES` | `2048` | Cap on logged response excerpts (UTF-8). |
 | `LOG_DIR` | `logs` | Directory for rotating per-product log files (`logs/{product}.log`). |
