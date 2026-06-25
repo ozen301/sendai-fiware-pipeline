@@ -693,6 +693,7 @@ def test_resend_real_path_not_per_target(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     resend = _resend_module()
+    _freeze_resend_now(monkeypatch, resend)
     _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
     db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
     db_connection.rows = [
