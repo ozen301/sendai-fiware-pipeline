@@ -160,6 +160,10 @@ and create mixed-type history in STH-Comet.
 | `peopleOccupancy_immedate`, `peopleOccupancy_near` | `"number"` (lowercase string) |
 | `peopleCount_flow` | `StructuredValue` |
 
+The `immedate` spelling is intentional. The live Sendai entities
+already used that attribute name before this pipeline, so the pipeline
+keeps it for compatibility instead of renaming it to `immediate`.
+
 > Verified 2026-05-23 against the live broker for `Blesensor.per3600.*`
 > and `Blesensor.per300.*` entities. Live entities also carry a
 > `peopleOccupancy_far` attribute (also `"number"`); Product A does not
