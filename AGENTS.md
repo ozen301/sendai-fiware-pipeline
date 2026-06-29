@@ -77,11 +77,18 @@ Review is **iterative, not single-pass**. Each round:
    finding, recording why when declining; the Author makes the edits.
 3. The Commander sends the updated artifact back for the next round.
 
-Repeat until the Reviewer raises no new substantive issues. Converge
-in a bounded number of rounds. If findings are not settling, stop and
-surface the disagreement to the human rather than looping indefinitely.
-Reuse the Reviewer's session across rounds so it keeps prior context;
+Continue the existing Reviewer session across rounds when one is
+available, so it keeps prior context instead of re-exploring the repo;
 re-review stays read-only, so resuming is safe.
+
+Repeat this process until the Reviewer raises no new substantive
+issues. Converge in a bounded number of rounds (to cut trivial
+back-and-forth, not real concerns); if findings are not settling, stop
+and surface the disagreement to the human rather than looping
+indefinitely. The goal is a robust artifact, not fast convergence.
+Never set aside a material concern such as a better alternative or an
+unresolved risk to make the review settle sooner, even if it arrives
+late or reopens a settled question.
 
 Whenever you send diffs or files to another agent, send only ordinary
 source code, tests, documentation, and configuration. Do **not** send
@@ -101,6 +108,9 @@ When working with Codex:
   must start fresh with `--fresh --write`, not `--resume --write`
   (resuming inherits the original thread's read-only sandbox, so
   `apply_patch` is rejected).
+- To continue a review across rounds, invoke `codex:codex-rescue` with
+  `--resume` (not `SendMessage` to the wrapper, which cold-starts a fresh
+  Codex session each round).
 
 ### Implementation Delegation
 
