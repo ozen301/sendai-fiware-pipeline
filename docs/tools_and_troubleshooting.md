@@ -326,6 +326,25 @@ may exceed it to keep one `aggregated_at` second together. Once the
 cursor catches up, each cron tick scans only revisions since the prior
 run.
 
+Because `aggregated_at` is a MySQL `timestamp`, the sweep cursor must be
+compared in a JST (`+09:00`) MySQL session. Check the runtime connection
+with the same environment the runners use:
+
+```sql
+SELECT
+  @@global.time_zone AS global_time_zone,
+  @@session.time_zone AS session_time_zone,
+  @@system_time_zone AS system_time_zone,
+  NOW() AS session_now,
+  UTC_TIMESTAMP() AS utc_now,
+  TIMEDIFF(NOW(), UTC_TIMESTAMP()) AS session_utc_offset;
+```
+
+The required result is a session offset of `09:00:00`. A
+`session_time_zone` of `SYSTEM` is acceptable only when
+`system_time_zone` is `JST`; otherwise the connection should be corrected
+before relying on revision-sweep cursor ranges.
+
 To inspect the cursor, read the top-level field:
 
 ```sh

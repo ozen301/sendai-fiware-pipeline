@@ -229,6 +229,16 @@ normal per-window update path.
 | Token refresh | OAuth2 client-credentials; proactive on expiry and on `401`. |
 | Logging | One structured line per POST in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE`: `hash` (always hash only), `failure` (default: hash on success, body excerpt on failure), or `full` (always body). |
 
+Revision cursor comparisons depend on the MySQL session time zone.
+`last_aggregated_at` is stored as a JST ISO timestamp, then formatted
+as a second-resolution `YYYY-MM-DD HH:MM:SS` SQL bound. The source
+`aggregated_at` columns are MySQL `timestamp` columns, so MySQL compares
+and returns them in the current session time zone. Runtime DB sessions
+used by the runners must therefore resolve to JST (`+09:00`), for
+example `@@session.time_zone = 'SYSTEM'` only when
+`@@system_time_zone = 'JST'`. A non-JST session can shift revision
+cursor ranges and cause the sweep to skip or repeat revised windows.
+
 The fresh-path and revision-sweep catch-ups split work by window age, at
 the lookback's lower bound (i.e., the oldest `startdate` the fresh path
 reprocesses this run). The fresh path owns windows whose `startdate` is
