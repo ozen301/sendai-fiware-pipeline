@@ -52,9 +52,11 @@ drift prevention:
 Use cross-agent validation actively for complicated or high-stakes
 work, not only for code. A plan or design for a critical or complex
 change, a spec, a non-trivial refactor, or a hard diagnosis can go
-through review as readily as an implementation. The more consequential
-or non-obvious the work is, the stronger the case for a second
-model's review before you commit to a direction. Prefer cross-model
+through review as readily as an implementation. Documentation
+explaining subtle behavior counts too: a read-only check of docstrings
+and comments against the code catches inaccuracy and drift. The more
+consequential or non-obvious the work is, the stronger the case for a
+second model's review before you commit to a direction. Prefer cross-model
 validation when both Codex and Claude Code are available.
 
 The process uses three roles:
@@ -147,26 +149,40 @@ implementation complete; they must be clean.
 
 ### Docstrings and Comments
 
+Write for a developer seeing this code for the first time, who does not
+hold the design in their head. The goal is not to record all you know
+but to move that reader to understanding by the shortest clear path.
+Before calling a docstring or comment done, read it once cold: does it
+state what the code does up front, follow a logical order, and say only
+what the reader needs? If not, revise, judging the whole docstring or
+comment rather than a single phrase.
+
 - Use Google-style docstrings for public modules, classes, and
-  functions. State what the function does and why (if not obvious).
-- When a parameter or return value is a `dict`/`list`/tuple whose
-  structure is not self-explanatory, document the keys and give a
-  short concrete example. However, skip it where the signature already
-  makes the shape obvious.
-- Add private-helper docstrings when purpose or behavior is not
+  functions. State what the code does first; let the "why", if
+  necessary, follow as a short note. Do not dwell on what the code must
+  *not* do.
+- For subtle logic, explain the mechanism step by step, not just
+  the conclusion; a concrete example often helps. Stay within this
+  code's behavior; stating unrelated paths or another product's behavior
+  pulls the reader off track.
+- Match the level of detail to the reader: `Args`/`Returns` are the
+  caller's contract, not the internal step sequence — cut anything that
+  doesn't affect how the code is used. Document a `dict`/`list`/tuple
+  shape (with a short example) or a private helper when it is not already
   obvious.
-- For dense or multi-step logic, add a brief lead-in comment that
-  narrates what the block does (the sequence of steps), above any
-  existing inline "why" notes.
-- Referencing a `docs/` file from code, docstrings, or comments is
-  allowed where it genuinely helps the reader. Inlining the invariant
-  or rationale is still fine when that reads better.
-- Writing style: keep prose friendly to non-native English speakers
-  (clear structure and accessible wording) while assuming a
-  technically fluent reader (use technical terms directly, no padding).
-  Clarity and accuracy lead: a well-structured longer sentence is fine
-  when it reads better, and precise technical terms beat
-  simpler but vaguer words. Target precise, professional, easy to read.
+- Keep claims accurate: details such as execution order, key order,
+  input→output mappings, and any "always/never" must match the code.
+  Verify, don't recall. Re-check each claim when copying a
+  docstring between parallel functions. Avoid absolutes unless literally
+  true, and describe current behavior, not change history.
+- Keep references and terms unambiguous: the reader should be able to
+  tell what every name points to; no word should carry a second reading
+  in context; metaphors should not need decoding; and pronouns and
+  connectives ("because", "so") should resolve and hold.
+- Keep prose ESL-friendly (clear structure, accessible wording) for a
+  technically fluent reader (terms used directly, no padding); a longer
+  well-structured sentence is fine, and precise terms beat vaguer ones.
+  Reference a `docs/` file when it genuinely helps.
 
 ### Configuration
 
@@ -237,4 +253,5 @@ Use Conventional Commits format:
 Common types: `feat`, `fix`, `refactor`, `docs`, `style`, `test`, `chore`.
 Add a body only when the reason is not obvious from the diff;
 add footers for issue references (`Closes #123`), breaking change notices
-(`BREAKING CHANGE: ...`), or other metadata. Simple commits need only the subject line.
+(`BREAKING CHANGE: ...`), or other metadata. Simple commits need only the
+subject line.
