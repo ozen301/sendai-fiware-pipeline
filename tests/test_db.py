@@ -4,6 +4,7 @@ import pymysql
 import pymysql.cursors
 import pytest
 
+import sendai_pipeline.db as db
 from sendai_pipeline.db import (
     DIRECTION_METRICS_TABLE,
     FLOW_METRICS_TABLE,
@@ -42,6 +43,20 @@ EXPECTED_FLOW_STARTDATES_SQL = " ".join(
     """.split()
 )
 
+EXPECTED_FLOW_DISCOVERY_SQL = " ".join(
+    """
+    SELECT startdate, MAX(aggregated_at) AS win_agg
+    FROM flow_metrics2_per_place2_agg_imputed
+    WHERE interval_min = %s
+      AND aggregated_at >= %s
+      AND aggregated_at < %s
+      AND startdate < %s
+      AND imputation_tier <= %s
+    GROUP BY startdate
+    ORDER BY win_agg, startdate
+    """.split()
+)
+
 EXPECTED_DIRECTION_SQL = " ".join(
     """
     SELECT startdate, from_group_place_id, to_group_place_id,
@@ -51,6 +66,30 @@ EXPECTED_DIRECTION_SQL = " ".join(
       AND startdate >= %s
       AND startdate <= %s
     ORDER BY startdate
+    """.split()
+)
+
+EXPECTED_DIRECTION_STARTDATES_SQL = " ".join(
+    """
+    SELECT startdate, from_group_place_id, to_group_place_id,
+           from_device_type, to_device_type, interval_min, count
+    FROM direction_metrics2_per_place2_agg
+    WHERE interval_min = %s
+      AND startdate IN (%s, %s, %s)
+    ORDER BY startdate
+    """.split()
+)
+
+EXPECTED_DIRECTION_DISCOVERY_SQL = " ".join(
+    """
+    SELECT startdate, MAX(aggregated_at) AS win_agg
+    FROM direction_metrics2_per_place2_agg
+    WHERE interval_min = %s
+      AND aggregated_at >= %s
+      AND aggregated_at < %s
+      AND startdate < %s
+    GROUP BY startdate
+    ORDER BY win_agg, startdate
     """.split()
 )
 
@@ -366,6 +405,35 @@ def test_select_flow_metrics_for_startdates_empty_startdates_skips_cursor() -> N
     assert connection._cursor.entered is False
 
 
+def test_discover_flow_revised_windows_emits_half_open_grouped_sql() -> None:
+    rows = [
+        {"startdate": "20260513_0500", "win_agg": "2026-06-23 08:15:00"},
+        {"startdate": "20260513_0600", "win_agg": "2026-06-23 08:15:01"},
+    ]
+    connection = FakeConnection(rows)
+
+    result = db.discover_flow_revised_windows(
+        connection,
+        interval_min=60,
+        aggregated_at_lower="2026-06-23 08:00:00",
+        aggregated_at_upper="2026-06-23 09:00:00",
+        startdate_upper="20260513_0700",
+        max_imputation_tier=2,
+    )
+
+    assert result == rows
+    assert len(connection._cursor.executed) == 1
+    sql, params = connection._cursor.executed[0]
+    assert _normalize_sql(sql) == EXPECTED_FLOW_DISCOVERY_SQL
+    assert params == (
+        60,
+        "2026-06-23 08:00:00",
+        "2026-06-23 09:00:00",
+        "20260513_0700",
+        2,
+    )
+
+
 def test_select_direction_metrics_emits_exact_sql_and_returns_rows() -> None:
     rows = [
         {
@@ -386,6 +454,78 @@ def test_select_direction_metrics_emits_exact_sql_and_returns_rows() -> None:
     sql, params = connection._cursor.executed[0]
     assert _normalize_sql(sql) == EXPECTED_DIRECTION_SQL
     assert params == (5, "20260513_0655", "20260513_0700")
+
+
+def test_select_direction_metrics_for_startdates_emits_in_clause_and_returns_rows() -> (
+    None
+):
+    rows = [
+        {
+            "startdate": "20260513_0700",
+            "from_group_place_id": "sendai202603.105",
+            "to_group_place_id": "ALL",
+            "from_device_type": "M5Stack",
+            "to_device_type": "M5Stack",
+            "count": 12,
+        }
+    ]
+    connection = FakeConnection(rows)
+
+    result = db.select_direction_metrics_for_startdates(
+        connection,
+        interval_min=5,
+        startdates=("20260513_0650", "20260513_0655", "20260513_0700"),
+    )
+
+    assert result == rows
+    assert len(connection._cursor.executed) == 1
+    sql, params = connection._cursor.executed[0]
+    assert _normalize_sql(sql) == EXPECTED_DIRECTION_STARTDATES_SQL
+    assert params == (5, "20260513_0650", "20260513_0655", "20260513_0700")
+
+
+def test_select_direction_metrics_for_startdates_empty_startdates_skips_cursor() -> (
+    None
+):
+    connection = FakeConnection([{"startdate": "20260513_0700"}])
+
+    result = db.select_direction_metrics_for_startdates(
+        connection,
+        interval_min=5,
+        startdates=[],
+    )
+
+    assert result == []
+    assert connection.cursor_calls == 0
+    assert connection._cursor.executed == []
+    assert connection._cursor.entered is False
+
+
+def test_discover_direction_revised_windows_emits_half_open_grouped_sql() -> None:
+    rows = [
+        {"startdate": "20260513_0655", "win_agg": "2026-06-23 08:15:00"},
+        {"startdate": "20260513_0700", "win_agg": "2026-06-23 08:15:01"},
+    ]
+    connection = FakeConnection(rows)
+
+    result = db.discover_direction_revised_windows(
+        connection,
+        interval_min=5,
+        aggregated_at_lower="2026-06-23 08:00:00",
+        aggregated_at_upper="2026-06-23 09:00:00",
+        startdate_upper="20260513_0715",
+    )
+
+    assert result == rows
+    assert len(connection._cursor.executed) == 1
+    sql, params = connection._cursor.executed[0]
+    assert _normalize_sql(sql) == EXPECTED_DIRECTION_DISCOVERY_SQL
+    assert params == (
+        5,
+        "2026-06-23 08:00:00",
+        "2026-06-23 09:00:00",
+        "20260513_0715",
+    )
 
 
 @pytest.fixture(

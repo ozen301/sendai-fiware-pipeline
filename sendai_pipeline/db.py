@@ -38,6 +38,18 @@ WHERE interval_min = %s
 ORDER BY startdate, group_place_id
 """
 
+_FLOW_REVISED_WINDOWS_SQL = f"""
+SELECT startdate, MAX(aggregated_at) AS win_agg
+FROM {FLOW_METRICS_TABLE}
+WHERE interval_min = %s
+  AND aggregated_at >= %s
+  AND aggregated_at < %s
+  AND startdate < %s
+  AND imputation_tier <= %s
+GROUP BY startdate
+ORDER BY win_agg, startdate
+"""
+
 _DIRECTION_METRICS_SQL = f"""
 SELECT startdate, from_group_place_id, to_group_place_id,
        from_device_type, to_device_type, interval_min, count
@@ -46,6 +58,26 @@ WHERE interval_min = %s
   AND startdate >= %s
   AND startdate <= %s
 ORDER BY startdate
+"""
+
+_DIRECTION_METRICS_FOR_STARTDATES_SQL_TEMPLATE = f"""
+SELECT startdate, from_group_place_id, to_group_place_id,
+       from_device_type, to_device_type, interval_min, count
+FROM {DIRECTION_METRICS_TABLE}
+WHERE interval_min = %s
+  AND startdate IN ({{placeholders}})
+ORDER BY startdate
+"""
+
+_DIRECTION_REVISED_WINDOWS_SQL = f"""
+SELECT startdate, MAX(aggregated_at) AS win_agg
+FROM {DIRECTION_METRICS_TABLE}
+WHERE interval_min = %s
+  AND aggregated_at >= %s
+  AND aggregated_at < %s
+  AND startdate < %s
+GROUP BY startdate
+ORDER BY win_agg, startdate
 """
 
 
@@ -163,6 +195,35 @@ def select_flow_metrics_for_startdates(
         return cursor.fetchall()
 
 
+def discover_flow_revised_windows(
+    connection: Any,
+    *,
+    interval_min: int,
+    aggregated_at_lower: str,
+    aggregated_at_upper: str,
+    startdate_upper: str,
+    max_imputation_tier: int,
+) -> list[dict[str, Any]]:
+    """Return flow source windows revised within a half-open cursor range.
+
+    The returned dict rows are discovery metadata only, for example
+    ``{"startdate": "20260629_1200", "win_agg": datetime(...)}``.  Callers
+    must re-fetch full windows before building payloads.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _FLOW_REVISED_WINDOWS_SQL,
+            (
+                interval_min,
+                aggregated_at_lower,
+                aggregated_at_upper,
+                startdate_upper,
+                max_imputation_tier,
+            ),
+        )
+        return cursor.fetchall()
+
+
 def select_direction_metrics(
     connection: Any,
     *,
@@ -175,6 +236,58 @@ def select_direction_metrics(
         cursor.execute(
             _DIRECTION_METRICS_SQL,
             (interval_min, lower_bound, upper_bound),
+        )
+        return cursor.fetchall()
+
+
+def select_direction_metrics_for_startdates(
+    connection: Any,
+    *,
+    interval_min: int,
+    startdates: Iterable[str],
+) -> list[dict[str, Any]]:
+    """Return direction metric rows for exact source-window start dates.
+
+    This mirrors the flow startdate refetch helper used by the revision sweep:
+    discovery decides which windows changed, and this query retrieves every row
+    needed to build complete Product B payloads for those windows.
+    """
+    startdate_values = tuple(startdates)
+    if not startdate_values:
+        return []
+
+    placeholders = ", ".join("%s" for _ in startdate_values)
+    sql = _DIRECTION_METRICS_FOR_STARTDATES_SQL_TEMPLATE.format(
+        placeholders=placeholders
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(sql, (interval_min, *startdate_values))
+        return cursor.fetchall()
+
+
+def discover_direction_revised_windows(
+    connection: Any,
+    *,
+    interval_min: int,
+    aggregated_at_lower: str,
+    aggregated_at_upper: str,
+    startdate_upper: str,
+) -> list[dict[str, Any]]:
+    """Return direction source windows revised within a half-open cursor range.
+
+    The returned dict rows are discovery metadata only, for example
+    ``{"startdate": "20260629_1200", "win_agg": datetime(...)}``.  Callers
+    must re-fetch full windows before building payloads.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            _DIRECTION_REVISED_WINDOWS_SQL,
+            (
+                interval_min,
+                aggregated_at_lower,
+                aggregated_at_upper,
+                startdate_upper,
+            ),
         )
         return cursor.fetchall()
 

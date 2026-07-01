@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+import sendai_pipeline.state as state_module
 from sendai_pipeline.logging_setup import _ALLOWED_EXTRA_KEYS
 from sendai_pipeline.state import (
     StateLoadError,
@@ -122,7 +123,8 @@ def test_load_missing_file_returns_empty_store(tmp_path: Path) -> None:
 
     store = WindowStateStore.load(path, now=Clock([T0]))
 
-    assert store.as_dict() == {"schema_version": 2, "windows": {}}
+    assert store.as_dict()["schema_version"] == state_module.SCHEMA_VERSION
+    assert store.as_dict()["windows"] == {}
     assert store.summary_counts() == {
         "pending": 0,
         "partial": 0,
@@ -163,7 +165,7 @@ def test_save_round_trips_window_and_target_shape(tmp_path: Path) -> None:
     store.save()
 
     expected = {
-        "schema_version": 2,
+        "schema_version": state_module.SCHEMA_VERSION,
         "windows": {
             WINDOW: {
                 "first_seen": T0.isoformat(),
@@ -183,10 +185,118 @@ def test_save_round_trips_window_and_target_shape(tmp_path: Path) -> None:
             }
         },
     }
-    assert json.loads(path.read_text(encoding="utf-8")) == expected
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == expected["schema_version"]
+    assert saved["windows"] == expected["windows"]
 
     reloaded = WindowStateStore.load(path, now=Clock([T2]))
-    assert reloaded.as_dict() == expected
+    assert reloaded.as_dict()["schema_version"] == expected["schema_version"]
+    assert reloaded.as_dict()["windows"] == expected["windows"]
+
+
+def test_schema_version_is_v3_for_revision_cursor_contract() -> None:
+    assert state_module.SCHEMA_VERSION == 3
+
+
+def test_revision_cursor_absent_key_loads_as_none(tmp_path: Path) -> None:
+    path = _state_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"schema_version": 2, "windows": {}}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    store = WindowStateStore.load(path, now=Clock([T0]))
+
+    assert store.revision_cursor() is None
+    assert store.as_dict()["last_aggregated_at"] is None
+
+
+def test_revision_cursor_round_trips_through_load_and_save(tmp_path: Path) -> None:
+    path = _state_path(tmp_path)
+    cursor = datetime(2026, 6, 23, 8, 15, 0, tzinfo=JST)
+
+    store = WindowStateStore(path, now=Clock([T0]))
+    store.set_revision_cursor(cursor)
+    store.save()
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 3
+    assert saved["last_aggregated_at"] == cursor.isoformat()
+
+    reloaded = WindowStateStore.load(path, now=Clock([T1]))
+    assert reloaded.revision_cursor() == cursor
+
+
+def test_v2_state_file_upgrades_to_v3_with_empty_revision_cursor(
+    tmp_path: Path,
+) -> None:
+    path = _state_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"schema_version": 2, "windows": {}}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    store = WindowStateStore.load(path, now=Clock([T0]))
+    store.save()
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 3
+    assert saved["last_aggregated_at"] is None
+    assert saved["windows"] == {}
+
+
+def test_revision_cursor_accessors_store_timezone_aware_datetimes(
+    tmp_path: Path,
+) -> None:
+    cursor = datetime(2026, 6, 23, 8, 15, 0, tzinfo=JST)
+    store = WindowStateStore(_state_path(tmp_path), now=Clock([T0]))
+
+    store.set_revision_cursor(cursor)
+
+    assert store.revision_cursor() == cursor
+    assert store.as_dict()["last_aggregated_at"] == cursor.isoformat()
+
+
+def test_save_after_load_window_mutation_preserves_revision_cursor(
+    tmp_path: Path,
+) -> None:
+    path = _state_path(tmp_path)
+    cursor = datetime(2026, 6, 23, 8, 15, 0, tzinfo=JST)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 3,
+                "last_aggregated_at": cursor.isoformat(),
+                "windows": {},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    store = WindowStateStore.load(path, now=Clock([T0, T1]))
+    store.begin_window_attempt(
+        WINDOW,
+        interval_min=60,
+        source_window_start=datetime(2026, 5, 13, 7, 0, 0, tzinfo=JST),
+        source_window_end=datetime(2026, 5, 13, 8, 0, 0, tzinfo=JST),
+        expected_target_ids=[ENTITY_10],
+    )
+    store.record_target(
+        WINDOW,
+        ENTITY_10,
+        status="ok",
+        http_status=204,
+        payload_sha256=HASH_A,
+    )
+    store.save()
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["last_aggregated_at"] == cursor.isoformat()
+    assert saved["windows"][WINDOW]["targets"][ENTITY_10]["status"] == "ok"
 
 
 def test_save_uses_atomic_replace_from_sibling_temp_file(

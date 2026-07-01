@@ -33,6 +33,7 @@ from sendai_pipeline.transform_flow import transform_flow_rows
 JST = timezone(timedelta(hours=9))
 NOW = datetime(2026, 5, 23, 12, 17, 0, tzinfo=JST)
 NOW_ON_HOUR = datetime(2026, 5, 23, 12, 0, 0, tzinfo=JST)
+REVISION_NOW = datetime(2026, 6, 30, 12, 17, 43, 123456, tzinfo=JST)
 
 
 class Clock:
@@ -63,6 +64,31 @@ class FakeDbCursor:
 
     def execute(self, _sql: str, params: tuple[Any, ...]) -> None:
         normalized_sql = " ".join(_sql.split())
+        if (
+            "MAX(aggregated_at)" in normalized_sql
+            and "GROUP BY startdate" in normalized_sql
+        ):
+            (
+                interval_min,
+                aggregated_at_lower,
+                aggregated_at_upper,
+                startdate_upper,
+                max_imputation_tier,
+            ) = params
+            self._connection.discovery_queries.append(
+                (
+                    int(interval_min),
+                    str(aggregated_at_lower),
+                    str(aggregated_at_upper),
+                    str(startdate_upper),
+                    int(max_imputation_tier),
+                )
+            )
+            self._rows = list(
+                self._connection.discovery_rows_by_interval.get(int(interval_min), [])
+            )
+            return
+
         if "startdate IN" in normalized_sql:
             interval_min = int(params[0])
             startdates = tuple(str(value) for value in params[1:-1])
@@ -102,6 +128,8 @@ class FakeDbConnection:
         *,
         startdate_rows_by_interval: Mapping[int, Iterable[Mapping[str, Any]]]
         | None = None,
+        discovery_rows_by_interval: Mapping[int, Iterable[Mapping[str, Any]]]
+        | None = None,
     ) -> None:
         self.rows_by_interval = {
             interval: [dict(row) for row in rows]
@@ -115,8 +143,13 @@ class FakeDbConnection:
             if startdate_rows_by_interval is not None
             else self.rows_by_interval
         )
+        self.discovery_rows_by_interval = {
+            interval: [dict(row) for row in rows]
+            for interval, rows in (discovery_rows_by_interval or {}).items()
+        }
         self.queries: list[tuple[int, str, str, int]] = []
         self.startdate_queries: list[tuple[int, tuple[str, ...], int]] = []
+        self.discovery_queries: list[tuple[int, str, str, str, int]] = []
         self.close_calls = 0
 
     def cursor(self) -> FakeDbCursor:
@@ -302,10 +335,18 @@ def transformed_hash(row: Mapping[str, Any], places: Iterable[SensorPlace]) -> s
     return payload_hash(payloads[0]["attrs"])
 
 
-def write_state(path: Path, windows: Mapping[str, Mapping[str, Any]]) -> None:
+def write_state(
+    path: Path,
+    windows: Mapping[str, Mapping[str, Any]],
+    *,
+    last_aggregated_at: str | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    state: dict[str, Any] = {"windows": windows}
+    if last_aggregated_at is not None:
+        state["last_aggregated_at"] = last_aggregated_at
     path.write_text(
-        json.dumps({"windows": windows}, sort_keys=True, separators=(",", ":")) + "\n",
+        json.dumps(state, sort_keys=True, separators=(",", ":")) + "\n",
         encoding="utf-8",
     )
 
@@ -1396,7 +1437,7 @@ def test_run_flow_skips_unchanged_ok_target_and_keeps_window_complete(
     assert records(caplog, "post_skipped_drift") == []
 
 
-def test_run_flow_skips_drifted_ok_target_and_keeps_original_hash(
+def test_run_flow_reposts_drifted_ok_target_and_records_new_hash(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1436,12 +1477,13 @@ def test_run_flow_skips_drifted_ok_target_and_keeps_original_hash(
         )
 
     assert result.exit_code == 0
-    assert orion.calls == []
+    assert [call["entity_id"] for call in orion.calls] == [target.entity_id]
     record = store.target_record("per3600/20260523_0900", target.entity_id)
     assert record is not None
     assert record["status"] == "ok"
-    assert record["last_payload_sha256"] == old_hash
-    drift = records(caplog, "post_skipped_drift")
+    assert record["last_payload_sha256"] == new_hash
+    assert records(caplog, "post_skipped_drift") == []
+    drift = records(caplog, "post_resent_drift")
     assert len(drift) == 1
     assert drift[0].entity_id == target.entity_id
     assert drift[0].window == "per3600/20260523_0900"
@@ -1591,7 +1633,7 @@ def test_run_flow_retries_failed_target_when_hash_differs_without_drift_log(
     assert records(caplog, "post_skipped_drift") == []
 
 
-def test_run_flow_completes_partial_window_without_reposting_drifted_ok_target(
+def test_run_flow_completes_partial_window_and_reposts_drifted_ok_target(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -1641,16 +1683,20 @@ def test_run_flow_completes_partial_window_without_reposting_drifted_ok_target(
     assert result.exit_code == 0
     assert result.windows_complete == 1
     assert result.windows_partial == 0
-    assert [call["entity_id"] for call in orion.calls] == [failed_target.entity_id]
+    assert [call["entity_id"] for call in orion.calls] == [
+        ok_target.entity_id,
+        failed_target.entity_id,
+    ]
     ok_record = store.target_record("per3600/20260523_0900", ok_target.entity_id)
     failed_record = store.target_record(
         "per3600/20260523_0900", failed_target.entity_id
     )
     assert ok_record is not None
     assert failed_record is not None
-    assert ok_record["last_payload_sha256"] == ok_old_hash
+    assert ok_record["last_payload_sha256"] == transformed_hash(ok_row, [ok_target])
     assert failed_record["status"] == "ok"
-    assert len(records(caplog, "post_skipped_drift")) == 1
+    assert records(caplog, "post_skipped_drift") == []
+    assert len(records(caplog, "post_resent_drift")) == 1
 
 
 def test_run_flow_saves_successful_target_before_next_post(
@@ -2247,6 +2293,704 @@ def test_main_flock_contention_returns_zero_and_warns(
         in capsys.readouterr().err
     )
     assert caplog.records == []
+
+
+def revision_discovery_row(startdate: str, aggregated_at: str) -> dict[str, str]:
+    return {"startdate": startdate, "win_agg": aggregated_at}
+
+
+def revision_flow_settings(
+    tmp_path: Path,
+    *,
+    send_mode: str = "send",
+    enabled: bool = True,
+    max_windows: int = 2000,
+) -> RunFlowSettings:
+    return run_settings(
+        tmp_path,
+        send_mode=send_mode,
+        revision_sweep_enabled=enabled,
+        revision_sweep_max_windows=max_windows,
+    )
+
+
+def revision_seed_query_bound(seed: object) -> str:
+    if isinstance(seed, datetime):
+        seed_dt = seed
+    elif isinstance(seed, str):
+        assert "T" in seed and seed.endswith("+09:00")
+        seed_dt = datetime.fromisoformat(seed)
+    else:
+        raise TypeError(f"unsupported revision seed type: {type(seed).__name__}")
+    return seed_dt.replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def test_run_flow_sweeps_old_revised_window_missed_by_fresh_path(
+    tmp_path: Path,
+) -> None:
+    target = place()
+    revised = flow_row(startdate="20260620_0900")
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [revised]},
+        discovery_rows_by_interval={
+            60: [revision_discovery_row("20260620_0900", "2026-06-30 08:15:00")]
+        },
+    )
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[target],
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert result.exit_code == 0
+    assert db_connection.startdate_queries == [(60, ("20260620_0900",), 2)]
+    assert db_connection.queries == [
+        (5, "20260630_0715", "20260630_0915", 2),
+        (60, "20260629_2100", "20260630_0900", 2),
+    ]
+
+
+def test_run_flow_sweeps_five_min_revision_older_than_floor_younger_than_horizon(
+    tmp_path: Path,
+) -> None:
+    db_connection = FakeDbConnection(
+        {5: []},
+        startdate_rows_by_interval={
+            5: [flow_row(startdate="20260630_0600", interval_min=5)]
+        },
+        discovery_rows_by_interval={
+            5: [revision_discovery_row("20260630_0600", "2026-06-30 08:15:00")]
+        },
+    )
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[place(interval_min=5)],
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert db_connection.startdate_queries == [(5, ("20260630_0600",), 2)]
+
+
+def test_run_flow_advances_revision_cursor_when_sweep_post_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        run_flow_module,
+        "REVISION_SWEEP_DISCOVERY_SPAN",
+        timedelta(hours=6),
+        raising=False,
+    )
+    path = tmp_path / "state" / "flow.json"
+    write_state(path, {}, last_aggregated_at="2026-06-30T12:00:00+09:00")
+    store = WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+        discovery_rows_by_interval={
+            60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+        },
+    )
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(results=[{"status": 502, "ok": False}]),
+        metadata=[place()],
+        store=store,
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert result.exit_code == 1
+    assert store.revision_cursor() == REVISION_NOW.replace(microsecond=0)
+    assert store.window_status("per3600/20260620_0900") == "partial"
+
+
+def test_run_flow_retries_failed_sweep_window_from_state_after_cursor_advanced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        run_flow_module,
+        "REVISION_SWEEP_DISCOVERY_SPAN",
+        timedelta(hours=6),
+        raising=False,
+    )
+    target = place()
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_0900": window_record(
+                first_seen=REVISION_NOW - timedelta(days=1),
+                last_attempt=REVISION_NOW - timedelta(days=1),
+                status="partial",
+                targets={
+                    target.entity_id: target_record(
+                        status="failed",
+                        http_status=502,
+                        payload_sha256="0" * 64,
+                        last_attempt_at=REVISION_NOW - timedelta(days=1),
+                    )
+                },
+            )
+        },
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+    store = WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+    )
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[target],
+        store=store,
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert result.exit_code == 0
+    assert db_connection.discovery_queries
+    assert db_connection.startdate_queries == [(60, ("20260620_0900",), 2)]
+    assert store.window_status("per3600/20260620_0900") == "complete"
+
+
+def test_run_flow_suppresses_revision_retry_during_chunked_drain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        run_flow_module,
+        "REVISION_SWEEP_DISCOVERY_SPAN",
+        timedelta(hours=6),
+        raising=False,
+    )
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_0900": window_record(
+                first_seen=REVISION_NOW - timedelta(days=1),
+                last_attempt=REVISION_NOW - timedelta(days=1),
+                status="partial",
+                targets={},
+            )
+        },
+        last_aggregated_at="2026-06-23T00:00:00+09:00",
+    )
+    store = WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+    )
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[place()],
+        store=store,
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert store.window_status("per3600/20260620_0900") == "partial"
+    assert db_connection.startdate_queries == []
+
+
+def test_run_flow_does_not_repost_gc_succeeded_same_second_sibling(
+    tmp_path: Path,
+) -> None:
+    # Cursor already passed the siblings' shared aggregated_at second: the
+    # partial window retries from state, while the GC'd success is not rediscovered.
+    failed = flow_row(startdate="20260620_0900")
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_0900": window_record(
+                first_seen=REVISION_NOW - timedelta(days=1),
+                last_attempt=REVISION_NOW - timedelta(days=1),
+                status="partial",
+                targets={},
+            )
+        },
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+    store = WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [failed]},
+    )
+    orion = FakeOrionClient()
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=orion,
+        metadata=[place(), place(place_number=11)],
+        store=store,
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert [call["entity_id"] for call in orion.calls] == [place().entity_id]
+    assert db_connection.startdate_queries == [(60, ("20260620_0900",), 2)]
+
+
+def test_run_flow_logs_give_up_signal_for_old_revision_retry(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_0900": window_record(
+                first_seen=REVISION_NOW - timedelta(days=5),
+                last_attempt=REVISION_NOW - timedelta(days=5),
+                status="partial",
+                targets={},
+            )
+        },
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection(
+                {60: []},
+                startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+            ),
+            orion=FakeOrionClient(results=[{"status": 502, "ok": False}]),
+            metadata=[place()],
+            store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+            settings=revision_flow_settings(tmp_path),
+            now=REVISION_NOW,
+        )
+
+    assert [record.window for record in records(caplog, "window_giving_up_soon")] == [
+        "per3600/20260620_0900"
+    ]
+
+
+def test_run_flow_excludes_cap_deferred_revision_from_retry_this_run(
+    tmp_path: Path,
+) -> None:
+    target = place()
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_1000": window_record(
+                first_seen=REVISION_NOW - timedelta(days=1),
+                last_attempt=REVISION_NOW - timedelta(days=1),
+                status="partial",
+                targets={
+                    target.entity_id: target_record(
+                        status="failed", payload_sha256="0" * 64
+                    )
+                },
+            )
+        },
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={
+            60: [
+                flow_row(startdate="20260620_0900"),
+                flow_row(startdate="20260620_1000"),
+            ]
+        },
+        discovery_rows_by_interval={
+            60: [
+                revision_discovery_row("20260620_0900", "2026-06-30 12:01:00"),
+                revision_discovery_row("20260620_1000", "2026-06-30 12:02:00"),
+            ]
+        },
+    )
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[target],
+        store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+        settings=revision_flow_settings(tmp_path, max_windows=1),
+        now=REVISION_NOW,
+    )
+
+    assert db_connection.startdate_queries == [(60, ("20260620_0900",), 2)]
+
+
+def test_run_flow_does_not_advance_cursor_after_unrecorded_window_error(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    write_state(path, {}, last_aggregated_at="2026-06-30T12:00:00+09:00")
+    store = WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10))
+
+    class CrashingOrion(FakeOrionClient):
+        def update_attrs(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection(
+                {60: []},
+                startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+                discovery_rows_by_interval={
+                    60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+                },
+            ),
+            orion=CrashingOrion(),
+            metadata=[place()],
+            store=store,
+            settings=revision_flow_settings(tmp_path),
+            now=REVISION_NOW,
+        )
+
+    assert store.revision_cursor() == datetime.fromisoformat(
+        "2026-06-30T12:00:00+09:00"
+    )
+
+
+def test_run_flow_supplemental_overlap_reposts_once_from_revision_sweep(
+    tmp_path: Path,
+) -> None:
+    target = place()
+    row = flow_row(startdate="20260629_2000")
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=REVISION_NOW - timedelta(days=1),
+        last_attempt=REVISION_NOW - timedelta(days=1),
+        status="complete",
+        targets={target.entity_id: target_record(status="ok", payload_sha256="0" * 64)},
+    )
+    window["expected_target_ids"] = [target.entity_id]
+    write_state(
+        path,
+        {"per3600/20260629_2000": window},
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+
+    orion = FakeOrionClient()
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection(
+            {60: []},
+            startdate_rows_by_interval={60: [row]},
+            discovery_rows_by_interval={
+                60: [revision_discovery_row("20260629_2000", "2026-06-30 12:01:00")]
+            },
+        ),
+        orion=orion,
+        metadata=[target],
+        store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert [call["entity_id"] for call in orion.calls] == [target.entity_id]
+
+
+def test_run_flow_skips_revised_dead_letter_window(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_0900": window_record(
+                first_seen=REVISION_NOW - timedelta(days=1),
+                last_attempt=REVISION_NOW - timedelta(days=1),
+                status="dead_letter",
+                targets={},
+            )
+        },
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+    orion = FakeOrionClient()
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection(
+            {60: []},
+            startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+            discovery_rows_by_interval={
+                60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+            },
+        ),
+        orion=orion,
+        metadata=[place()],
+        store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert orion.calls == []
+
+
+def test_run_flow_sweep_zero_payload_window_leaves_no_state(
+    tmp_path: Path,
+) -> None:
+    store = state_store(tmp_path, Clock([REVISION_NOW] * 10))
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection(
+            {60: []},
+            startdate_rows_by_interval={
+                60: [flow_row(startdate="20260620_0900", group_place_id="quick.10")]
+            },
+            discovery_rows_by_interval={
+                60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+            },
+        ),
+        orion=FakeOrionClient(),
+        metadata=[place()],
+        store=store,
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert "per3600/20260620_0900" not in store.as_dict()["windows"]
+
+
+def test_run_flow_revision_sweep_disabled_does_not_scan_or_resend(
+    tmp_path: Path,
+) -> None:
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+        discovery_rows_by_interval={
+            60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+        },
+    )
+    orion = FakeOrionClient()
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=orion,
+        metadata=[place()],
+        settings=revision_flow_settings(tmp_path, enabled=False),
+        now=REVISION_NOW,
+    )
+
+    assert db_connection.discovery_queries == []
+    assert db_connection.startdate_queries == []
+    assert orion.calls == []
+
+
+def test_run_flow_revision_sweep_dry_run_previews_without_state_or_retry_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    write_state(path, {}, last_aggregated_at="2026-06-30T12:00:00+09:00")
+    store = WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10))
+    before = deepcopy(store.as_dict())
+    forbid_state_mutations(monkeypatch, store)
+    orion = FakeOrionClient()
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection(
+            {60: []},
+            startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+            discovery_rows_by_interval={
+                60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+            },
+        ),
+        orion=orion,
+        metadata=[place()],
+        store=store,
+        settings=revision_flow_settings(tmp_path, send_mode="dry-run"),
+        now=REVISION_NOW,
+    )
+
+    assert store.as_dict() == before
+    assert [call["dry_run"] for call in orion.calls] == [True]
+
+
+def test_run_flow_revision_cursor_seeds_from_constant_when_absent(
+    tmp_path: Path,
+) -> None:
+    store = state_store(tmp_path, Clock([REVISION_NOW] * 10))
+    db_connection = FakeDbConnection({60: []})
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[place()],
+        store=store,
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert db_connection.discovery_queries[0][1] == revision_seed_query_bound(
+        run_flow_module.REVISION_CURSOR_SEED
+    )
+
+
+def test_run_flow_soft_cap_keeps_same_aggregated_at_second_together(
+    tmp_path: Path,
+) -> None:
+    rows = [flow_row(startdate="20260620_0900"), flow_row(startdate="20260620_1000")]
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: rows},
+        discovery_rows_by_interval={
+            60: [
+                revision_discovery_row("20260620_0900", "2026-06-30 12:01:00"),
+                revision_discovery_row("20260620_1000", "2026-06-30 12:01:00"),
+                revision_discovery_row("20260620_1100", "2026-06-30 12:02:00"),
+            ]
+        },
+    )
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[place(), place(place_number=11)],
+        settings=revision_flow_settings(tmp_path, max_windows=1),
+        now=REVISION_NOW,
+    )
+
+    assert db_connection.startdate_queries == [
+        (60, ("20260620_0900", "20260620_1000"), 2)
+    ]
+
+
+def test_run_flow_revision_cap_bounds_discovered_and_retried_work(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260620_0800": window_record(
+                first_seen=REVISION_NOW - timedelta(days=1),
+                last_attempt=REVISION_NOW - timedelta(days=1),
+                status="partial",
+                targets={},
+            )
+        },
+        last_aggregated_at="2026-06-30T12:00:00+09:00",
+    )
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: [flow_row(startdate="20260620_0900")]},
+        discovery_rows_by_interval={
+            60: [revision_discovery_row("20260620_0900", "2026-06-30 12:01:00")]
+        },
+    )
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[place()],
+        store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+        settings=revision_flow_settings(tmp_path, max_windows=1),
+        now=REVISION_NOW,
+    )
+
+    assert len(db_connection.startdate_queries) == 1
+
+
+def test_run_flow_revision_discovery_chunks_by_span(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        run_flow_module,
+        "REVISION_SWEEP_DISCOVERY_SPAN",
+        timedelta(hours=6),
+        raising=False,
+    )
+    path = tmp_path / "state" / "flow.json"
+    write_state(path, {}, last_aggregated_at="2026-06-23T00:00:00+09:00")
+    db_connection = FakeDbConnection({60: []})
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=FakeOrionClient(),
+        metadata=[place()],
+        store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert db_connection.discovery_queries[0][2] == "2026-06-23 06:00:00"
+
+
+def test_run_flow_initial_drain_bounds_redundant_unrevised_resends(
+    tmp_path: Path,
+) -> None:
+    target = place()
+    recent_hash = transformed_hash(flow_row(startdate="20260629_0900"), [target])
+    path = tmp_path / "state" / "flow.json"
+    window = window_record(
+        first_seen=REVISION_NOW - timedelta(hours=12),
+        last_attempt=REVISION_NOW - timedelta(hours=12),
+        status="complete",
+        targets={
+            target.entity_id: target_record(status="ok", payload_sha256=recent_hash)
+        },
+    )
+    window["expected_target_ids"] = [target.entity_id]
+    write_state(path, {"per3600/20260629_0900": window})
+    orion = FakeOrionClient()
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection(
+            {60: []},
+            startdate_rows_by_interval={
+                60: [
+                    flow_row(startdate="20260624_0900"),
+                    flow_row(startdate="20260629_0900"),
+                ]
+            },
+            discovery_rows_by_interval={
+                60: [
+                    revision_discovery_row("20260624_0900", "2026-06-23 01:00:00"),
+                    revision_discovery_row("20260629_0900", "2026-06-23 01:01:00"),
+                ]
+            },
+        ),
+        orion=orion,
+        metadata=[target],
+        store=WindowStateStore.load(path, now=Clock([REVISION_NOW] * 10)),
+        settings=revision_flow_settings(tmp_path),
+        now=REVISION_NOW,
+    )
+
+    assert [call["attrs"]["dateObservedFrom"]["value"] for call in orion.calls] == [
+        "2026-06-24T09:00:00+09:00"
+    ]
 
 
 def test_run_flow_logging_extras_are_allowed() -> None:

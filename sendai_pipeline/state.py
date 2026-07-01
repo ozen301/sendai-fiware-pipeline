@@ -12,7 +12,7 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _VALID_TARGET_STATUSES: frozenset[str] = frozenset({"ok", "failed", "pending"})
 _WINDOW_STATUSES: tuple[str, ...] = ("pending", "partial", "complete", "dead_letter")
@@ -45,6 +45,7 @@ class WindowStateStore:
         self._now = now
         self._state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
+            "last_aggregated_at": None,
             "windows": {},
         }
 
@@ -98,6 +99,9 @@ class WindowStateStore:
 
         store._state = {
             "schema_version": schema_version,
+            "last_aggregated_at": _loaded_revision_cursor_value(
+                data.get("last_aggregated_at")
+            ),
             "windows": dict(windows),
         }
         logger.debug(
@@ -109,6 +113,39 @@ class WindowStateStore:
     def as_dict(self) -> dict[str, Any]:
         """Return the live JSON-shaped state dictionary."""
         return self._state
+
+    def revision_cursor(self) -> datetime | None:
+        """Return the revision-sweep cursor stored for this product.
+
+        The persisted representation is the top-level ``last_aggregated_at``
+        ISO string in the product state file, normalized by runners to JST.
+        Missing legacy state files use ``None`` until the first send-mode sweep
+        stores a cursor.
+
+        Returns:
+            Parsed cursor datetime, or ``None`` when no cursor is stored.
+        """
+        value = self._state.get("last_aggregated_at")
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return datetime.fromisoformat(value)
+        raise StateValidationError("last_aggregated_at must be an ISO datetime string")
+
+    def set_revision_cursor(self, value: datetime) -> None:
+        """Store the revision-sweep cursor as a JST ISO datetime string.
+
+        Args:
+            value: Cursor watermark to persist.  Naive values are treated as
+                JST; aware values are converted to JST before serialization.
+        """
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=JST)
+        else:
+            value = value.astimezone(JST)
+        self._state["last_aggregated_at"] = value.isoformat()
 
     def save(self) -> None:
         """Atomically write the current state to disk."""
@@ -305,7 +342,12 @@ class WindowStateStore:
         window["status"] = status
         return status
 
-    def gc_complete_before(self, cutoff: datetime) -> int:
+    def gc_complete_before(
+        self,
+        cutoff: datetime,
+        *,
+        preserve_window_keys: Iterable[str] = (),
+    ) -> int:
         """Remove complete windows whose source start is strictly before cutoff.
 
         Args:
@@ -313,15 +355,22 @@ class WindowStateStore:
                 this timestamp are removed.  Windows whose source start equals
                 the cutoff are kept (strict ``<`` comparison), so the cutoff
                 boundary window is never prematurely dropped.
+            preserve_window_keys: Complete windows to keep for this GC pass even
+                if they are older than ``cutoff``.  Revision sweep passes the
+                windows it processed in the same run so an old completed window
+                is not garbage-collected before the final save records the
+                sweep result.
 
         Returns:
             Number of complete windows removed.
         """
         windows = self._windows()
+        preserved = set(preserve_window_keys)
         remove_keys = [
             key
             for key, window in windows.items()
-            if window.get("status") == "complete"
+            if key not in preserved
+            and window.get("status") == "complete"
             and self.source_window_start(key, window) < cutoff
         ]
 
@@ -570,6 +619,19 @@ def _normalized_expected_target_ids(
 
 def _without_microseconds(value: datetime) -> datetime:
     return value.replace(microsecond=0)
+
+
+def _loaded_revision_cursor_value(value: Any) -> str | None:
+    """Return the persisted revision cursor value from loaded JSON state.
+
+    The in-memory state keeps the cursor in the same shape as persisted JSON:
+    a JST ISO string or ``None``.  Non-string values are treated like absent
+    legacy state so a malformed optional cursor cannot block loading otherwise
+    usable window state.
+    """
+    if isinstance(value, str):
+        return value
+    return None
 
 
 def _derive_source_window_metadata(window_key: str) -> dict[str, Any]:

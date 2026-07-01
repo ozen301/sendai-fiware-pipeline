@@ -196,10 +196,10 @@ emitting.
 ### 2.9 Idempotency
 
 In normal send mode, a prior successful target result is terminal for
-`(product, interval, source window, entity_id)`. Failed or missing
-targets are retried; prior-`ok` targets are not re-POSTed even if
-source aggregates later drift. This avoids duplicate STH-Comet history
-rows.
+`(product, interval, source window, entity_id)` only while the payload
+hash is unchanged. Failed or missing targets are retried. A prior-`ok`
+target with an unchanged payload hash is skipped as a real no-op; a
+prior-`ok` target whose payload hash differs is re-POSTed.
 
 A window is `complete` once every entity id in its expected target set
 has a recorded `ok`. The two products build that expected set
@@ -208,11 +208,13 @@ differently: Product A unions it from the targets actually observed
 result, a silent Product A place that emits no source row never holds its
 window in `partial`.
 
-Once STH-Comet subscriptions are enabled, correction by normal repost
-is not history-idempotent. Treat Comet deletion/replay as an operator
-repair workflow; upstream STH-Comet deletion is coarse (service /
-service path, entity, or entity attribute), not a normal per-window
-update path.
+Once STH-Comet subscriptions are enabled, a drift resend appends
+another history row instead of replacing the old row. Duplicate
+STH-Comet history rows for revised windows are accepted by contract.
+Treat Comet deletion/replay only as an operator repair workflow when
+history must be cleaned or rebuilt; upstream STH-Comet deletion is
+coarse (service / service path, entity, or entity attribute), not a
+normal per-window update path.
 
 ### 2.10 Scheduling and retry
 
@@ -220,10 +222,21 @@ update path.
 |---|---|
 | Schedule | Cron (or systemd timer), every 5 minutes. |
 | Source stability delay | Process windows whose `startdate` is at or before `now − SOURCE_STABILITY_DELAY_HOURS` (default 3h). Separate from the 72h retry horizon. |
-| Catch-up | Each run reprocesses a rolling lookback against the per-window state store. Missed or failed targets are picked up on the next run **while their window is still inside the lookback**. The lookback widens to cover open windows already in state, but only up to `MAX_LOOKBACK_HOURS_*`. Windows the runner never saw (e.g. while the cron was down or the per-product lock was held by a long resend) are *not* auto-recovered once they age past the reprocess floor (`REPROCESS_HOURS_*`); republish them per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). |
+| Fresh-path catch-up | Each run reprocesses a rolling `startdate` lookback against the per-window state store. Missed or failed targets are picked up on the next run while their window is still inside the lookback. The lookback widens to cover open windows already in state, but only up to `MAX_LOOKBACK_HOURS_*` (72h by default). The fresh path cannot reach a window it never saw once that window ages past the reprocess floor (`REPROCESS_HOURS_*`). |
+| Revision-sweep catch-up | A second catch-up path is independent of the normal `startdate` lookback. It scans each source table by `aggregated_at` to discover older `(interval_min, startdate)` windows whose source rows were inserted or revised at or after the sweep cursor, then sends the current payload for those windows. Because it selects by `aggregated_at` rather than by recency, the sweep also recovers such missed windows: their `aggregated_at` is at or after the cursor, so the sweep discovers and resends them. When the sweep is disabled (`REVISION_SWEEP_ENABLED=false`) it does not run at all — no scan, no resend — and even when enabled it cannot reach windows whose `aggregated_at` predates the cursor's starting point. In those cases, republish the affected windows per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). |
+| Revision cursor | `last_aggregated_at` is a per-product, forward-only watermark: every revision with `aggregated_at` below this value has already been looked at. It lives at the top of that product's state JSON (`state/flow.json` or `state/direction.json`) and advances forward once per run. A failed send does not hold it back; failures are remembered in the per-window state store and retried from there. To re-sweep from an earlier point, edit that product's cursor in its state file. |
 | Retry | Exponential backoff on `5xx` and network errors (1s, 2s, 4s, 8s, 16s). On `429`, the client honors a `Retry-After` header when present and otherwise falls back to the same backoff. Single `401` triggers a forced token refresh and one extra retry. Other `4xx` is fatal for that POST. |
 | Token refresh | OAuth2 client-credentials; proactive on expiry and on `401`. |
 | Logging | One structured line per POST in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE`: `hash` (always hash only), `failure` (default: hash on success, body excerpt on failure), or `full` (always body). |
+
+The fresh-path and revision-sweep catch-ups split work by window age, at
+the lookback's lower bound (i.e., the oldest `startdate` the fresh path
+reprocesses this run). The fresh path owns windows whose `startdate` is
+at or after that bound (the more recent windows, inside the lookback);
+the sweep owns windows whose `startdate` is strictly before it (the
+older windows). No window is processed by both paths in one run, and
+§2.9's payload-hash check would collapse any redundant re-POST in any
+case.
 
 ### 2.11 Rollout gates
 
@@ -254,6 +267,7 @@ Load-bearing columns:
 | `group_place_id` | Source place key; final numeric suffix maps to metadata `place_number`. |
 | `device_type` | Batch filter (see §2.4). |
 | `interval_min` | See §2.1. |
+| `aggregated_at` | DB-stamped timestamp (`DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP`) that moves on every insert or revision. The revision sweep uses it to discover changed `(interval_min, startdate)` windows. |
 | `imputation_tier` | Product A source-quality gate; only rows at or below `SOURCE_MAX_IMPUTATION_TIER` are read. |
 | `flow_gt_m60`, `flow_gt_m80`, `flow_gt_m120` | Count attributes. |
 | `stay_gt_m60`, `stay_gt_m80` | Occupancy attributes. |
@@ -341,6 +355,7 @@ Load-bearing columns:
 | `from_group_place_id`, `to_group_place_id` | Source place keys; may also be literal `'ALL'` for aggregate rows. |
 | `from_device_type`, `to_device_type` | Product B device-population filter; both sides must match the selected device type for the interval. |
 | `interval_min` | See §2.1. |
+| `aggregated_at` | DB-stamped timestamp (`DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP`) that moves on every insert or revision. The revision sweep uses it to discover changed `(interval_min, startdate)` windows, then re-fetches the full window's rows to build and send the compositional `peopleCount_flow` payload. It never builds payloads from a partial revised-row set. |
 | `count` | Movement count used inside `peopleCount_flow`. |
 
 ### 4.2 Filtering rules

@@ -72,7 +72,7 @@ not run `scripts/refresh_metadata.py`.
 | `IGNORED_PLACE_PREFIXES` | `quick.,test` | Comma-separated prefixes used to filter source rows: any row whose `group_place_id` column (Product A) or whose `from_group_place_id` / `to_group_place_id` column (Product B) starts with one of these prefixes is excluded from publishing. Excluded rows produce a `DEBUG`-level `ignored_place_prefix` log event and nothing else: no Orion POST, no WARN. Empty / unset applies the default. Set to a single comma to disable noise filtering entirely. The literal `'ALL'` is never matched. |
 | `SOURCE_MAX_IMPUTATION_TIER` | `2` | Product A source-quality gate. Rows from `flow_metrics2_per_place2_agg_imputed` publish only when `imputation_tier <= SOURCE_MAX_IMPUTATION_TIER`; the default keeps tiers `0`, `1`, and `2`, matching the rule "smaller than 3." Empty / unset applies the default. Values must be non-negative integers. `scripts/resend.py flow --max-imputation-tier N` can override this for one explicit resend; Product B source selection does not apply this setting. |
 
-## Window timing and retry horizons
+## Window timing, retry, and revision sweep
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -81,9 +81,19 @@ not run `scripts/refresh_metadata.py`.
 | `REPROCESS_HOURS_PER300` | `2` | Normal-run rolling lookback floor for 5-minute windows. |
 | `MAX_LOOKBACK_HOURS_PER3600` | `72` | Maximum age at which an open 60-minute window is still retried. Both intervals default to 72h because source rows can arrive at MySQL up to 3 days late. |
 | `MAX_LOOKBACK_HOURS_PER300` | `72` | Same for 5-minute windows. |
+| `REVISION_SWEEP_ENABLED` | `true` | Shared off-switch for both product runners. Set to `false` to pause the revision sweep without affecting normal fresh sends. |
+| `REVISION_SWEEP_MAX_WINDOWS` | `2000` | Shared per-run cap on total revision-sweep work: newly discovered windows plus retried old open windows. It paces the initial self-draining drain. Keep it comfortably above the number of windows revised per cron interval so the drain converges; the default is ample and should not be made tiny. |
 
 `MAX_LOOKBACK_HOURS_*` must be ≥ `REPROCESS_HOURS_*` for the same
 interval, or the run aborts at startup.
+
+Only these two revision-sweep settings are environment variables. The
+first-run cursor seed and the discovery-scan span are code-level
+constants. Each product's `last_aggregated_at` cursor lives in its own
+state file (`state/flow.json` or `state/direction.json`); to re-seed or
+re-sweep a product, edit that product's cursor in the state file. See
+[pipeline_spec.md §2.10](pipeline_spec.md#210-scheduling-and-retry) for
+the canonical cursor definition.
 
 ## Logging
 

@@ -308,6 +308,36 @@ sticks in `pending` or `partial` and the normal retry isn't clearing
 it, use these tools, in order, to inspect, repair, and (only as a
 last resort) replay.
 
+### Revision sweep cursor
+
+Each product state file also has a top-level `last_aggregated_at`
+cursor. This is the revision-sweep watermark: source rows with
+`aggregated_at` before that value have already been scanned for that
+product. The cursor is separate for `state/flow.json` and
+`state/direction.json`; a failed POST does not hold it back because the
+per-window state keeps the failed window for retry.
+
+On first deployment the cursor seeds from the runner's code-level
+`REVISION_CURSOR_SEED` and drains forward automatically. The drain is
+paced by two controls: `REVISION_SWEEP_DISCOVERY_SPAN` bounds each
+MySQL discovery scan, and `REVISION_SWEEP_MAX_WINDOWS` sets a soft cap on
+how many discovered or old-open windows are processed in one run; a run
+may exceed it to keep one `aggregated_at` second together. Once the
+cursor catches up, each cron tick scans only revisions since the prior
+run.
+
+To inspect the cursor, read the top-level field:
+
+```sh
+jq '.last_aggregated_at' state/flow.json
+jq '.last_aggregated_at' state/direction.json
+```
+
+To re-sweep from an earlier point, stop that product's runner, back up
+the state file, set the top-level `last_aggregated_at` to the desired
+JST ISO timestamp, and restart the runner. Resetting earlier can
+re-POST matching windows and append duplicate STH-Comet history rows.
+
 ### `state_doctor.py`
 
 Read-only diagnostic. Lists every open window (`pending` or
@@ -407,8 +437,10 @@ uv run python scripts/state_repair.py direction \
   --apply
 ```
 
-Do not edit `state/*.json` by hand. Always go through this tool so
-the backup, lock acquisition, and reload-and-verify steps happen.
+Do not edit window records in `state/*.json` by hand. Always go
+through this tool so the backup, lock acquisition, and
+reload-and-verify steps happen. The top-level revision cursor is the
+one controlled-edit exception; see [Revision sweep cursor](#revision-sweep-cursor).
 
 ### `migrate_flow_state.py`
 
@@ -473,19 +505,19 @@ uv run python scripts/resend.py {flow|direction}
 | `--place N` | Place number filter; repeatable. Resolved through metadata. Mutually exclusive with `--entity-id`. |
 | `--entity-id ID` | Explicit entity id; repeatable. Mutually exclusive with `--place`. If `--interval-min` is omitted, all ids must be canonical and resolve to the same interval. |
 | `--reason "..."` | Required. Recorded as audit context in the run log. |
-| `--force` | Bypass the per-target skip. By default, any target already `ok` in state is skipped, whether its payload is unchanged or has drifted (see the paragraph below for why a wide range needs `--force`). |
+| `--force` | Bypass the unchanged-payload skip. By default, a prior-`ok` target is skipped only when the computed payload hash is unchanged; a drifted prior-`ok` target is re-POSTed. `--force` additionally re-POSTs unchanged prior-`ok` targets. |
 | `--send` | Perform live Orion writes. Omit for dry-run: prints the planned per-window plan and exits before any MySQL query, Orion token fetch, or Orion HTTP call. |
 
 Resend writes to the same `window_key` as the original publication
 because it's a retry of the original business window, not a synthetic
-replacement. By default, any target already `ok` in state is skipped
-(whether its payload is unchanged or has since drifted) using the same
-code path as normal send-mode retries, so resend is safe to use even when
-a window is already partly complete. Pass `--force` when the intent is to
-redeliver regardless of stored status. For a wide range this matters:
-without `--force`, recent in-state windows are skipped while older
-GC-reclaimed windows are re-posted, so the result is non-uniform even
-though the run exits 0 (see ["I need to resend a large range without
+replacement. By default, unchanged prior-`ok` targets are skipped, while
+drifted prior-`ok` targets are re-POSTed through the same shared
+`_process_send_window` path used by the live runners; `scripts/resend.py`
+does not carry separate drift logic. Pass `--force` when the intent is to
+redeliver unchanged targets too. For a wide range this matters: without
+`--force`, unchanged recent in-state windows are skipped while drifted
+or GC-reclaimed windows are re-posted, so the result can be non-uniform
+even though the run exits 0 (see ["I need to resend a large range without
 dropping live data"](#i-need-to-resend-a-large-range-without-dropping-live-data)).
 
 For Product A, `--place` / `--entity-id` limits which flow payloads are
@@ -632,12 +664,11 @@ per-product lock, such as `state_repair.py … --apply`.
 Before you run a large backfill, set the required flags and know the
 gotchas:
 
-1. **`--force`**: required for a *uniform* re-publish. Without it, a
-   target already `ok` in state is skipped while a target with no stored
-   record is posted, so a wide range comes out non-uniform (recent windows
-   skipped, older GC-reclaimed windows re-posted) even though the run
-   reports success. See the `--force` row in the `resend.py` reference
-   above.
+1. **`--force`**: required for a *uniform* re-publish. Without it, an
+   unchanged target already `ok` in state is skipped while a drifted
+   target or a target with no stored record is posted, so a wide range can
+   come out non-uniform even though the run reports success. See the
+   `--force` row in the `resend.py` reference above.
 2. **Two interval passes**: one invocation publishes one interval. To
    cover everything, run it twice: once `--interval-min 5` (per300) and
    once `--interval-min 60` (per3600), each with `--force`.
