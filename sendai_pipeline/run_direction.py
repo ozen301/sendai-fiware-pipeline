@@ -10,11 +10,11 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from dotenv import load_dotenv
 
-from sendai_pipeline import auth, db, entity_map, orion_client
+from sendai_pipeline import auth, db, orion_client
 from sendai_pipeline.filter_settings import FilterConfigError, FilterSettings
 from sendai_pipeline.logging_setup import LoggingSettings, configure_logging
 from sendai_pipeline.metadata import (
@@ -23,10 +23,14 @@ from sendai_pipeline.metadata import (
     index_by_place_interval,
     load_metadata,
 )
+from sendai_pipeline.settings_validation import parse_exact_env_value
 from sendai_pipeline.state import WindowStateStore
 from sendai_pipeline.transform_direction import (
-    TransformDirectionResult,
-    transform_direction_rows,
+    DirectionNoPayloadOutcome,
+    DirectionPayloadOutcome,
+    DirectionSourceInvalidOutcome,
+    DirectionTransformOutcome,
+    transform_direction_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,22 +38,20 @@ _lifecycle_logger = logging.getLogger("sendai_pipeline")
 
 JST = timezone(timedelta(hours=9))
 
-_INTERVALS: tuple[int, ...] = (5, 60)
-_INTERVAL_PREFIXES: dict[int, str] = {5: "per300", 60: "per3600"}
+_DIRECTION_INTERVAL_MIN = 60
+_INTERVALS: tuple[int, ...] = (_DIRECTION_INTERVAL_MIN,)
+_INTERVAL_PREFIXES: dict[int, str] = {_DIRECTION_INTERVAL_MIN: "per3600"}
 _VALID_SEND_MODES: frozenset[str] = frozenset({"dry-run", "send"})
 _DEFAULT_METADATA_PATH = Path("metadata/sensors.csv")
 _DEFAULT_SOURCE_STABILITY_DELAY_HOURS = 3
 _DEFAULT_REVISION_SWEEP_MAX_WINDOWS = 2000
 
-# Revision cursor state is stored as a JST ISO datetime.  Discovery crosses the
-# MySQL boundary as second-resolution wall-clock strings in the JST session.
-REVISION_CURSOR_SEED = datetime(2026, 6, 23, 0, 0, 0, tzinfo=JST)
 # Keep each discovery scan small enough for the MySQL read timeout; the
-# max-window setting controls POST volume separately from this time span.
+# max-window setting controls PUT volume separately from this time span.
 REVISION_SWEEP_DISCOVERY_SPAN = timedelta(hours=6)
 
 _DirectionRow = Mapping[str, Any]
-_PostResult = Mapping[str, Any]
+_PutResult = Mapping[str, Any]
 
 __all__ = [
     "FilterConfigError",
@@ -73,15 +75,15 @@ class _DbConnection(Protocol):
 
 
 class _OrionForDirection(Protocol):
-    def update_attrs(
+    def replace_attrs(
         self,
         entity_id: str,
-        entity_type: str | None,
+        entity_type: str,
         attrs: Mapping[str, Any],
         *,
         dry_run: bool = False,
-    ) -> _PostResult:
-        """Update one Orion entity's attributes."""
+    ) -> _PutResult:
+        """Fully replace one Orion entity's attributes."""
         ...
 
     def list_entities(
@@ -100,7 +102,7 @@ class RunDirectionSettings:
     """Configuration for one direction publishing run.
 
     Attributes:
-        send_mode: ``"dry-run"`` to avoid live POSTs, or ``"send"`` to write
+        send_mode: ``"dry-run"`` to avoid live PUTs, or ``"send"`` to write
             attributes to Orion.
         reprocess_hours_per3600: Minimum 60-minute lookback.
         reprocess_hours_per300: Minimum 5-minute lookback.
@@ -112,6 +114,10 @@ class RunDirectionSettings:
         revision_sweep_max_windows: Maximum revision-sweep windows per run.
         state_path: JSON state file path.
         lock_path: Process lock file path.
+        product_b_aggregate_entity_id: Orion entity id for aggregate Product B
+            writes.
+        product_b_aggregate_entity_type: Orion entity type for aggregate Product B
+            writes.
     """
 
     send_mode: str = "dry-run"
@@ -124,6 +130,8 @@ class RunDirectionSettings:
     revision_sweep_max_windows: int = _DEFAULT_REVISION_SWEEP_MAX_WINDOWS
     state_path: Path = Path("state/direction.json")
     lock_path: Path = Path("state/direction.lock")
+    product_b_aggregate_entity_id: str = "jp.sendai.Blesensor.flow"
+    product_b_aggregate_entity_type: str = "Blesensor.flow"
 
     def __post_init__(self) -> None:
         if self.send_mode not in _VALID_SEND_MODES:
@@ -190,6 +198,18 @@ class RunDirectionSettings:
                 "REVISION_SWEEP_MAX_WINDOWS",
                 _DEFAULT_REVISION_SWEEP_MAX_WINDOWS,
             ),
+            product_b_aggregate_entity_id=parse_exact_env_value(
+                source,
+                "PRODUCT_B_AGGREGATE_ENTITY_ID",
+                "jp.sendai.Blesensor.flow",
+                RunDirectionConfigError,
+            ),
+            product_b_aggregate_entity_type=parse_exact_env_value(
+                source,
+                "PRODUCT_B_AGGREGATE_ENTITY_TYPE",
+                "Blesensor.flow",
+                RunDirectionConfigError,
+            ),
             state_path=Path("state/direction.json"),
             lock_path=Path("state/direction.lock"),
         )
@@ -204,8 +224,10 @@ class RunDirectionResult:
         windows_complete: Processed windows that ended complete.
         windows_partial: Processed windows that ended partial.
         windows_dead_letter: Processed windows that ended dead-lettered.
-        posts_ok: Attribute update attempts that succeeded.
-        posts_failed: Attribute update attempts that failed.
+        puts_ok: Full-replace attempts that succeeded.
+        puts_failed: Full-replace attempts that failed.
+        windows_no_payload: Windows with no surviving candidate places.
+        windows_source_invalid: Windows missing required source totals.
         rows_dropped: Source rows omitted during transformation.
         oldest_non_complete: Oldest retained pending or partial window.
         lookback_hours_used: Effective lookback hours by interval.
@@ -221,8 +243,10 @@ class RunDirectionResult:
     windows_complete: int
     windows_partial: int
     windows_dead_letter: int
-    posts_ok: int
-    posts_failed: int
+    puts_ok: int
+    puts_failed: int
+    windows_no_payload: int
+    windows_source_invalid: int
     rows_dropped: int
     oldest_non_complete: datetime | None
     lookback_hours_used: dict[int, float]
@@ -239,7 +263,7 @@ def run_direction(
     filter_settings: FilterSettings,
     now: Callable[[], datetime],
 ) -> RunDirectionResult:
-    """Publish direction metrics for the eligible reprocessing windows.
+    """Publish aggregate direction metrics for eligible 60-minute windows.
 
     A *reprocessing window* is a source aggregation window whose
     ``startdate`` falls within the lookback range that ends at the
@@ -250,7 +274,7 @@ def run_direction(
 
     Args:
         db_connection: Database connection used by ``sendai_pipeline.db``.
-        orion: Orion client or test double exposing ``update_attrs``.
+        orion: Orion client or test double exposing ``replace_attrs``.
         metadata: Runtime sensor metadata.
         state_store: Per-window delivery state store.
         settings: Direction-run settings.
@@ -259,7 +283,7 @@ def run_direction(
 
     Returns:
         Run summary including ``exit_code``: ``1`` in send mode when any
-        partial windows, failed POSTs, or open windows remain after the
+        source-invalid, partial, failed-PUT, or open window remains after the
         run; ``0`` otherwise (including dry-run).
     """
     run_started_at = _coerce_jst_datetime(now())
@@ -288,8 +312,10 @@ def run_direction(
             windows_complete=0,
             windows_partial=0,
             windows_dead_letter=0,
-            posts_ok=0,
-            posts_failed=0,
+            puts_ok=0,
+            puts_failed=0,
+            windows_no_payload=0,
+            windows_source_invalid=0,
             rows_dropped=0,
             oldest_non_complete=None,
             lookback_hours_used=lookback_hours_used,
@@ -298,9 +324,13 @@ def run_direction(
         _log_run_summary(result)
         return result
 
-    active_targets = active_places(metadata, target_batches=target_batches)
-    metadata_index = index_by_place_interval(active_targets)
-    _validate_orion_targets(active_targets, orion)
+    active_source_places = active_places(metadata, target_batches=target_batches)
+    metadata_index = index_by_place_interval(active_source_places)
+    _validate_orion_target(
+        settings.product_b_aggregate_entity_id,
+        settings.product_b_aggregate_entity_type,
+        orion,
+    )
 
     counts = _RunCounts()
     revision_sweep_windows: set[str] = set()
@@ -335,11 +365,7 @@ def run_direction(
         # Use 2× the maximum lookback as the GC horizon — same reasoning as
         # run_flow: keeps a safety margin for windows near the retry boundary.
         cutoff_gc = run_started_at - timedelta(
-            hours=2
-            * max(
-                settings.max_lookback_hours_per3600,
-                settings.max_lookback_hours_per300,
-            )
+            hours=2 * settings.max_lookback_hours_per3600
         )
         state_store.gc_complete_before(
             cutoff_gc,
@@ -352,7 +378,12 @@ def run_direction(
     exit_code = (
         1
         if settings.send_mode == "send"
-        and (counts.windows_partial > 0 or counts.posts_failed > 0 or has_open_windows)
+        and (
+            counts.windows_source_invalid > 0
+            or counts.windows_partial > 0
+            or counts.puts_failed > 0
+            or has_open_windows
+        )
         else 0
     )
     result = RunDirectionResult(
@@ -360,8 +391,10 @@ def run_direction(
         windows_complete=counts.windows_complete,
         windows_partial=counts.windows_partial,
         windows_dead_letter=counts.windows_dead_letter,
-        posts_ok=counts.posts_ok,
-        posts_failed=counts.posts_failed,
+        puts_ok=counts.puts_ok,
+        puts_failed=counts.puts_failed,
+        windows_no_payload=counts.windows_no_payload,
+        windows_source_invalid=counts.windows_source_invalid,
         rows_dropped=counts.rows_dropped,
         oldest_non_complete=oldest_non_complete,
         lookback_hours_used=lookback_hours_used,
@@ -428,8 +461,10 @@ class _RunCounts:
     windows_complete: int = 0
     windows_partial: int = 0
     windows_dead_letter: int = 0
-    posts_ok: int = 0
-    posts_failed: int = 0
+    puts_ok: int = 0
+    puts_failed: int = 0
+    windows_no_payload: int = 0
+    windows_source_invalid: int = 0
     rows_dropped: int = 0
 
 
@@ -442,7 +477,7 @@ class _RevisionWorkItem:
         startdate: Source ``startdate`` string, for example
             ``"20260629_1200"``.
         window_key: State key for the source window, for example
-            ``"per300/20260629_1200"``.
+            ``"per3600/20260629_1200"``.
         aggregated_at: Cursor key for discovered windows.  Retry items come
             from state, not discovery rows, so this is ``None`` for retries.
         retry: ``False`` for windows discovered by ``aggregated_at`` in this
@@ -456,19 +491,49 @@ class _RevisionWorkItem:
     retry: bool = False
 
 
-def _validate_orion_targets(
-    active_targets: Iterable[SensorPlace],
+def _validate_orion_target(
+    entity_id: str,
+    entity_type: str,
     orion: _OrionForDirection,
 ) -> None:
-    """Compare configured metadata targets with the live Orion entity set.
+    """Check whether Orion currently contains the aggregate Product B target.
 
     Returns ``None`` — this function only logs; it never raises and never
-    blocks the run.  Missing targets do not stop publication because the POST
-    result for each entity is the authoritative delivery outcome.
+    blocks the run. A missing target does not stop publication because the PUT
+    result is the authoritative delivery outcome.
     """
-    entity_map.validate_targets(
-        active_targets,
-        cast(orion_client.OrionClient, orion),
+    limit = 1000
+    entities = orion.list_entities(entity_type, attrs="id", limit=limit)
+    live_ids = {str(entity["id"]) for entity in entities if "id" in entity}
+    if len(entities) >= limit:
+        logger.warning(
+            "orion list_entities response may be truncated",
+            extra={
+                "event": "entity_map_truncated",
+                "entity_type": entity_type,
+                "count_live": len(live_ids),
+                "limit": limit,
+            },
+        )
+    if entity_id not in live_ids:
+        logger.warning(
+            "aggregate target missing from orion",
+            extra={
+                "event": "entity_map_missing_target",
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+            },
+        )
+    logger.info(
+        "validated aggregate target against orion",
+        extra={
+            "event": "entity_map_refreshed",
+            "entity_type": entity_type,
+            "count_expected": 1,
+            "count_live": len(live_ids),
+            "count_missing": int(entity_id not in live_ids),
+            "count_extra": len(live_ids - {entity_id}),
+        },
     )
 
 
@@ -498,7 +563,6 @@ def _process_interval(
         upper_bound=_format_sql_window_bound(cutoff),
     )
     interval_metadata = _metadata_index_for_interval(metadata_index, interval_min)
-    expected_target_ids = [place.entity_id for place in interval_metadata.values()]
 
     for startdate, rows_for_window in _group_rows_by_startdate(rows):
         window_key = _window_key(interval_min, startdate)
@@ -512,18 +576,22 @@ def _process_interval(
                 rows_for_window=rows_for_window,
                 orion=orion,
                 state_store=state_store,
+                settings=settings,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata,
-                expected_target_ids=expected_target_ids,
                 counts=counts,
+                transformed_at=run_started_at,
             )
         else:
             _process_dry_run_window(
                 rows_for_window=rows_for_window,
                 orion=orion,
+                settings=settings,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata,
                 counts=counts,
+                window_key=window_key,
+                transformed_at=run_started_at,
             )
 
     if settings.send_mode == "send":
@@ -544,97 +612,91 @@ def _process_send_window(
     rows_for_window: list[_DirectionRow],
     orion: _OrionForDirection,
     state_store: WindowStateStore,
+    settings: RunDirectionSettings | None = None,
     filter_settings: FilterSettings,
     interval_metadata: Mapping[tuple[int, int], SensorPlace],
-    expected_target_ids: Iterable[str],
     counts: _RunCounts,
+    transformed_at: datetime | None = None,
     force_resend: bool = False,
-    sweep_mode: bool = False,
-    persist_each_target: bool = True,
 ) -> bool:
-    """Post one source window and update persistent per-target state.
+    """PUT one aggregate source window and update persistent target state.
 
-    When the transform creates a Product B source window, it emits one payload
-    per active target, with null sentinel values for targets that observed no
-    movement, so the history keeps "observed nothing" distinct from "nothing
-    sent".  This call records the window (via ``begin_window_attempt``) and
-    sends those payloads.
-
-    The revision sweep can reach an old window whose rows all filter out,
-    leaving no payloads at all.  Recording it would create an open entry with
-    nothing to deliver, so the window would stay open and linger in state (GC
-    removes only completed windows).  ``sweep_mode`` avoids that: with no
-    payloads it returns ``False`` without recording the window.
+    The transform runs before state creation. No-payload and source-invalid
+    outcomes are observable run results, but neither represents a delivery
+    attempt, so neither creates a window record.
 
     Args:
         window_key: State key for this source window.
         interval_min: Aggregation interval in minutes.
         startdate: Source ``startdate`` string for the window.
         rows_for_window: Direction metric rows fetched for this window.
-        orion: Orion client facade used to post attribute updates.
+        orion: Orion client facade used for the full-replace write.
         state_store: Persistent window-state store.
+        settings: Runner settings containing the aggregate target.
         filter_settings: Runtime filters applied before payload creation.
         interval_metadata: Active Product B metadata for this interval.
-        expected_target_ids: Active Product B roster for this interval.
         counts: Mutable per-run counters updated while sending this window.
-        force_resend: Whether to repost unchanged prior-``ok`` targets.
-        sweep_mode: Set by the revision sweep.  When ``True``, a window with
-            no payloads returns ``False`` without a state record.
-        persist_each_target: Whether to save state after each target result.
+        transformed_at: Timestamp used for the payload's retrieval time.
+        force_resend: Whether to rewrite an unchanged prior-``ok`` target.
 
     Returns:
-        ``True`` when the window has been processed.  ``False`` only in sweep
-        mode, when the window has no payloads to send, so it is skipped without
-        creating a state record.
-    """
-    source_start = _parse_source_window_start(startdate)
-    effective_expected_target_ids = _effective_expected_target_ids(
-        state_store,
-        window_key,
-        expected_target_ids,
-    )
-    effective_metadata = _metadata_for_expected_targets(
-        interval_metadata,
-        effective_expected_target_ids,
-    )
-    transformed = _transform(rows_for_window, filter_settings, effective_metadata)
-    counts.rows_dropped += transformed.rows_dropped
-    if sweep_mode and not transformed.payloads:
-        return False
+        ``True`` for a payload outcome; ``False`` for a no-write outcome.
 
+    Raises:
+        RunDirectionConfigError: If called without the aggregate settings and
+            transformation timestamp required for the aggregate write.
+    """
+    if settings is None or transformed_at is None:
+        raise RunDirectionConfigError(
+            "aggregate direction processing requires settings and transformed_at"
+        )
+    transformed = _transform(
+        rows_for_window,
+        filter_settings,
+        interval_metadata,
+        settings=settings,
+        transformed_at=transformed_at,
+    )
+    counts.rows_dropped += transformed.rows_dropped
+    if _record_no_write_outcome(window_key, transformed, counts):
+        return False
+    if not isinstance(transformed, DirectionPayloadOutcome):
+        raise TypeError(f"unsupported direction transform outcome: {type(transformed)}")
+
+    source_start = _parse_source_window_start(startdate)
+    aggregate_target_ids = [settings.product_b_aggregate_entity_id]
     state_store.begin_window_attempt(
         window_key,
         interval_min=interval_min,
         source_window_start=source_start,
         source_window_end=source_start + timedelta(minutes=interval_min),
-        expected_target_ids=effective_expected_target_ids,
+        expected_target_ids=aggregate_target_ids,
     )
 
-    for payload in transformed.payloads:
-        payload_sha256 = _attrs_sha256(payload["attrs"])
-        entity_id = payload["entity_id"]
-        prior = state_store.target_record(window_key, entity_id)
-        # Prior-ok unchanged payloads are true no-ops.  A prior-ok hash drift
-        # means the source was revised after delivery, so repost it to publish
-        # the revised value to Orion/STH-Comet.  This accepts duplicate
-        # STH-Comet history rows as described in pipeline_spec.md section 2.9.
-        if not force_resend and prior is not None and prior.get("status") == "ok":
-            prior_payload_sha256 = prior.get("last_payload_sha256")
-            if prior_payload_sha256 == payload_sha256:
-                logger.debug(
-                    "target payload unchanged",
-                    extra={
-                        "event": "post_skipped_unchanged",
-                        "entity_id": entity_id,
-                        "window": window_key,
-                        "payload_sha256": payload_sha256,
-                    },
-                )
-                continue
+    payload = transformed.payload
+    attrs = payload["attrs"]
+    payload_sha256 = _attrs_sha256(attrs)
+    entity_id = str(payload["entity_id"])
+    prior = state_store.target_record(window_key, entity_id)
+    # Prior-ok unchanged payloads are true no-ops. A prior-ok hash drift means
+    # the source was revised after delivery, so replace the aggregate again.
+    if not force_resend and prior is not None and prior.get("status") == "ok":
+        prior_payload_sha256 = prior.get("last_payload_sha256")
+        if prior_payload_sha256 == payload_sha256:
             logger.debug(
-                "target payload drift resent",
+                "aggregate payload unchanged",
                 extra={
-                    "event": "post_resent_drift",
+                    "event": "put_skipped_unchanged",
+                    "entity_id": entity_id,
+                    "window": window_key,
+                    "payload_sha256": payload_sha256,
+                },
+            )
+        else:
+            logger.debug(
+                "aggregate payload drift resent",
+                extra={
+                    "event": "put_resent_drift",
                     "entity_id": entity_id,
                     "window": window_key,
                     "prior_payload_sha256": prior_payload_sha256,
@@ -642,16 +704,22 @@ def _process_send_window(
                 },
             )
 
-        result = orion.update_attrs(
+    if (
+        force_resend
+        or prior is None
+        or prior.get("status") != "ok"
+        or (prior.get("last_payload_sha256") != payload_sha256)
+    ):
+        result = orion.replace_attrs(
             entity_id,
             payload["entity_type"],
-            payload["attrs"],
+            attrs,
         )
         ok = bool(result.get("ok"))
         if ok:
-            counts.posts_ok += 1
+            counts.puts_ok += 1
         else:
-            counts.posts_failed += 1
+            counts.puts_failed += 1
         state_store.record_target(
             window_key,
             entity_id,
@@ -659,10 +727,9 @@ def _process_send_window(
             http_status=int(result.get("status", 0)),
             payload_sha256=payload_sha256,
         )
-        if persist_each_target:
-            state_store.save()
+        state_store.save()
 
-    status = state_store.recompute_status(window_key, effective_expected_target_ids)
+    status = state_store.recompute_status(window_key, aggregate_target_ids)
     if status == "complete":
         counts.windows_complete += 1
         logger.info(
@@ -699,12 +766,12 @@ def _process_revision_sweep(
     ``startdate``.  It resolves the forward-only revision cursor, scans the
     half-open chunk ``[cursor, upper)``, refetches full source windows, then
     sends or dry-runs each current payload.  In send mode the cursor advances
-    after the work list finishes.  Failed POSTs stay as ``partial`` window
+    after the work list finishes.  Failed PUTs stay as ``partial`` window
     state and are retried from state; they do not hold the cursor back.
 
     Args:
         db_connection: Open MySQL connection for discovery and refetch queries.
-        orion: Orion client facade used to post (or dry-run) payloads.
+        orion: Orion client facade used to PUT (or dry-run) payloads.
         state_store: Persistent window-state store; holds the cursor and the
             open windows the retry pass re-sends.
         settings: Runner settings, including send mode and the per-run cap.
@@ -726,23 +793,30 @@ def _process_revision_sweep(
     # Resolve the JST cursor and the half-open discovery chunk.  The upper
     # bound is the earlier of the floored run start and one discovery span past
     # the cursor, so an initial backlog drains in bounded MySQL scans.
-    cursor = (state_store.revision_cursor() or REVISION_CURSOR_SEED).replace(
-        microsecond=0
-    )
-    cursor = _coerce_jst_datetime(cursor)
     run_upper = run_started_at.replace(microsecond=0)
+    stored_cursor = state_store.revision_cursor()
+    if stored_cursor is None:
+        if settings.send_mode == "send":
+            state_store.set_revision_cursor(run_upper)
+            logger.debug(
+                "initialized direction revision cursor",
+                extra={
+                    "event": "revision_cursor_advanced",
+                    "old_cursor": None,
+                    "new_cursor": run_upper,
+                },
+            )
+        return set()
+
+    cursor = _coerce_jst_datetime(stored_cursor).replace(microsecond=0)
     span_upper = cursor + REVISION_SWEEP_DISCOVERY_SPAN
-    aggregated_at_upper = min(run_upper, span_upper)
+    aggregated_at_upper = max(cursor, min(run_upper, span_upper))
     chunk_binds = span_upper < run_upper
     aggregated_at_lower_sql = _format_mysql_timestamp(cursor)
     aggregated_at_upper_sql = _format_mysql_timestamp(aggregated_at_upper)
     interval_metadata_by_interval = {
         interval_min: _metadata_index_for_interval(metadata_index, interval_min)
         for interval_min in _INTERVALS
-    }
-    expected_targets_by_interval = {
-        interval_min: [place.entity_id for place in interval_metadata.values()]
-        for interval_min, interval_metadata in interval_metadata_by_interval.items()
     }
     startdate_upper_by_interval: dict[int, datetime] = {}
     discovered: list[_RevisionWorkItem] = []
@@ -856,7 +930,7 @@ def _process_revision_sweep(
     rows_by_key = _select_revision_direction_rows(db_connection, work_items)
 
     # Do not catch unexpected per-window errors here.  If transformation or
-    # posting raises before normal state records are written, abort before the
+    # writing raises before normal state records are written, abort before the
     # cursor is saved so the same discovery range is retried next run.
     for item in work_items:
         if item.retry:
@@ -874,19 +948,23 @@ def _process_revision_sweep(
                 rows_for_window=rows_for_window,
                 orion=orion,
                 state_store=state_store,
+                settings=settings,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata_by_interval[item.interval_min],
-                expected_target_ids=expected_targets_by_interval[item.interval_min],
                 counts=counts,
-                sweep_mode=True,
+                transformed_at=run_started_at,
+                force_resend=not item.retry,
             )
         else:
             _process_dry_run_window(
                 rows_for_window=rows_for_window,
                 orion=orion,
+                settings=settings,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata_by_interval[item.interval_min],
                 counts=counts,
+                window_key=item.window_key,
+                transformed_at=run_started_at,
             )
 
     if settings.send_mode == "send":
@@ -1025,7 +1103,7 @@ def _select_revision_direction_rows(
 
     Returns:
         Mapping from ``(interval_min, startdate)`` to that window's complete
-        direction rows, for example ``(5, "20260629_1200")``.
+        direction rows, for example ``(60, "20260629_1200")``.
     """
     startdates_by_interval: dict[int, list[str]] = {}
     for item in work_items:
@@ -1044,87 +1122,91 @@ def _select_revision_direction_rows(
     return rows_by_key
 
 
-def _effective_expected_target_ids(
-    state_store: WindowStateStore,
-    window_key: str,
-    configured_expected_target_ids: Iterable[str],
-) -> list[str]:
-    """Return the target set this attempt must respect for one window.
-
-    Product B pins the expected target set to the first attempt: once a window
-    has stored targets, those are used for all retries regardless of the
-    current active metadata.  This prevents the window from silently growing
-    or shrinking its target set mid-run when metadata changes between attempts.
-
-    When the stored set differs from the current metadata, a warning is emitted
-    so operators can detect configuration drift.  The stored set is still
-    respected — callers should use the repair tool to override it explicitly if
-    needed.
-    """
-    configured = sorted(set(configured_expected_target_ids))
-    stored = state_store.expected_target_ids(window_key)
-    if not stored:
-        return configured
-    # The stored set from a previous attempt differs from the current metadata:
-    # warn and keep the stored set to avoid partial-window surprises.
-    if stored != configured:
-        _lifecycle_logger.warning(
-            "window expected targets differ from active metadata",
-            extra={
-                "event": "window_expected_targets_changed",
-                "window": window_key,
-                "count_expected": len(stored),
-                "count_live": len(configured),
-            },
-        )
-    return stored
-
-
-def _metadata_for_expected_targets(
-    interval_metadata: Mapping[tuple[int, int], SensorPlace],
-    expected_target_ids: Iterable[str],
-) -> dict[tuple[int, int], SensorPlace]:
-    expected = set(expected_target_ids)
-    return {
-        key: place
-        for key, place in interval_metadata.items()
-        if place.entity_id in expected
-    }
-
-
 def _process_dry_run_window(
     *,
     rows_for_window: list[_DirectionRow],
     orion: _OrionForDirection,
+    settings: RunDirectionSettings,
     filter_settings: FilterSettings,
     interval_metadata: Mapping[tuple[int, int], SensorPlace],
     counts: _RunCounts,
+    window_key: str,
+    transformed_at: datetime,
 ) -> None:
-    """Build and log payloads for one source window without sending live POSTs."""
-    transformed = _transform(rows_for_window, filter_settings, interval_metadata)
+    """Build and preview one source window without mutating delivery state."""
+    transformed = _transform(
+        rows_for_window,
+        filter_settings,
+        interval_metadata,
+        settings=settings,
+        transformed_at=transformed_at,
+    )
     counts.rows_dropped += transformed.rows_dropped
-    for payload in transformed.payloads:
-        result = orion.update_attrs(
-            payload["entity_id"],
-            payload["entity_type"],
-            payload["attrs"],
-            dry_run=True,
+    if _record_no_write_outcome(window_key, transformed, counts):
+        return
+    if not isinstance(transformed, DirectionPayloadOutcome):
+        raise TypeError(f"unsupported direction transform outcome: {type(transformed)}")
+
+    payload = transformed.payload
+    result = orion.replace_attrs(
+        str(payload["entity_id"]),
+        payload["entity_type"],
+        payload["attrs"],
+        dry_run=True,
+    )
+    if bool(result.get("ok")):
+        counts.puts_ok += 1
+    else:
+        counts.puts_failed += 1
+
+
+def _record_no_write_outcome(
+    window_key: str,
+    transformed: DirectionTransformOutcome,
+    counts: _RunCounts,
+) -> bool:
+    """Count and log a typed transform outcome that must not reach Orion."""
+    if isinstance(transformed, DirectionNoPayloadOutcome):
+        counts.windows_no_payload += 1
+        logger.debug(
+            "direction window has no payload",
+            extra={"event": "direction_window_no_payload", "window": window_key},
         )
-        if bool(result.get("ok")):
-            counts.posts_ok += 1
-        else:
-            counts.posts_failed += 1
+        return True
+    if isinstance(transformed, DirectionSourceInvalidOutcome):
+        counts.windows_source_invalid += 1
+        logger.warning(
+            "direction window is missing required source totals",
+            extra={
+                "event": "direction_window_source_invalid",
+                "window": window_key,
+                "missing_from_all_place_numbers": list(
+                    transformed.missing_from_all_place_numbers
+                ),
+                "missing_to_all_place_numbers": list(
+                    transformed.missing_to_all_place_numbers
+                ),
+            },
+        )
+        return True
+    return False
 
 
 def _transform(
     rows_for_window: list[_DirectionRow],
     filter_settings: FilterSettings,
     interval_metadata: Mapping[tuple[int, int], SensorPlace],
-) -> TransformDirectionResult:
-    return transform_direction_rows(
+    *,
+    settings: RunDirectionSettings,
+    transformed_at: datetime,
+) -> DirectionTransformOutcome:
+    return transform_direction_window(
         rows_for_window,
         interval_metadata,
+        aggregate_entity_id=settings.product_b_aggregate_entity_id,
+        aggregate_entity_type=settings.product_b_aggregate_entity_type,
         ignored_place_prefixes=filter_settings.ignored_place_prefixes,
+        now=lambda: transformed_at,
     )
 
 
@@ -1212,8 +1294,10 @@ def _log_run_summary(result: RunDirectionResult) -> None:
             "windows_complete": result.windows_complete,
             "windows_partial": result.windows_partial,
             "windows_dead_letter": result.windows_dead_letter,
-            "posts_ok": result.posts_ok,
-            "posts_failed": result.posts_failed,
+            "puts_ok": result.puts_ok,
+            "puts_failed": result.puts_failed,
+            "windows_no_payload": result.windows_no_payload,
+            "windows_source_invalid": result.windows_source_invalid,
             "rows_dropped": result.rows_dropped,
             "oldest_non_complete": result.oldest_non_complete,
             "lookback_hours_used": result.lookback_hours_used,

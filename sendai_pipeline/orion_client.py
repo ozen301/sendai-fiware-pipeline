@@ -1,4 +1,4 @@
-"""Orion NGSI v2 client for Sendai FIWARE attribute updates."""
+"""Orion NGSI v2 client for Sendai FIWARE attribute operations."""
 
 import json
 import logging
@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, Self
+from urllib.parse import quote
 
 import requests
 
@@ -66,15 +67,16 @@ class OrionSettings:
 class OrionClient:
     """NGSI v2 client with Sendai FIWARE auth, retry, and structured logging.
 
-    Each :meth:`update_attrs` call serialises the body to canonical JSON,
-    fetches a token from the injected ``auth`` provider, and posts the
-    attributes to ``/orion/v2.0/entities/<id>/attrs``. Transient failures
-    (5xx, ``ConnectionError``, ``Timeout``, 429) are retried with
-    exponential backoff (delays ``1, 2, 4, 8, 16`` seconds). A single 401
-    triggers a forced token refresh and one out-of-band retry; the second
-    consecutive 401 is terminal. Other 4xx responses are terminal without
-    retry. Each call emits exactly one structured log record
-    (``post_succeeded`` or ``post_failed``).
+    Each attribute-write call serialises the body to canonical JSON and fetches
+    a token from the injected ``auth`` provider. :meth:`update_attrs` posts
+    partial updates, while :meth:`replace_attrs` puts a complete replacement.
+    Transient write failures (5xx, ``ConnectionError``, ``Timeout``, 429) are
+    retried with exponential backoff (delays ``1, 2, 4, 8, 16`` seconds).
+    :meth:`delete_attr` deletes one named attribute without retrying transient
+    failures. All three operations force a token refresh once after a 401 and
+    retry within the remaining retry budget (a 401 on the final attempt is not
+    retried further), and each emits exactly one verb-specific structured log
+    record.
 
     :meth:`list_entities` is a thin GET helper used by ``entity_map`` to
     validate targets; it does not retry.
@@ -104,23 +106,24 @@ class OrionClient:
                 In production this is a ``sendai_pipeline.auth.AuthClient``;
                 tests inject a fake.
             session: HTTP session used for requests. Defaults to a fresh
-                :class:`requests.Session`. Anything with ``.post`` and
-                ``.get`` methods returning a response-shaped object works,
-                which is how tests inject fakes.
+                :class:`requests.Session`. Anything with ``.post``, ``.put``,
+                ``.delete``, and ``.get`` methods returning a response-shaped
+                object works, which is how tests inject fakes.
             sleep: Callable used to pause between retries. Injected so
                 tests can record delays without real waits.
             now: Callable returning a monotonic-enough wall time in
                 seconds, used to compute ``elapsed_ms``. Injected for
                 deterministic tests.
             payload_mode: One of ``"hash"`` / ``"failure"`` / ``"full"``,
-                controlling how POST bodies are logged. See
+                controlling how attribute-write bodies are logged. See
                 :func:`sendai_pipeline.logging_setup.payload_log_fields`
                 for the per-mode matrix.
             payload_max_bytes: Cap (UTF-8 bytes) on the ``payload`` log
                 field; oversize bodies are truncated with a marker.
             response_max_bytes: Cap (UTF-8 bytes) on the
                 ``response_excerpt`` log field and on the ``body_excerpt``
-                returned by :meth:`update_attrs`.
+                returned by :meth:`update_attrs`, :meth:`replace_attrs`, or
+                :meth:`delete_attr`.
         """
         self.settings = settings
         self.auth = auth
@@ -178,7 +181,7 @@ class OrionClient:
         ).encode("utf-8")
 
         if dry_run:
-            self._log_post_result(
+            self._log_write_result(
                 entity_id=entity_id,
                 status=0,
                 ok=True,
@@ -259,7 +262,7 @@ class OrionClient:
                 backoff_index += 1
 
         elapsed_ms = int(round((self.now() - started) * 1000))
-        body_excerpt = self._log_post_result(
+        body_excerpt = self._log_write_result(
             entity_id=entity_id,
             status=status,
             ok=ok,
@@ -269,6 +272,257 @@ class OrionClient:
             response_text=response_text,
             dry_run=False,
             payload_mode=self.payload_mode,
+        )
+
+        return {
+            "status": status,
+            "ok": ok,
+            "attempts": attempts,
+            "elapsed_ms": elapsed_ms,
+            "body_excerpt": body_excerpt,
+            "dry_run": False,
+        }
+
+    def replace_attrs(
+        self,
+        entity_id: str,
+        entity_type: str,
+        attrs: Mapping[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Replace all NGSI v2 attributes on one Orion entity.
+
+        The entity id is encoded as one URL path segment, while the entity
+        type is passed separately as a query parameter. The body is serialised
+        as canonical JSON (``sort_keys=True, separators=(",", ":")``) and
+        sent as raw bytes so the wire payload is deterministic.
+
+        Args:
+            entity_id: Target aggregate entity id.
+            entity_type: NGSI entity type used to disambiguate the entity.
+            attrs: Complete mapping of attribute names to NGSI attribute
+                objects. Attributes omitted from this mapping are removed by
+                Orion's replace-all operation.
+            dry_run: When true, build and log the body with a
+                ``put_succeeded`` record and return without contacting the
+                network.
+
+        Returns:
+            A dict with keys ``status`` (int, ``0`` on dry-run or connection
+            failure), ``ok`` (bool), ``attempts`` (int), ``elapsed_ms`` (int),
+            ``body_excerpt`` (truncated response text on failure, ``None`` on
+            success or dry-run), and ``dry_run`` (bool).
+
+        Raises:
+            Any exception other than ``requests.exceptions.ConnectionError``
+            / ``requests.exceptions.Timeout`` propagates to the caller. Those
+            two exceptions are caught and treated as retryable.
+        """
+        body_bytes = json.dumps(
+            attrs,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        if dry_run:
+            self._log_write_result(
+                entity_id=entity_id,
+                status=0,
+                ok=True,
+                attempts=0,
+                elapsed_ms=0,
+                body_bytes=body_bytes,
+                response_text=None,
+                dry_run=True,
+                payload_mode="full",
+                verb="put",
+            )
+            return {
+                "status": 0,
+                "ok": True,
+                "attempts": 0,
+                "elapsed_ms": 0,
+                "body_excerpt": None,
+                "dry_run": True,
+            }
+
+        url = (
+            f"{self.settings.base_url}/orion/v2.0/entities/"
+            f"{quote(entity_id, safe='')}/attrs"
+        )
+        started = self.now()
+        attempts = 0
+        backoff_index = 0
+        refreshed_after_401 = False
+        force_refresh = False
+        status = 0
+        response_text: str | None = None
+        ok = False
+        max_attempts = self.settings.max_retries + 1
+
+        while attempts < max_attempts:
+            attempts += 1
+            try:
+                response = self.session.put(
+                    url,
+                    params={"type": entity_type},
+                    data=body_bytes,
+                    headers=self._headers(
+                        include_content_type=True,
+                        force_refresh=force_refresh,
+                    ),
+                    timeout=self.settings.timeout,
+                    verify=self.settings.verify_tls,
+                )
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                force_refresh = False
+                status = 0
+                response_text = str(exc)
+                ok = False
+                if attempts >= max_attempts:
+                    break
+                self.sleep(self._backoff_delay(backoff_index))
+                backoff_index += 1
+                continue
+
+            force_refresh = False
+            status = response.status_code
+            response_text = response.text
+            ok = 200 <= status < 300
+
+            if ok:
+                break
+
+            if status == 401 and not refreshed_after_401:
+                refreshed_after_401 = True
+                force_refresh = True
+                if attempts < max_attempts:
+                    continue
+                break
+
+            retry_delay, advance_backoff = self._retry_delay(response, backoff_index)
+            if retry_delay is None or attempts >= max_attempts:
+                break
+
+            self.sleep(retry_delay)
+            if advance_backoff:
+                backoff_index += 1
+
+        elapsed_ms = int(round((self.now() - started) * 1000))
+        body_excerpt = self._log_write_result(
+            entity_id=entity_id,
+            status=status,
+            ok=ok,
+            attempts=attempts,
+            elapsed_ms=elapsed_ms,
+            body_bytes=body_bytes,
+            response_text=response_text,
+            dry_run=False,
+            payload_mode=self.payload_mode,
+            verb="put",
+        )
+
+        return {
+            "status": status,
+            "ok": ok,
+            "attempts": attempts,
+            "elapsed_ms": elapsed_ms,
+            "body_excerpt": body_excerpt,
+            "dry_run": False,
+        }
+
+    def delete_attr(
+        self,
+        entity_id: str,
+        entity_type: str,
+        attr_name: str,
+    ) -> dict[str, Any]:
+        """Delete one named attribute from an Orion entity.
+
+        The entity id and attribute name are each encoded as one URL path
+        segment. The entity type is passed separately as a query parameter,
+        and the request has no body. A 204 response means the attribute was
+        deleted; 404 is also successful because the requested end state is
+        already satisfied. Every other status is a terminal failure, except
+        that the first 401 triggers one forced token refresh and retry.
+
+        Args:
+            entity_id: Target entity id.
+            entity_type: NGSI entity type used to disambiguate the entity.
+            attr_name: Exact attribute name to delete.
+
+        Returns:
+            A dict with keys ``status`` (int, ``0`` on connection failure),
+            ``ok`` (bool), ``attempts`` (int), ``elapsed_ms`` (int),
+            ``body_excerpt`` (truncated response text on failure and ``None``
+            on success), and ``dry_run`` (always ``False``).
+
+        Note:
+            Connection and timeout failures are caught and returned without
+            retry. Attribute cleanup is intentionally single-shot apart from
+            the one 401 token-refresh retry.
+        """
+        url = (
+            f"{self.settings.base_url}/orion/v2.0/entities/"
+            f"{quote(entity_id, safe='')}/attrs/{quote(attr_name, safe='')}"
+        )
+        started = self.now()
+        attempts = 0
+        refreshed_after_401 = False
+        force_refresh = False
+        status = 0
+        response_text: str | None = None
+        ok = False
+
+        while True:
+            attempts += 1
+            try:
+                response = self.session.delete(
+                    url,
+                    params={"type": entity_type},
+                    headers=self._headers(
+                        include_content_type=False,
+                        force_refresh=force_refresh,
+                    ),
+                    timeout=self.settings.timeout,
+                    verify=self.settings.verify_tls,
+                )
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+            ) as exc:
+                status = 0
+                response_text = str(exc)
+                break
+
+            force_refresh = False
+            status = response.status_code
+            response_text = response.text
+
+            if status == 401 and not refreshed_after_401:
+                refreshed_after_401 = True
+                force_refresh = True
+                continue
+
+            ok = status in {204, 404}
+            break
+
+        elapsed_ms = int(round((self.now() - started) * 1000))
+        body_excerpt = self._log_write_result(
+            entity_id=entity_id,
+            status=status,
+            ok=ok,
+            attempts=attempts,
+            elapsed_ms=elapsed_ms,
+            body_bytes=b"",
+            response_text=response_text,
+            dry_run=False,
+            payload_mode=self.payload_mode,
+            verb="delete",
         )
 
         return {
@@ -407,9 +661,10 @@ class OrionClient:
         """Determine the retry delay for a failed (non-2xx) response.
 
         Only 429 and 5xx are retryable; every other status (including a
-        second consecutive 401 — the first one triggers a token refresh in
-        ``update_attrs`` and never reaches here) falls through to the
-        terminal ``(None, False)`` case.
+        second consecutive 401 — the first one is handled in each
+        attribute-write method with a forced token refresh and one retry
+        within the retry budget, and never reaches here) falls through to
+        the terminal ``(None, False)`` case.
 
         Returns:
             A ``(delay, advance_backoff)`` tuple where:
@@ -446,7 +701,7 @@ class OrionClient:
         """
         return float(2**index)
 
-    def _log_post_result(
+    def _log_write_result(
         self,
         *,
         entity_id: str,
@@ -458,15 +713,16 @@ class OrionClient:
         response_text: str | None,
         dry_run: bool,
         payload_mode: str,
+        verb: str = "post",
     ) -> str | None:
-        """Emit the terminal POST log record and return any response excerpt.
+        """Emit a terminal operation log and return any response excerpt.
 
-        Logs at INFO on success (``post_succeeded``) and ERROR on failure
-        (``post_failed``).  On failure, returns the truncated
-        ``response_excerpt`` string when one is present so callers can surface
-        it in the result dict; returns ``None`` on success, and also on
-        failure in ``hash`` payload mode, where no ``response_excerpt`` field
-        is produced.
+        Logs at INFO on success and ERROR on failure, using *verb* in the
+        structured event name and message. ``body_bytes`` is empty for DELETE
+        requests. On failure, returns the truncated ``response_excerpt``
+        string when one is present so callers can surface it in the result
+        dict; returns ``None`` on success, and also on failure in ``hash``
+        payload mode, where no ``response_excerpt`` field is produced.
         """
         fields = payload_log_fields(
             body_bytes,
@@ -477,7 +733,7 @@ class OrionClient:
             response_max_bytes=self.response_max_bytes,
         )
         extra = {
-            "event": "post_succeeded" if ok else "post_failed",
+            "event": f"{verb}_succeeded" if ok else f"{verb}_failed",
             "entity_id": entity_id,
             "http_status": status,
             "ok": ok,
@@ -488,10 +744,10 @@ class OrionClient:
         }
 
         if ok:
-            logger.info("orion post succeeded", extra=extra)
+            logger.info("orion %s succeeded", verb, extra=extra)
             return None
 
-        logger.error("orion post failed", extra=extra)
+        logger.error("orion %s failed", verb, extra=extra)
         return fields.get("response_excerpt")
 
 

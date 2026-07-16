@@ -47,6 +47,14 @@ class FakeSession:
         self.calls.append({"method": "POST", "url": url, **kwargs})
         return self._next()
 
+    def put(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append({"method": "PUT", "url": url, **kwargs})
+        return self._next()
+
+    def delete(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.calls.append({"method": "DELETE", "url": url, **kwargs})
+        return self._next()
+
     def get(self, url: str, **kwargs: Any) -> FakeResponse:
         self.calls.append({"method": "GET", "url": url, **kwargs})
         return self._next()
@@ -157,6 +165,20 @@ def sample_attrs() -> dict[str, Any]:
         "dateObservedFrom": {
             "type": "DateTime",
             "value": "2026-05-22T09:00:00+09:00",
+        },
+    }
+
+
+def sample_aggregate_attrs() -> dict[str, Any]:
+    return {
+        "peopleCount_flow_2": {"type": "Number", "value": 3},
+        "identifcation": {
+            "type": "Text",
+            "value": "jp.sendai.Blesensor.flow",
+        },
+        "dateRetrieved": {
+            "type": "DateTime",
+            "value": "2026-05-22T10:00:00+09:00",
         },
     }
 
@@ -682,3 +704,543 @@ def test_list_entities_sends_fiware_service_header() -> None:
     call = session.calls[0]
     assert call["headers"]["Fiware-Service"] == "sendai"
     assert call["headers"]["Fiware-ServicePath"] == "/"
+
+
+def test_replace_attrs_puts_canonical_body_to_encoded_entity_attrs_endpoint(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attrs = sample_aggregate_attrs()
+    session = FakeSession([FakeResponse(204)])
+    auth = FakeAuth(tokens=["request-token"])
+    client = make_client(session, auth=auth)
+    entity_id = "jp.sendai.Blesensor.flow/aggregate?slot=one two"
+    entity_type = "Blesensor.flow/v2 & beta"
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.replace_attrs(entity_id, entity_type, attrs)
+
+    assert result == {
+        "status": 204,
+        "ok": True,
+        "attempts": 1,
+        "elapsed_ms": 0,
+        "body_excerpt": None,
+        "dry_run": False,
+    }
+    assert len(session.calls) == 1
+    call = session.calls[0]
+    assert call["method"] == "PUT"
+    assert call["url"] == (
+        "https://fiware.example.test/orion/v2.0/entities/"
+        "jp.sendai.Blesensor.flow%2Faggregate%3Fslot%3Done%20two/attrs"
+    )
+    assert call["params"] == {"type": entity_type}
+    prepared_url = (
+        requests.Request(
+            "PUT",
+            call["url"],
+            params=call["params"],
+        )
+        .prepare()
+        .url
+    )
+    assert prepared_url == (
+        "https://fiware.example.test/orion/v2.0/entities/"
+        "jp.sendai.Blesensor.flow%2Faggregate%3Fslot%3Done%20two/attrs"
+        "?type=Blesensor.flow%2Fv2+%26+beta"
+    )
+    assert entity_id not in call["url"]
+    assert entity_type not in call["url"]
+    assert call["headers"] == {
+        "Authorization": "Bearer request-token",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "Fiware-Service": "sendai",
+        "Fiware-ServicePath": "/",
+    }
+    assert call["data"] == canonical_json_bytes(attrs)
+    assert json.loads(call["data"]) == attrs
+    assert "json" not in call
+    assert call["timeout"] == 3.5
+    assert call["verify"] is True
+    assert auth.calls == [False]
+    records = post_records(caplog, "put_succeeded")
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].entity_id == entity_id
+    assert records[0].http_status == 204
+    assert records[0].attempts == 1
+    assert post_records(caplog, "post_succeeded") == []
+
+
+def test_replace_attrs_treats_non_204_2xx_as_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attrs = sample_aggregate_attrs()
+    session = FakeSession([FakeResponse(200)])
+    client = make_client(session, auth=FakeAuth(tokens=["request-token"]))
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.replace_attrs(
+            "jp.sendai.Blesensor.flow", "Blesensor.flow", attrs
+        )
+
+    assert result["ok"] is True
+    assert result["status"] == 200
+    assert result["attempts"] == 1
+    assert len(session.calls) == 1
+    records = post_records(caplog, "put_succeeded")
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].http_status == 200
+
+
+def test_replace_attrs_dry_run_skips_network_and_logs_full_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attrs = sample_aggregate_attrs()
+    session = FakeSession([FakeResponse(204)])
+    auth = FakeAuth()
+    client = make_client(session, auth=auth, payload_mode="hash")
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.replace_attrs(
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+            attrs,
+            dry_run=True,
+        )
+
+    assert result == {
+        "status": 0,
+        "ok": True,
+        "attempts": 0,
+        "elapsed_ms": 0,
+        "body_excerpt": None,
+        "dry_run": True,
+    }
+    assert session.calls == []
+    assert auth.calls == []
+    records = post_records(caplog, "put_succeeded")
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == logging.INFO
+    assert record.ok is True
+    assert record.dry_run is True
+    assert record.attempts == 0
+    assert record.payload == canonical_json_bytes(attrs).decode("utf-8")
+    assert (
+        record.payload_sha256 == hashlib.sha256(canonical_json_bytes(attrs)).hexdigest()
+    )
+    assert post_records(caplog, "post_succeeded") == []
+
+
+def test_replace_attrs_timeout_retries_and_can_succeed() -> None:
+    session = FakeSession(
+        [requests.exceptions.ReadTimeout("read timed out"), FakeResponse(204)]
+    )
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == 204
+    assert result["attempts"] == 2
+    assert sleep.delays == [1]
+    assert [call["method"] for call in session.calls] == ["PUT", "PUT"]
+
+
+def test_replace_attrs_connection_error_retries_and_can_succeed() -> None:
+    session = FakeSession(
+        [requests.exceptions.ConnectionError("network down"), FakeResponse(204)]
+    )
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == 204
+    assert result["attempts"] == 2
+    assert sleep.delays == [1]
+    assert len(session.calls) == 2
+
+
+def test_replace_attrs_transient_errors_retry_with_exponential_backoff() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(503, text="unavailable"),
+            FakeResponse(502, text="bad gateway"),
+            FakeResponse(204),
+        ]
+    )
+    sleep = FakeSleep()
+    client = make_client(
+        session,
+        settings=make_settings(max_retries=2),
+        sleep=sleep,
+    )
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == 204
+    assert result["attempts"] == 3
+    assert sleep.delays == [1, 2]
+    assert len(session.calls) == 3
+
+
+def test_replace_attrs_rate_limit_honors_retry_after() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(429, text="slow down", headers={"Retry-After": "7"}),
+            FakeResponse(204),
+        ]
+    )
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is True
+    assert result["attempts"] == 2
+    assert sleep.delays == [7]
+
+
+def test_replace_attrs_unauthorized_refreshes_once_then_succeeds() -> None:
+    session = FakeSession([FakeResponse(401, text="expired"), FakeResponse(204)])
+    auth = FakeAuth(tokens=["expired-token"], refresh_tokens=["fresh-token"])
+    sleep = FakeSleep()
+    client = make_client(session, auth=auth, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == 204
+    assert result["attempts"] == 2
+    assert auth.calls == [False, True]
+    assert sleep.delays == []
+    assert [call["headers"]["Authorization"] for call in session.calls] == [
+        "Bearer expired-token",
+        "Bearer fresh-token",
+    ]
+
+
+def test_replace_attrs_second_unauthorized_is_terminal() -> None:
+    session = FakeSession(
+        [FakeResponse(401, text="expired"), FakeResponse(401, text="still expired")]
+    )
+    auth = FakeAuth(tokens=["expired-token"], refresh_tokens=["fresh-token"])
+    sleep = FakeSleep()
+    client = make_client(session, auth=auth, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == 401
+    assert result["attempts"] == 2
+    assert result["body_excerpt"] == "still expired"
+    assert auth.calls == [False, True]
+    assert sleep.delays == []
+    assert len(session.calls) == 2
+
+
+def test_replace_attrs_terminal_client_error_does_not_retry() -> None:
+    session = FakeSession([FakeResponse(400, text="invalid aggregate")])
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == 400
+    assert result["attempts"] == 1
+    assert result["body_excerpt"] == "invalid aggregate"
+    assert sleep.delays == []
+    assert len(session.calls) == 1
+
+
+def test_replace_attrs_exhausts_retry_budget_and_logs_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession(
+        [FakeResponse(503, text=f"boom-{index}") for index in range(3)]
+    )
+    sleep = FakeSleep()
+    client = make_client(
+        session,
+        settings=make_settings(max_retries=2),
+        sleep=sleep,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.replace_attrs(
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+            sample_aggregate_attrs(),
+        )
+
+    assert result == {
+        "status": 503,
+        "ok": False,
+        "attempts": 3,
+        "elapsed_ms": 0,
+        "body_excerpt": "boom-2",
+        "dry_run": False,
+    }
+    assert sleep.delays == [1, 2]
+    assert len(session.calls) == 3
+    records = post_records(caplog, "put_failed")
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].http_status == 503
+    assert records[0].attempts == 3
+    assert records[0].payload == canonical_json_bytes(sample_aggregate_attrs()).decode(
+        "utf-8"
+    )
+    assert records[0].response_excerpt == "boom-2"
+    assert post_records(caplog, "post_failed") == []
+
+
+def test_delete_attr_deletes_encoded_path_segments_with_type_and_no_body(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession([FakeResponse(204)])
+    auth = FakeAuth(tokens=["request-token"])
+    client = make_client(session, auth=auth)
+    entity_id = "jp.sendai.Blesensor.flow/aggregate?slot=one two"
+    entity_type = "Blesensor.flow/v2 & beta"
+    attr_name = "peopleCount_flow/7?source=north gate"
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.delete_attr(entity_id, entity_type, attr_name)
+
+    assert result == {
+        "status": 204,
+        "ok": True,
+        "attempts": 1,
+        "elapsed_ms": 0,
+        "body_excerpt": None,
+        "dry_run": False,
+    }
+    assert len(session.calls) == 1
+    call = session.calls[0]
+    assert call["method"] == "DELETE"
+    assert call["url"] == (
+        "https://fiware.example.test/orion/v2.0/entities/"
+        "jp.sendai.Blesensor.flow%2Faggregate%3Fslot%3Done%20two/attrs/"
+        "peopleCount_flow%2F7%3Fsource%3Dnorth%20gate"
+    )
+    assert call["params"] == {"type": entity_type}
+    prepared_url = (
+        requests.Request(
+            "DELETE",
+            call["url"],
+            params=call["params"],
+        )
+        .prepare()
+        .url
+    )
+    assert prepared_url == (
+        "https://fiware.example.test/orion/v2.0/entities/"
+        "jp.sendai.Blesensor.flow%2Faggregate%3Fslot%3Done%20two/attrs/"
+        "peopleCount_flow%2F7%3Fsource%3Dnorth%20gate"
+        "?type=Blesensor.flow%2Fv2+%26+beta"
+    )
+    assert "data" not in call
+    assert "json" not in call
+    assert call["headers"]["Authorization"] == "Bearer request-token"
+    assert "Content-Type" not in call["headers"]
+    assert auth.calls == [False]
+    records = post_records(caplog, "delete_succeeded")
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].entity_id == entity_id
+    assert records[0].http_status == 204
+    assert records[0].attempts == 1
+
+
+def test_delete_attr_unauthorized_refreshes_once_then_succeeds() -> None:
+    session = FakeSession([FakeResponse(401, text="expired"), FakeResponse(204)])
+    auth = FakeAuth(tokens=["expired-token"], refresh_tokens=["fresh-token"])
+    sleep = FakeSleep()
+    client = make_client(session, auth=auth, sleep=sleep)
+
+    result = client.delete_attr(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        "peopleCount_flow_7",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == 204
+    assert result["attempts"] == 2
+    assert auth.calls == [False, True]
+    assert sleep.delays == []
+    assert [call["headers"]["Authorization"] for call in session.calls] == [
+        "Bearer expired-token",
+        "Bearer fresh-token",
+    ]
+
+
+def test_delete_attr_second_unauthorized_is_terminal() -> None:
+    session = FakeSession(
+        [FakeResponse(401, text="expired"), FakeResponse(401, text="still expired")]
+    )
+    auth = FakeAuth(tokens=["expired-token"], refresh_tokens=["fresh-token"])
+    sleep = FakeSleep()
+    client = make_client(session, auth=auth, sleep=sleep)
+
+    result = client.delete_attr(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        "peopleCount_flow_7",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == 401
+    assert result["attempts"] == 2
+    assert result["body_excerpt"] == "still expired"
+    assert auth.calls == [False, True]
+    assert sleep.delays == []
+    assert len(session.calls) == 2
+
+
+def test_delete_attr_already_absent_is_success(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession([FakeResponse(404, text="not found")])
+    client = make_client(session)
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.delete_attr(
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+            "peopleCount_flow_7",
+        )
+
+    assert result == {
+        "status": 404,
+        "ok": True,
+        "attempts": 1,
+        "elapsed_ms": 0,
+        "body_excerpt": None,
+        "dry_run": False,
+    }
+    records = post_records(caplog, "delete_succeeded")
+    assert len(records) == 1
+    assert records[0].http_status == 404
+
+
+@pytest.mark.parametrize("status", [200, 400, 500])
+def test_delete_attr_unexpected_status_is_terminal_failure(
+    status: int,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession([FakeResponse(status, text="unexpected delete response")])
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.delete_attr(
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+            "peopleCount_flow_7",
+        )
+
+    assert result == {
+        "status": status,
+        "ok": False,
+        "attempts": 1,
+        "elapsed_ms": 0,
+        "body_excerpt": "unexpected delete response",
+        "dry_run": False,
+    }
+    assert sleep.delays == []
+    assert len(session.calls) == 1
+    records = post_records(caplog, "delete_failed")
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    assert records[0].http_status == status
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        requests.exceptions.ConnectionError("network down"),
+        requests.exceptions.ReadTimeout("read timed out"),
+    ],
+)
+def test_delete_attr_connection_error_is_caught_as_single_shot_failure(
+    exc: Exception,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession([exc])
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
+        result = client.delete_attr(
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+            "peopleCount_flow_7",
+        )
+
+    assert result["ok"] is False
+    assert result["status"] == 0
+    assert result["attempts"] == 1
+    assert result["dry_run"] is False
+    assert sleep.delays == []
+    assert len(session.calls) == 1
+    assert str(exc) in (result["body_excerpt"] or "")
+    records = post_records(caplog, "delete_failed")
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+
+
+def test_update_attrs_product_a_remains_post() -> None:
+    session = FakeSession([FakeResponse(204)])
+    client = make_client(session)
+
+    client.update_attrs(
+        "jp.sendai.Blesensor.per3600.10",
+        "Blesensor.per3600",
+        sample_attrs(),
+    )
+
+    assert len(session.calls) == 1
+    assert session.calls[0]["method"] == "POST"
+    assert session.calls[0]["url"] == (
+        "https://fiware.example.test/orion/v2.0/entities/"
+        "jp.sendai.Blesensor.per3600.10/attrs?type=Blesensor.per3600"
+    )
+    assert "params" not in session.calls[0]

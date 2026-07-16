@@ -16,10 +16,11 @@ platform in two forms so other applications can use them:
 - *Product B, inter-place flow:* for each pair of sensors, how many distinct
   devices moved from one to the other in the same window.
 
-Two independent pipelines run every five minutes. Product A publishes
-per-place counts, while Product B publishes inter-place flow; both write to the
-same FIWARE entities. Both pipelines publish 5-minute and 60-minute aggregates
-and feed the FIWARE platform's time-series history service so that
+Two independent pipelines run every five minutes and write to separate
+FIWARE entities. Product A publishes per-place counts to one entity per
+place and interval, at both 5-minute and 60-minute aggregation. Product B
+publishes inter-place flow to a single aggregate entity, at 60-minute
+aggregation only. Both feed the FIWARE platform's time-series history service so that
 values are available as both "current" (via *Orion API*) and "historical" (via *STH-Comet API*).
 Source schemas, entity ids, batch names, and deployment procedures intentionally match
 the Sendai environment; runtime configuration, real sensor metadata,
@@ -70,6 +71,10 @@ uv run python scripts/show_data.py --source orion --flow-attrs \
 uv run python scripts/show_data.py --source comet \
   --attrs peopleCount_immedate --last-n 20 \
   jp.sendai.Blesensor.per300.101
+
+# Inspect the Product B aggregate entity's history (attributes auto-enumerated).
+uv run python scripts/show_data.py --source comet --last-n 20 \
+  jp.sendai.Blesensor.flow
 
 # Diagnose stuck windows (read-only).
 uv run python scripts/state_doctor.py flow --pretty

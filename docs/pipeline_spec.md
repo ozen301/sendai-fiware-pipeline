@@ -11,7 +11,7 @@ platform:
 | # | Source MySQL table | What gets sent | Target Orion entity |
 |---|---|---|---|
 | **A** | `bleData2025d.flow_metrics2_per_place2_agg_imputed` | Per-place pedestrian counts and stay times (gap-filled superset of `flow_metrics2_per_place2_agg`) | `jp.sendai.Blesensor.per3600.<N>` (60-min) and `jp.sendai.Blesensor.per300.<N>` (5-min), **one entity per place** |
-| **B** | `bleData2025d.direction_metrics2_per_place2_agg` | Place-to-place flow ("回遊性") | **Same per-place entities as Product A**; Product B adds the `peopleCount_flow` attribute on each (see §4.3) |
+| **B** | `bleData2025d.direction_metrics2_per_place2_agg` | Place-to-place flow ("回遊性") | One exclusively owned aggregate entity, `jp.sendai.Blesensor.flow` by default (see §4) |
 
 ## Contents
 
@@ -19,7 +19,7 @@ platform:
 - §2 Common rules (apply to both products)
 - §3 Product A: per-place counts
 - §4 Product B: inter-place flow
-- §5 Endpoint and example POST
+- §5 Orion endpoints and STH-Comet subscriptions
 
 ---
 
@@ -33,9 +33,9 @@ and the read account are kept out of this committed spec; see `.env` or
 the team's secrets store. The pipeline is expected to run on a host that
 is already on the same network.
 
-### FIWARE side: common headers for every POST
+### FIWARE side: common headers for every request
 
-Every Orion POST carries:
+Every Orion attribute write carries:
 
 ```
 Accept:              application/json
@@ -56,14 +56,19 @@ where this lives in the code).
 
 ### Metadata governance
 
-Entity IDs, entity types, install batches, expected device types, and
-the misspelled `identifcation` attribute value are all loaded from
-`metadata/sensors.csv`. The pipeline reads this file at startup and does
-**not** reconstruct entity ids or types from any pattern, even if
-today's data follows one. Orion's `GET /v2.0/entities?type=…` is used
-only to *validate* that metadata targets exist on the platform; missing
-platform entities are logged, but the metadata file remains
-authoritative.
+Product A entity IDs, entity types, install batches, expected device types, and
+the required `identifcation` column are loaded from `metadata/sensors.csv`.
+The column's per-place value is not emitted in any payload: Product A does not
+write an `identifcation` attribute, and Product B sets the aggregate
+`identifcation` value to `PRODUCT_B_AGGREGATE_ENTITY_ID`. The pipeline reads
+this file at startup and does not reconstruct Product A entity ids or types
+from a pattern. Product B also uses the metadata for source eligibility and
+device-type selection, but its single aggregate target comes from
+`PRODUCT_B_AGGREGATE_ENTITY_ID` and `PRODUCT_B_AGGREGATE_ENTITY_TYPE` (§4).
+
+Orion entity queries only validate non-blockingly that configured targets
+exist. A missing entity is logged, but the configured target remains
+authoritative and the write result determines the window outcome.
 
 `metadata/sensors.csv` is produced from a stable manually seeded
 metadata file (currently the 2023 batch) plus the latest refreshable
@@ -77,9 +82,10 @@ These rules apply to **both** Product A and Product B.
 
 ### 2.1 Allowed intervals
 
-Only `interval_min ∈ {5, 60}` rows are published. `interval_min = 1`
-rows exist in the source tables for further aggregation but are never
-sent.
+Product A publishes `interval_min ∈ {5, 60}` rows. Product B publishes only
+`interval_min = 60`; it ignores 5-minute direction rows in fresh sends and
+revision sweeps. `interval_min = 1` rows exist for further source aggregation
+and are never sent by either product.
 
 ### 2.2 Noise prefixes: dropped silently
 
@@ -105,7 +111,7 @@ The prefix list is operator-configurable via `IGNORED_PLACE_PREFIXES`
 `group_place_id`. For Product B, the literal aggregation key `'ALL'` is
 **not** a noise prefix; it is exempt from this filter (see §4).
 
-### 2.3 Metadata-driven entity mapping
+### 2.3 Metadata-driven Product A entity mapping
 
 Mapping is **metadata-driven**, not pattern-reconstructed:
 
@@ -118,10 +124,11 @@ metadata.entity_id, metadata.entity_type                  ↓
                   query    = ?type={metadata.entity_type}
 ```
 
-The metadata CSV's `entity_id` and `entity_type` columns are the
-authoritative source. The pipeline **must not** reconstruct an entity
-id from `interval_min × 60`, even if today's metadata follows that
-pattern in 100% of rows.
+The metadata CSV's `entity_id` and `entity_type` columns are the authoritative
+Product A target source. The pipeline **must not** reconstruct an entity id
+from `interval_min × 60`, even if today's metadata follows that pattern in
+100% of rows. Product B resolves source places through this metadata but writes
+the aggregate target configured in §4 instead of these per-place targets.
 
 `group_place_id` prefix per install batch (informational, used only to
 derive `place_number`):
@@ -133,22 +140,24 @@ derive `place_number`):
 
 ### 2.4 Device-type filtering (batch disambiguation)
 
-The source tables store parallel rows under both `Pixel3aUT` and
-`M5Stack` device types for every per-place target. The filter picks the
-right one:
+The source tables store parallel rows under both `Pixel3aUT` and `M5Stack`.
+Product A selects the expected type from each place's metadata:
 
 | Place number range | Install batch | Use rows where `device_type =` |
 |---|---|---|
 | 1-28 | 2023設置 | `Pixel3aUT` |
 | 101-112, 201-210 | 2026年3月設置 | `M5Stack` |
 
-This filter is a **required disambiguator** for both products, not just
-a cross-batch exclusion; omitting it would double-count.
+Product B instead selects one city-wide device type from the oldest targeted
+active batch for interval 60 and applies it to both endpoints of every included
+row (§4.2). Device-type filtering is a required disambiguator for both products;
+omitting it would double-count.
 
 ### 2.5 NGSI attribute types
 
-The Sendai broker carries the following types on every per-place
-entity. The pipeline matches the existing convention exactly; writing
+The Sendai broker carries the following types on Product A per-place entities
+and historical Product B per-place attributes. Product A matches the existing
+convention exactly; writing
 the canonical NGSI `Integer` / `Number` would change the stored type
 and create mixed-type history in STH-Comet.
 
@@ -158,7 +167,7 @@ and create mixed-type history in STH-Comet.
 | `identifcation` | `Text` |
 | `peopleCount_immedate`, `peopleCount_near`, `peopleCount_far` | `"number"` (lowercase string) |
 | `peopleOccupancy_immedate`, `peopleOccupancy_near` | `"number"` (lowercase string) |
-| `peopleCount_flow` | `StructuredValue` |
+| historical bare `peopleCount_flow` | `StructuredValue` |
 
 The `immedate` spelling is intentional. The live Sendai entities
 already used that attribute name before this pipeline, so the pipeline
@@ -173,8 +182,14 @@ keeps it for compatibility instead of renaming it to `immediate`.
 
 ### 2.6 TimeInstant metadata
 
-Every attribute the pipeline writes carries NGSI metadata
-`TimeInstant = dateObservedFrom`. When the STH-Comet subscription
+Every attribute either product writes carries the exact NGSI metadata object
+below, where `<dateObservedFrom>` is the source-window start:
+
+```json
+{"TimeInstant": {"type": "DateTime", "value": "<dateObservedFrom>"}}
+```
+
+When the STH-Comet subscription
 requests `metadata: ["TimeInstant"]`, Comet uses this value as the
 stored history timestamp instead of the wall-clock receive time. This
 aligns Comet `recvTime` with the logical aggregate window start.
@@ -182,9 +197,11 @@ aligns Comet `recvTime` with the logical aggregate window start.
 ### 2.7 `null` vs `0`
 
 For all numeric attributes: `null` means "no observation," `0` means
-"observed zero." The two are semantically different and the pipeline
-preserves both. In particular, nullable source numeric values are sent
-as JSON `null`, not coerced to zero.
+"observed zero." The two are semantically different and the pipeline preserves
+both. Product A sends nullable source values as JSON `null`. Product B writes
+`0` only for a missing pairwise route between two emitted places whose source
+totals prove they were measuring; Product B represents no observation through
+roster absence, not a null matrix.
 
 ### 2.8 Time zone
 
@@ -196,25 +213,22 @@ emitting.
 ### 2.9 Idempotency
 
 In normal send mode, a prior successful target result is terminal for
-`(product, interval, source window, entity_id)` only while the payload
-hash is unchanged. Failed or missing targets are retried. A prior-`ok`
-target with an unchanged payload hash is skipped as a real no-op; a
-prior-`ok` target whose payload hash differs is re-POSTed.
+`(product, interval, source window, entity_id)` only while the payload hash is
+unchanged. Failed or missing targets are retried. A prior-`ok` target with an
+unchanged payload hash is skipped as a real no-op; a prior-`ok` target whose
+payload hash differs is written again by its owning product.
 
-A window is `complete` once every entity id in its expected target set
-has a recorded `ok`. The two products build that expected set
-differently: Product A unions it from the targets actually observed
-(§3.2), Product B fixes it to the active-metadata roster (§4). As a
-result, a silent Product A place that emits no source row never holds its
-window in `partial`.
+A window is `complete` once every entity id in its expected target set has a
+recorded `ok`. Product A unions that set from the targets actually observed
+(§3.2). Product B has exactly one expected target, the configured aggregate
+entity (§4). A Product B attempt that produces no aggregate payload records no
+window state.
 
-Once STH-Comet subscriptions are enabled, a drift resend appends
-another history row instead of replacing the old row. Duplicate
-STH-Comet history rows for revised windows are accepted by contract.
-Treat Comet deletion/replay only as an operator repair workflow when
-history must be cleaned or rebuilt; upstream STH-Comet deletion is
-coarse (service / service path, entity, or entity attribute), not a
-normal per-window update path.
+Once STH-Comet subscriptions are enabled, a drift or revision write appends a
+corrective history row instead of replacing the old row. For Product B, the
+corrective row retains the source window's original `TimeInstant` and carries a
+new `dateRetrieved` send time. Existing Comet history is not deleted, rewritten,
+or purged during the aggregate cutover.
 
 ### 2.10 Scheduling and retry
 
@@ -224,10 +238,10 @@ normal per-window update path.
 | Source stability delay | Process windows whose `startdate` is at or before `now − SOURCE_STABILITY_DELAY_HOURS` (default 3h). Separate from the 72h retry horizon. |
 | Fresh-path catch-up | Each run reprocesses a rolling `startdate` lookback against the per-window state store. Missed or failed targets are picked up on the next run while their window is still inside the lookback. The lookback widens to cover open windows already in state, but only up to `MAX_LOOKBACK_HOURS_*` (72h by default). The fresh path cannot reach a window it never saw once that window ages past the reprocess floor (`REPROCESS_HOURS_*`). |
 | Revision-sweep catch-up | A second catch-up path is independent of the normal `startdate` lookback. It scans each source table by `aggregated_at` to discover older `(interval_min, startdate)` windows whose source rows were inserted or revised at or after the sweep cursor, then sends the current payload for those windows. Because it selects by `aggregated_at` rather than by recency, the sweep also recovers such missed windows: their `aggregated_at` is at or after the cursor, so the sweep discovers and resends them. When the sweep is disabled (`REVISION_SWEEP_ENABLED=false`) it does not run at all — no scan, no resend — and even when enabled it cannot reach windows whose `aggregated_at` predates the cursor's starting point. In those cases, republish the affected windows per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). |
-| Revision cursor | `last_aggregated_at` is a per-product, forward-only watermark: every revision with `aggregated_at` below this value has already been looked at. It lives at the top of that product's state JSON (`state/flow.json` or `state/direction.json`) and advances forward once per run. A failed send does not hold it back; failures are remembered in the per-window state store and retried from there. To re-sweep from an earlier point, edit that product's cursor in its state file. |
-| Retry | Exponential backoff on `5xx` and network errors (1s, 2s, 4s, 8s, 16s). On `429`, the client honors a `Retry-After` header when present and otherwise falls back to the same backoff. Single `401` triggers a forced token refresh and one extra retry. Other `4xx` is fatal for that POST. |
+| Revision cursor | `last_aggregated_at` is a per-product, forward-only watermark: automatic discovery considers revisions at or after this value, while revisions below it are outside the sweep. It lives at the top of that product's state JSON (`state/flow.json` or `state/direction.json`) and advances forward once per run. A failed send does not hold it back; failures are remembered in the per-window state store and retried from there. To re-sweep from an earlier point, edit that product's cursor in its state file. |
+| Retry | Exponential backoff on `5xx` and network errors (1s, 2s, 4s, 8s, 16s). On `429`, the client honors a `Retry-After` header when present and otherwise falls back to the same backoff. Single `401` triggers a forced token refresh and one extra retry within the retry budget (a `401` arriving on the final attempt is not retried further). Other `4xx` is fatal for that write. |
 | Token refresh | OAuth2 client-credentials; proactive on expiry and on `401`. |
-| Logging | One structured line per POST in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE`: `hash` (always hash only), `failure` (default: hash on success, body excerpt on failure), or `full` (always body). |
+| Logging | One structured line per Orion write in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE`: `hash` (always hash only), `failure` (default: hash on success, body excerpt on failure), or `full` (always body). |
 
 Revision cursor comparisons depend on the MySQL session time zone.
 `last_aggregated_at` is stored as a JST ISO timestamp, then formatted
@@ -244,15 +258,28 @@ the lookback's lower bound (i.e., the oldest `startdate` the fresh path
 reprocesses this run). The fresh path owns windows whose `startdate` is
 at or after that bound (the more recent windows, inside the lookback);
 the sweep owns windows whose `startdate` is strictly before it (the
-older windows). No window is processed by both paths in one run, and
-§2.9's payload-hash check would collapse any redundant re-POST in any
-case.
+older windows). No window is processed by both paths in one run.
+§2.9's payload-hash check collapses redundant writes on the fresh path
+and on sweep *retry* items, but a sweep *discovery* force-sends the
+current payload without a hash-skip, so during an initial cursor drain a
+window the fresh path already re-sent can be re-sent once more as an
+additional corrective history row.
+
+When a send-mode Product B revision sweep has no stored cursor, it initializes
+`last_aggregated_at` to the run's start time, truncated to whole seconds. The
+cursor is forward-only thereafter, so the automatic sweep discovers revisions
+at or after that starting point. Use `scripts/resend.py` for deliberate replay
+of older source windows.
 
 ### 2.11 Rollout gates
 
-Use product-specific batch gates to control deployment scope. The
-current target configuration is `TARGET_FLOW_BATCHES=2023,2026` and
-`TARGET_DIRECTION_BATCHES=2023,2026`.
+Use product-specific batch gates to control deployment scope. For Product A,
+`TARGET_FLOW_BATCHES` selects per-place publish targets. For Product B,
+`TARGET_DIRECTION_BATCHES` is a source inclusion and rollout gate: it controls
+which source places can contribute and which included batch supplies the
+oldest targeted device type. It does not select Orion targets; Product B always
+writes the single configured aggregate entity. Empty or unset Product B batches
+remain a safe no-op.
 
 ---
 
@@ -350,10 +377,25 @@ The same column names (`flow_gt_mXX`, `stay_gt_mXX`) are used for both
 
 ## 4. Data Product B: Inter-place flow
 
-Target entities: the **same per-place entities as Product A**
-(`Blesensor.per3600.<N>` for 60-min, `Blesensor.per300.<N>` for 5-min).
-Product B contributes a single `peopleCount_flow` attribute plus the
-shared envelope.
+Product B writes one aggregate package per sendable 60-minute source window to
+one exclusively owned Orion entity. The confirmed default target is:
+
+| Setting | Confirmed default |
+|---|---|
+| `PRODUCT_B_AGGREGATE_ENTITY_ID` | `jp.sendai.Blesensor.flow` |
+| `PRODUCT_B_AGGREGATE_ENTITY_TYPE` | `Blesensor.flow` |
+
+Each write replaces the entity's complete attribute set with `PUT /attrs`.
+Operators must not attach unrelated attributes or other writers to this entity,
+because a Product B write intentionally removes attributes omitted from the new
+source-window package. Product A remains a per-place `POST /attrs` writer and
+does not use this entity.
+
+The aggregate entity must exist before Product B writes it. Validation is
+non-blocking: a missing entity is logged, Product B still attempts the write,
+and the `PUT /attrs` result is authoritative. A missing aggregate entity makes
+that write fail with 404, so fresh environments must bootstrap it explicitly
+with both id and type before enabling Product B.
 
 ### 4.1 Source schema: `direction_metrics2_per_place2_agg`
 
@@ -364,28 +406,28 @@ Load-bearing columns:
 | `startdate` | Source window, format `YYYYMMDD_HHMM`. |
 | `from_group_place_id`, `to_group_place_id` | Source place keys; may also be literal `'ALL'` for aggregate rows. |
 | `from_device_type`, `to_device_type` | Product B device-population filter; both sides must match the selected device type for the interval. |
-| `interval_min` | See §2.1. |
-| `aggregated_at` | DB-stamped timestamp (`DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP`) that moves on every insert or revision. The revision sweep uses it to discover changed `(interval_min, startdate)` windows, then re-fetches the full window's rows to build and send the compositional `peopleCount_flow` payload. It never builds payloads from a partial revised-row set. |
-| `count` | Movement count used inside `peopleCount_flow`. |
+| `interval_min` | Product B accepts exactly `60`. |
+| `aggregated_at` | DB-stamped timestamp (`DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP`) that moves on every insert or revision. The revision sweep uses it to discover changed `(interval_min, startdate)` windows, then re-fetches the full window's rows to build and send the complete aggregate payload. It never builds a payload from a partial revised-row set. |
+| `count` | Movement count used inside dynamic `peopleCount_flow_<N>` attributes. |
 
 ### 4.2 Filtering rules
 
-Per-row order (matches `transform_direction.py`):
+Apply these rules before constructing the aggregate package:
 
-1. Drop if `interval_min ∉ {5, 60}`.
-2. Drop if **either** `from_group_place_id` or `to_group_place_id`
-   matches an `IGNORED_PLACE_PREFIXES` entry. The literal `'ALL'` is
-   exempt; it is a real aggregation key (see §4.3).
-3. Resolve each non-`ALL` side via metadata. The source-side batch
-   (derived from the `sendai2023.` / `sendai202603.` prefix) must
-   match the metadata batch. Drop if either side fails to resolve.
-4. Drop self-loops (`from == to`). Keep cross-batch pairs when both
-   sides resolve.
-5. Select the Product B device type from the oldest active target batch
-   for the interval, then drop if either of `from_device_type` /
-   `to_device_type` disagrees with that selected type. With active 2023
-   and 2026 targets, the selected type is `Pixel3aUT`; with only 2026
-   active targets, it is `M5Stack`.
+1. Keep only `interval_min = 60`. Five-minute direction rows never produce a
+   Product B write, even when `REPROCESS_HOURS_PER300` or
+   `MAX_LOOKBACK_HOURS_PER300` is configured.
+2. Drop a row if either place id matches `IGNORED_PLACE_PREFIXES`. The literal
+   `'ALL'` is exempt because it is a source total key.
+3. Resolve every non-`ALL` endpoint through active metadata. Its source batch
+   must be included by `TARGET_DIRECTION_BATCHES`, and the source-side batch
+   prefix must agree with the metadata batch.
+4. Select the expected device type from the oldest targeted active batch for
+   interval 60. Keep a row only when both device-type fields match it.
+
+Self-loop rows are retained. A surviving `N→N` row is a real movement route,
+not a duplicate to discard. Cross-batch pairs are also valid when both endpoints
+resolve and the row passes the selected device-type filter.
 
 Cross-batch direction pairs are valid Product B observations. The same
 selected device type is used for pairwise rows and `'ALL'` rows so the
@@ -393,155 +435,205 @@ inter-place values and the pre-computed deduplicated totals come from
 the same source device population.
 
 The source table stores parallel pairwise and `'ALL'` rows under both
-`(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every per-place
-target. Mixed `(Pixel3aUT, M5Stack)` pairings do not occur. The
-device-type filter is therefore a required disambiguator, not just a
-cross-batch exclusion.
+`(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every place. Mixed
+`(Pixel3aUT, M5Stack)` pairings do not occur. The device-type filter is a
+required disambiguator, not just a cross-batch exclusion. Adding a batch to
+`TARGET_DIRECTION_BATCHES` can change the oldest selected device type for all
+included places; this city-wide filter is part of the contract.
 
 ### 4.3 Attribute mapping (request body)
 
-One POST per active target per source window. The body is:
+One replace-all write is built for each sendable source window. The body is:
 
 | Attribute | NGSI type | Value source |
 |---|---|---|
-| `identifcation` | `Text` | metadata `identifcation` column (place number as string, e.g. `"105"`) |
 | `dateObservedFrom` | `DateTime` | `startdate` parsed as JST |
-| `dateObservedTo` | `DateTime` | `dateObservedFrom + interval_min` minutes |
+| `dateObservedTo` | `DateTime` | `dateObservedFrom + 60 minutes` |
 | `dateRetrieved` | `DateTime` | now in JST (truncated to whole seconds) |
-| `peopleCount_flow` | `StructuredValue` | see below |
+| `identifcation` | `Text` | exactly `PRODUCT_B_AGGREGATE_ENTITY_ID` |
+| `peopleCount_flow_<N>` | `StructuredValue` | dense movement matrix for emitted place `N` |
 
-The `peopleCount_flow` value, for the entity's own place `N`:
+Each attribute has the metadata object defined in §2.6. There is exactly one
+`identifcation` attribute, its value always equals the configured aggregate
+entity id, and it is included in every package.
+
+#### Candidate and emitted places
+
+After all §4.2 filters, a **candidate place** is a non-`ALL` endpoint of any
+surviving pairwise or total row. A candidate becomes an **emitted place** only
+when both required source totals exist:
+
+- `ALL → N` supplies `peopleCount_flow_<N>.value.from.all`.
+- `N → ALL` supplies `peopleCount_flow_<N>.value.to.all`.
+
+The pipeline does not derive either total by summing pairwise rows. If any
+candidate is missing either required total, the whole window is source-invalid
+and no partial package is written. A place with no surviving source row is not
+a candidate and is absent from the package; Product B does not create sentinel
+or null matrix attributes to fill a fixed roster.
+
+#### Dense movement matrix
+
+For every emitted place `N`, `peopleCount_flow_<N>.value` has this shape. For
+example, with an emitted roster of places 3, 5, and 10,
+`peopleCount_flow_10.value` is:
 
 ```json
 {
-  "from": { "all": <int|null>, "<M>": <int|null>, ... },
-  "to":   { "all": <int|null>, "<M>": <int|null>, ... }
+  "from": { "all": 26, "3": 24, "5": 2, "10": 0 },
+  "to":   { "all": 24, "3": 22, "5": 2, "10": 0 }
 }
 ```
 
-- `from.<M>` = unique BLEID count moving *into* `N` from place `M` in
-  this window. Built from rows where `from_group_place_id` → `M` and
-  `to_group_place_id` → `N`.
-- `to.<M>` = unique BLEID count moving *out of* `N` to place `M` in
-  this window. Built from rows where `from_group_place_id` → `N` and
-  `to_group_place_id` → `M`.
-- `from.all` / `to.all` come from **pre-computed `'ALL'`-keyed rows in
-  the same table**, which already carry the deduplicated unique-BLEID
-  total. The pipeline **must not** sum the pairwise rows to approximate
-  `all`. Specifically:
-  - `peopleCount_flow.from.all` = `count` from rows matching this window
-    and interval where `from_group_place_id = 'ALL'` and
-    `to_group_place_id` resolves to place `N`, with both device-type
-    fields equal to the interval's selected Product B device type.
-  - `peopleCount_flow.to.all` = `count` from rows matching this window
-    and interval where `from_group_place_id` resolves to place `N` and
-    `to_group_place_id = 'ALL'`, with both device-type fields equal to
-    the interval's selected Product B device type.
+The keys under each `from` and `to` are dense over the same emitted-place
+roster: every emitted place number appears once under both sides, plus `"all"`.
+A route with no surviving pairwise row between two emitted places is written as `0`,
+meaning observed zero movement between places proven to be measuring by their
+source totals.
 
-Targets with no surviving observations still receive a payload with
-sentinel `peopleCount_flow = {"from": {"all": null}, "to": {"all":
-null}}` so Comet history remains continuous.
+For a surviving `M→N` row, the count populates `from.<M>` of place `N` and
+`to.<N>` of place `M`. A surviving self-loop `N→N` row populates both
+`from.<N>` and `to.<N>` of place `N`; dense fill includes every emitted
+place's own key even when that self-loop count is `0`.
 
-Because every active target always receives a payload, Product B's
-completion is **fixed-target**: `expected_target_ids` is the
-active-metadata roster snapshotted on the window's first attempt and is
-not expanded from current metadata on retry (a mid-flight metadata
-change logs `window_expected_targets_changed` and keeps the original
-snapshot). This is the deliberate counterpart to Product A's
-observed-target completion (§3.2.1); Product B has no supplemental
-discovery pass and is not affected by the flow-state migration.
+The attribute roster is dynamic. Historical names
+`peopleCount_flow_1` through `peopleCount_flow_28` do not define a fixed range;
+any valid emitted place number becomes an attribute suffix.
 
-**Naming note.** A DB row with `from_group_place_id = 'ALL'` and
-`to_group_place_id` resolving to place `N` populates
-`peopleCount_flow.from.all` for entity `N`, because the JSON `from`
-field is from the perspective of place `N` ("came from all places into
-N"). The DB `to_group_place_id` column names the movement destination,
-not the JSON key.
+#### No-write outcomes and state
 
-### 4.4 Full body example (60-min, single entity)
+| Outcome | Write | State record for the attempt | Event and level | Counter | Run exit |
+|---|---|---|---|---|---|
+| Zero candidate places | none | none | `direction_window_no_payload`, `DEBUG` | `windows_no_payload` | unchanged by this outcome |
+| Any candidate missing `from.all` or `to.all` | none; reject the whole window | none | `direction_window_source_invalid`, `WARNING`, with the window key and both missing-place lists | `windows_source_invalid` | nonzero in send mode |
 
-2024-07-20 10:00-11:00 JST, place 3, entity
-`jp.sendai.Blesensor.per3600.3`. Every attribute carries the same
-`TimeInstant` metadata value (the window start, §2.6); shown in full on
-the first attribute and elided as `{…}` on the rest for readability:
+A sendable window has one expected target id, the configured aggregate entity
+id, and uses the state key `per3600/<startdate>`. Each attempt replaces any
+stored Product B expected-target snapshot with that one id. A 204 response to
+the aggregate `PUT /attrs` marks it `ok` without a follow-up GET.
+
+### 4.4 Full body example
+
+This package represents 2024-07-20 10:00-11:00 JST with emitted places 3 and
+5. Every attribute carries the same `TimeInstant` metadata value; it is shown
+in full on the first attribute and elided as `{…}` on the rest for readability:
 
 ```json
 {
-  "identifcation":    {
-    "type": "Text",
-    "value": "3",
+  "dateObservedFrom": {
+    "type": "DateTime",
+    "value": "2024-07-20T10:00:00+09:00",
     "metadata": {"TimeInstant": {"type": "DateTime", "value": "2024-07-20T10:00:00+09:00"}}
   },
-  "dateObservedFrom": {"type": "DateTime", "value": "2024-07-20T10:00:00+09:00", "metadata": {…}},
   "dateObservedTo":   {"type": "DateTime", "value": "2024-07-20T11:00:00+09:00", "metadata": {…}},
   "dateRetrieved":    {"type": "DateTime", "value": "2024-07-22T13:25:43+09:00", "metadata": {…}},
-  "peopleCount_flow": {
+  "identifcation":    {"type": "Text", "value": "jp.sendai.Blesensor.flow", "metadata": {…}},
+  "peopleCount_flow_3": {
     "type": "StructuredValue",
     "value": {
-      "from": { "all": 85, "2": 24, "4": 31, "5": 12, "7": 8, "13": 5 },
-      "to":   { "all": 82, "2": 22, "4": 28, "5": 14, "7": 7, "13": 4 }
+      "from": {"all": 85, "3": 0, "5": 12},
+      "to":   {"all": 82, "3": 0, "5": 14}
+    },
+    "metadata": {…}
+  },
+  "peopleCount_flow_5": {
+    "type": "StructuredValue",
+    "value": {
+      "from": {"all": 79, "3": 14, "5": 2},
+      "to":   {"all": 77, "3": 12, "5": 2}
     },
     "metadata": {…}
   }
 }
 ```
 
-(The 5-min variant has the same body shape, but on
-`jp.sendai.Blesensor.per300.3` with `dateObservedTo = +300 s`.)
+The `"5": 2` values show the confirmed self-loop rule. No 5-minute Product B
+variant exists.
 
 ---
 
-## 5. Endpoint and example POST
+## 5. Orion endpoints and STH-Comet subscriptions
 
-Both products POST to the same metadata-driven URL:
+### Attribute-write endpoints
 
-```
+Product A updates one metadata-selected per-place entity at a time:
+
+```text
 POST {url_orion_v20_entities}/{metadata.entity_id}/attrs
      ?type={metadata.entity_type}
 ```
 
-Product A and Product B issue separate POSTs to the same entity for the
-same window: A writes its count/occupancy attributes, B writes
-`peopleCount_flow` and `identifcation` / `dateRetrieved`, and the shared
-`dateObserved*` envelope computes identically from both sides.
+Product B replaces the configured aggregate entity's complete attribute set:
 
-### Example curl (Product B, 60-min, place 3)
-
-```sh
-curl -X POST \
-  "${url_orion_v20_entities}/jp.sendai.Blesensor.per3600.3/attrs?type=Blesensor.per3600" \
-  -H "Accept: application/json" \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer ${accessToken}" \
-  -H "Fiware-Service: ${FIWARE_SERVICE}" \
-  -H "Fiware-ServicePath: ${FIWARE_SERVICE_PATH}" \
-  --data @/path/to/payload.json
+```text
+PUT {url_orion_v20_entities}/{PRODUCT_B_AGGREGATE_ENTITY_ID}/attrs
+    ?type={PRODUCT_B_AGGREGATE_ENTITY_TYPE}
 ```
 
-### STH-Comet subscriptions
+Product B dry-run output shows this `PUT /attrs` operation and its full
+aggregate body without mutating Orion.
 
-STH-Comet subscriptions for both products are created after the
-first-ok-wins send policy is deployed and the cron is stopped for
-cutover. Subscription creation uses
-`scripts/create_sth_subscriptions.py`, which reads the private
-`COMET_NOTIFY_URL` from runtime configuration and creates dry-run-first
-Orion subscriptions with:
+Live Product B writes log `put_succeeded` or `put_failed`. Dry-run logs
+`put_succeeded` with `dry_run=true`, so logs never describe a Product B
+replacement as an attribute-update post.
 
-- `notification.attrsFormat: "legacy"`.
-- `options=skipInitialNotification` (URL query parameter on the
-  subscription `POST`, not a body field).
-- `notification.metadata: ["TimeInstant"]`.
-- `subject.condition.notifyOnMetadataChange: true` (placed in the
-  condition, not the notification, so a `TimeInstant`-only change on
-  the trigger attribute still fires the subscription. Without this,
-  two consecutive windows publishing the same trigger value would be
-  silently dropped from Comet history).
-- `subject.condition.attrs` set to a product-exclusive attribute so
-  the peer product's normal updates do not fire this subscription and
-  corrupt Comet history with the wrong window's values: Product A
-  uses `peopleCount_immedate`, Product B uses `peopleCount_flow`.
-  Both are written only by their owning product, so each subscription
-  fires only on its own pipeline's updates.
-- `notification.attrs` equal to the owning product's attributes:
-  Product A is the §3.3 list; Product B is `dateObservedFrom`,
-  `dateObservedTo`, `peopleCount_flow`.
+Orion current state on the Product B aggregate entity is **last written**, not
+necessarily the newest source window. A revision write for an older window can
+remain current until another write occurs. Consumers must use
+`dateObservedFrom` and `dateObservedTo` to identify the represented window.
+
+Product A keeps one subscription selecting `idPattern: ".*"` for
+`Blesensor.per300` and `Blesensor.per3600`, triggering on
+`peopleCount_immedate`, projecting the §3.3 attributes in legacy format, and
+requesting `TimeInstant` metadata with metadata-change notifications enabled.
+
+### Product B STH-Comet subscription
+
+The Product B subscription targets only the configured aggregate entity and
+notifies the full current attribute set. Its contract is:
+
+```json
+{
+  "description": "Product B aggregate STH-Comet history",
+  "subject": {
+    "entities": [{
+      "id": "<PRODUCT_B_AGGREGATE_ENTITY_ID>",
+      "type": "<PRODUCT_B_AGGREGATE_ENTITY_TYPE>"
+    }],
+    "condition": {
+      "attrs": ["dateRetrieved"],
+      "notifyOnMetadataChange": true
+    }
+  },
+  "notification": {
+    "http": {"url": "<COMET_NOTIFY_URL>"},
+    "attrsFormat": "legacy",
+    "metadata": ["TimeInstant"]
+  }
+}
+```
+
+`subject.entities` uses exact `id` and `type`, not `idPattern`.
+`notification.attrs` is omitted, not set to an empty list, so new dynamic
+`peopleCount_flow_<N>` names can be forwarded without editing the subscription.
+For idempotency, the matcher also accepts an existing subscription whose
+`notification.attrs` is `[]`, because Orion treats that as the same
+all-attribute notification shape.
+Shape matching also requires the new description prefix and the configured
+notification URL; an old per-place Product B subscription or a subscription
+routed to a stale URL is not a match.
+
+Subscription creation keeps `options=skipInitialNotification` when
+`STH_SUBSCRIPTION_SKIP_INITIAL=true`. The body contains no `throttling` field.
+
+The all-attribute subscription is safe only because Product B exclusively owns
+the entity and replaces all attributes on every write.
+
+Neither product's subscription sets `throttling`; per-subscription throttling
+can silently discard burst notifications, including Product A bursts and
+Product B backlog or revision writes.
+
+Revision writes rebuild the complete Product B package from the full source
+window and use `PUT /attrs` with the original `TimeInstant` and a new
+`dateRetrieved`. STH-Comet therefore appends corrective rows instead of
+rewriting prior history.

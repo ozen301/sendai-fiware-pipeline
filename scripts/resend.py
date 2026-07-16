@@ -26,6 +26,7 @@ from sendai_pipeline.metadata import (
 )
 from sendai_pipeline.run_direction import (
     JST,
+    RunDirectionSettings,
 )
 from sendai_pipeline.run_direction import (
     _format_sql_window_bound as direction_sql_bound,
@@ -87,11 +88,17 @@ class ResendPlan:
     windows: tuple[str, ...]
     interval_metadata: dict[tuple[int, int], SensorPlace]
     source_max_imputation_tier: int | None = None
+    direction_settings: RunDirectionSettings | None = None
 
     @property
     def expected_target_ids(self) -> list[str]:
         """Return the entity ids expected for each requested source window."""
         return [place.entity_id for place in self.interval_metadata.values()]
+
+    @property
+    def target_count(self) -> int:
+        """Return the number of Orion targets written per source window."""
+        return 1 if self.product == "direction" else len(self.expected_target_ids)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -132,6 +139,19 @@ def main(argv: list[str] | None = None) -> int:
 def _build_plan(args: argparse.Namespace) -> ResendPlan:
     if args.place and args.entity_id:
         raise ResendConfigError("--place and --entity-id are mutually exclusive")
+    if args.product == "direction":
+        if args.place:
+            raise ResendConfigError(
+                "--place is not valid for aggregate direction resend"
+            )
+        if args.entity_id:
+            raise ResendConfigError(
+                "--entity-id is not valid for aggregate direction resend"
+            )
+        if args.interval_min == 5:
+            raise ResendConfigError(
+                "aggregate direction resend only supports --interval-min 60"
+            )
     interval_min = _resolve_interval_min(args)
     if args.product == "direction" and args.max_imputation_tier is not None:
         raise ResendConfigError("--max-imputation-tier is only valid for flow")
@@ -189,6 +209,9 @@ def _build_plan(args: argparse.Namespace) -> ResendPlan:
         source_max_imputation_tier=(
             source_max_imputation_tier if args.product == "flow" else None
         ),
+        direction_settings=(
+            RunDirectionSettings.from_env() if args.product == "direction" else None
+        ),
     )
 
 
@@ -216,6 +239,8 @@ def _resolve_interval_min(args: argparse.Namespace) -> int:
             cannot be inferred, or if the ids span multiple intervals.
     """
     explicit_interval = args.interval_min
+    if args.product == "direction" and explicit_interval is None:
+        return 60
     entity_ids = tuple(args.entity_id)
     inferred_intervals = _intervals_from_entity_ids(entity_ids)
 
@@ -290,20 +315,24 @@ def _intervals_from_entity_ids(entity_ids: Iterable[str]) -> dict[str, int | Non
 
 def _dry_run(plan: ResendPlan) -> int:
     _log_requested(plan)
-    target_count = len(plan.expected_target_ids)
+    target_count = plan.target_count
     for startdate in plan.windows:
         window_key = _window_key(plan.product, plan.interval_min, startdate)
+        write_plan = (
+            "would_put=1"
+            if plan.product == "direction"
+            else f"would_post={target_count}"
+        )
         print(
             f"DRY-RUN: would resend {plan.product} {window_key} "
-            f"(target_count={target_count}, skipped_by_hash=0, "
-            f"would_post={target_count})"
+            f"(target_count={target_count}, skipped_by_hash=0, {write_plan})"
         )
         _log_window_processed(
             plan,
             window_key=window_key,
             rows=0,
-            posts_ok=0,
-            posts_failed=0,
+            writes_ok=0,
+            writes_failed=0,
             rows_dropped=0,
             count_skipped=0,
             count_would_create=target_count,
@@ -312,8 +341,8 @@ def _dry_run(plan: ResendPlan) -> int:
     _log_summary(
         plan,
         windows_seen=len(plan.windows),
-        posts_ok=0,
-        posts_failed=0,
+        writes_ok=0,
+        writes_failed=0,
         windows_partial=0,
         windows_complete=0,
     )
@@ -323,9 +352,11 @@ def _dry_run(plan: ResendPlan) -> int:
 def _send_resend(plan: ResendPlan) -> int:
     run_started_at = datetime.now(JST)
     _log_requested(plan)
-    posts_ok = 0
-    posts_failed = 0
+    writes_ok = 0
+    writes_failed = 0
     windows_empty = 0
+    windows_no_payload = 0
+    windows_source_invalid = 0
     windows_gc = 0
     run_windows_partial = 0
     run_windows_complete = 0
@@ -370,21 +401,33 @@ def _send_resend(plan: ResendPlan) -> int:
                     state_store=store,
                     filter_settings=filter_settings,
                     counts=counts,
-                    persist_each_target=False,
+                    transformed_at=run_started_at,
                 )
-                posts_ok += counts.posts_ok
-                posts_failed += counts.posts_failed
+                if plan.product == "flow":
+                    writes_ok += counts.posts_ok
+                    writes_failed += counts.posts_failed
+                else:
+                    writes_ok += counts.puts_ok
+                    writes_failed += counts.puts_failed
+                    windows_no_payload += counts.windows_no_payload
+                    windows_source_invalid += counts.windows_source_invalid
                 run_windows_partial += counts.windows_partial
                 run_windows_complete += counts.windows_complete
                 _log_window_processed(
                     plan,
                     window_key=window_key,
                     rows=len(rows),
-                    posts_ok=counts.posts_ok,
-                    posts_failed=counts.posts_failed,
+                    writes_ok=(
+                        counts.posts_ok if plan.product == "flow" else counts.puts_ok
+                    ),
+                    writes_failed=(
+                        counts.posts_failed
+                        if plan.product == "flow"
+                        else counts.puts_failed
+                    ),
                     rows_dropped=counts.rows_dropped,
                     count_skipped=0,
-                    count_would_create=len(plan.expected_target_ids),
+                    count_would_create=plan.target_count,
                     dry_run=False,
                 )
                 counter += 1
@@ -407,14 +450,16 @@ def _send_resend(plan: ResendPlan) -> int:
     _log_summary(
         plan,
         windows_seen=len(plan.windows),
-        posts_ok=posts_ok,
-        posts_failed=posts_failed,
+        writes_ok=writes_ok,
+        writes_failed=writes_failed,
         windows_empty=windows_empty,
+        windows_no_payload=windows_no_payload,
+        windows_source_invalid=windows_source_invalid,
         windows_gc=windows_gc,
         windows_partial=run_windows_partial,
         windows_complete=run_windows_complete,
     )
-    return 0 if posts_failed == 0 else 1
+    return 0 if writes_failed == 0 and windows_source_invalid == 0 else 1
 
 
 def _abort_on_dead_letter_windows(
@@ -528,24 +573,40 @@ def _process_window(
     state_store: WindowStateStore,
     filter_settings: FilterSettings,
     counts: Any,
-    persist_each_target: bool,
+    transformed_at: datetime,
 ) -> None:
-    process = (
-        process_flow_window if plan.product == "flow" else process_direction_window
-    )
-    process(
+    if plan.product == "flow":
+        process_flow_window(
+            window_key,
+            interval_min=plan.interval_min,
+            startdate=startdate,
+            rows_for_window=rows,
+            orion=orion,
+            state_store=state_store,
+            filter_settings=filter_settings,
+            interval_metadata=plan.interval_metadata,
+            expected_target_ids=plan.expected_target_ids,
+            counts=counts,
+            force_resend=plan.force,
+            persist_each_target=False,
+        )
+        return
+
+    if plan.direction_settings is None:
+        raise ResendConfigError("direction resend requires aggregate settings")
+    process_direction_window(
         window_key,
         interval_min=plan.interval_min,
         startdate=startdate,
         rows_for_window=rows,
         orion=orion,
         state_store=state_store,
+        settings=plan.direction_settings,
         filter_settings=filter_settings,
         interval_metadata=plan.interval_metadata,
-        expected_target_ids=plan.expected_target_ids,
         counts=counts,
+        transformed_at=transformed_at,
         force_resend=plan.force,
-        persist_each_target=persist_each_target,
     )
 
 
@@ -738,7 +799,7 @@ def _log_requested(plan: ResendPlan) -> None:
             "source_window_end": plan.to_window,
             "reason": plan.reason,
             "dry_run": not plan.send,
-            "count_expected": len(plan.expected_target_ids),
+            "count_expected": plan.target_count,
         },
     )
 
@@ -748,13 +809,18 @@ def _log_window_processed(
     *,
     window_key: str,
     rows: int,
-    posts_ok: int,
-    posts_failed: int,
+    writes_ok: int,
+    writes_failed: int,
     rows_dropped: int,
     count_skipped: int,
     count_would_create: int,
     dry_run: bool,
 ) -> None:
+    write_counts = (
+        {"puts_ok": writes_ok, "puts_failed": writes_failed}
+        if plan.product == "direction"
+        else {"posts_ok": writes_ok, "posts_failed": writes_failed}
+    )
     logger.info(
         "resend window processed",
         extra={
@@ -764,8 +830,7 @@ def _log_window_processed(
             "window": window_key,
             "reason": plan.reason,
             "rows": rows,
-            "posts_ok": posts_ok,
-            "posts_failed": posts_failed,
+            **write_counts,
             "rows_dropped": rows_dropped,
             "count_skipped": count_skipped,
             "count_would_create": count_would_create,
@@ -791,13 +856,28 @@ def _log_summary(
     plan: ResendPlan,
     *,
     windows_seen: int,
-    posts_ok: int,
-    posts_failed: int,
+    writes_ok: int,
+    writes_failed: int,
     windows_partial: int,
     windows_complete: int,
     windows_empty: int = 0,
     windows_gc: int = 0,
+    windows_no_payload: int = 0,
+    windows_source_invalid: int = 0,
 ) -> None:
+    write_counts = (
+        {"puts_ok": writes_ok, "puts_failed": writes_failed}
+        if plan.product == "direction"
+        else {"posts_ok": writes_ok, "posts_failed": writes_failed}
+    )
+    direction_outcomes = (
+        {
+            "windows_no_payload": windows_no_payload,
+            "windows_source_invalid": windows_source_invalid,
+        }
+        if plan.product == "direction"
+        else {}
+    )
     logger.info(
         "resend summary",
         extra={
@@ -805,8 +885,8 @@ def _log_summary(
             "product": plan.product,
             "interval_min": plan.interval_min,
             "windows_seen": windows_seen,
-            "posts_ok": posts_ok,
-            "posts_failed": posts_failed,
+            **write_counts,
+            **direction_outcomes,
             "windows_empty": windows_empty,
             "windows_gc": windows_gc,
             "windows_partial": windows_partial,

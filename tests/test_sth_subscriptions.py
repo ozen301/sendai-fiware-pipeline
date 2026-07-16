@@ -1,4 +1,5 @@
 import json
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -9,9 +10,9 @@ from sendai_pipeline.logging_setup import _ALLOWED_EXTRA_KEYS
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
     PRODUCT_A_TRIGGER_ATTRS,
-    PRODUCT_B_HISTORY_ATTRS,
-    PRODUCT_B_TRIGGER_ATTRS,
+    PRODUCT_B_STABLE_WRITE_ATTRS,
     StHSubscriptionError,
+    StHSubscriptionResult,
     StHSubscriptionSettings,
     build_product_a_subscription_body,
     build_product_b_subscription_body,
@@ -25,6 +26,9 @@ from sendai_pipeline.sth_subscriptions import (
 )
 
 JST = timezone(timedelta(hours=9))
+AGGREGATE_ENTITY_ID = "custom.aggregate.entity"
+AGGREGATE_ENTITY_TYPE = "Custom.aggregate.type"
+COMET_NOTIFY_URL = "http://internal-comet.example/notify"
 
 
 class FakeAuth:
@@ -84,29 +88,91 @@ class FakeSession:
 def settings(**overrides: Any) -> StHSubscriptionSettings:
     values: dict[str, Any] = {
         "base_url": "https://example.test",
-        "comet_notify_url": "http://internal-comet.example/notify",
+        "comet_notify_url": COMET_NOTIFY_URL,
     }
     values.update(overrides)
     return StHSubscriptionSettings(**values)
 
 
-def test_build_product_a_subscription_triggers_on_exclusive_attribute() -> None:
+def product_b_subscription(
+    *,
+    subscription_id: str = "aggregate-sub",
+    description: str = "Product B aggregate STH-Comet history set at earlier",
+    entity_id: str = AGGREGATE_ENTITY_ID,
+    entity_type: str = AGGREGATE_ENTITY_TYPE,
+    notify_url: str = COMET_NOTIFY_URL,
+) -> dict[str, Any]:
+    return {
+        "id": subscription_id,
+        "description": description,
+        "subject": {
+            "entities": [{"id": entity_id, "type": entity_type}],
+            "condition": {
+                "attrs": ["dateRetrieved"],
+                "notifyOnMetadataChange": True,
+            },
+        },
+        "notification": {
+            "http": {"url": notify_url},
+            "attrsFormat": "legacy",
+            "metadata": ["TimeInstant"],
+        },
+    }
+
+
+def remove_nested_field(body: dict[str, Any], path: tuple[str | int, ...]) -> None:
+    current: Any = body
+    for key in path[:-1]:
+        current = current[key]
+    del current[path[-1]]
+
+
+def create_product_b_with_existing(
+    existing: dict[str, Any],
+) -> tuple[StHSubscriptionResult, FakeSession]:
+    fake_session = FakeSession(
+        post_responses=[
+            FakeResponse(201, headers={"Location": "/subscriptions/correct-sub"})
+        ],
+        get_responses=[FakeResponse(200, json_body=[existing])],
+    )
+    result = create_product_b_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+    return result, fake_session
+
+
+def test_build_product_a_subscription_preserves_shape_without_throttling() -> None:
     body = build_product_a_subscription_body(
         settings(),
         now=datetime(2026, 5, 24, 12, 30, tzinfo=JST),
     )
 
-    assert body["subject"]["entities"] == [
-        {"idPattern": ".*", "type": "Blesensor.per300"},
-        {"idPattern": ".*", "type": "Blesensor.per3600"},
-    ]
-    assert body["subject"]["condition"]["attrs"] == list(PRODUCT_A_TRIGGER_ATTRS)
-    assert body["subject"]["condition"]["attrs"] == ["peopleCount_immedate"]
-    assert body["notification"]["attrsFormat"] == "legacy"
-    assert body["notification"]["attrs"] == list(PRODUCT_A_HISTORY_ATTRS)
-    assert body["notification"]["metadata"] == ["TimeInstant"]
-    assert body["subject"]["condition"]["notifyOnMetadataChange"] is True
-    assert "notifyOnMetadataChange" not in body["notification"]
+    assert body == {
+        "description": "Product A STH-Comet history set at 2026-05-24T12:30:00+09:00",
+        "subject": {
+            "entities": [
+                {"idPattern": ".*", "type": "Blesensor.per300"},
+                {"idPattern": ".*", "type": "Blesensor.per3600"},
+            ],
+            "condition": {
+                "attrs": ["peopleCount_immedate"],
+                "notifyOnMetadataChange": True,
+            },
+        },
+        "notification": {
+            "http": {"url": COMET_NOTIFY_URL},
+            "attrsFormat": "legacy",
+            "attrs": list(PRODUCT_A_HISTORY_ATTRS),
+            "metadata": ["TimeInstant"],
+        },
+    }
 
 
 def test_redacted_subscription_json_omits_private_notify_url() -> None:
@@ -130,7 +196,7 @@ def test_settings_from_env_uses_private_notify_url_and_defaults() -> None:
     assert parsed.service_path == "/"
     assert parsed.dry_run is True
     assert parsed.skip_initial_notification is True
-    assert parsed.throttling_seconds == 0
+    assert "throttling_seconds" not in {field.name for field in fields(parsed)}
 
 
 def test_settings_from_env_accepts_subscription_overrides() -> None:
@@ -141,7 +207,6 @@ def test_settings_from_env_accepts_subscription_overrides() -> None:
             "FIWARE_SERVICE": "service",
             "FIWARE_SERVICE_PATH": "/path",
             "STH_SUBSCRIPTION_EXPIRES": "2030-01-01T00:00:00Z",
-            "STH_SUBSCRIPTION_THROTTLING_SECONDS": "30",
             "STH_SUBSCRIPTION_SKIP_INITIAL": "false",
         }
     )
@@ -149,13 +214,74 @@ def test_settings_from_env_accepts_subscription_overrides() -> None:
     assert parsed.service == "service"
     assert parsed.service_path == "/path"
     assert parsed.expires == "2030-01-01T00:00:00Z"
-    assert parsed.throttling_seconds == 30
     assert parsed.skip_initial_notification is False
+
+
+def test_build_product_a_subscription_ignores_removed_legacy_throttling_override() -> (
+    None
+):
+    parsed = StHSubscriptionSettings.from_env(
+        {
+            "FIWARE_BASE_URL": "https://example.test",
+            "COMET_NOTIFY_URL": COMET_NOTIFY_URL,
+            "STH_SUBSCRIPTION_THROTTLING_SECONDS": "30",
+        }
+    )
+
+    body = build_product_a_subscription_body(
+        parsed,
+        now=datetime(2026, 5, 24, 12, 30, tzinfo=JST),
+    )
+
+    # The removed shared knob deliberately changes configured Product A bodies only
+    # by omitting throttling; its selector, trigger, projection, and metadata stay.
+    assert "throttling" not in body
+    assert body["subject"]["entities"] == [
+        {"idPattern": ".*", "type": "Blesensor.per300"},
+        {"idPattern": ".*", "type": "Blesensor.per3600"},
+    ]
+    assert body["subject"]["condition"] == {
+        "attrs": list(PRODUCT_A_TRIGGER_ATTRS),
+        "notifyOnMetadataChange": True,
+    }
+    assert body["notification"]["attrs"] == list(PRODUCT_A_HISTORY_ATTRS)
+    assert body["notification"]["metadata"] == ["TimeInstant"]
 
 
 def test_settings_from_env_requires_comet_notify_url() -> None:
     with pytest.raises(StHSubscriptionError, match="COMET_NOTIFY_URL"):
         StHSubscriptionSettings.from_env({"FIWARE_BASE_URL": "https://example.test"})
+
+
+def test_settings_from_env_skips_product_b_validation_when_not_required() -> None:
+    # A Product-A-only run passes require_product_b=False, so a malformed
+    # PRODUCT_B_AGGREGATE_* value is neither read nor validated; the aggregate
+    # fields keep their defaults instead of failing an unrelated Product A run.
+    parsed = StHSubscriptionSettings.from_env(
+        {
+            "FIWARE_BASE_URL": "https://example.test",
+            "COMET_NOTIFY_URL": COMET_NOTIFY_URL,
+            "PRODUCT_B_AGGREGATE_ENTITY_ID": " malformed",
+            "PRODUCT_B_AGGREGATE_ENTITY_TYPE": "",
+        },
+        require_product_b=False,
+    )
+
+    assert parsed.product_b_aggregate_entity_id == "jp.sendai.Blesensor.flow"
+    assert parsed.product_b_aggregate_entity_type == "Blesensor.flow"
+
+
+def test_settings_from_env_validates_product_b_when_required() -> None:
+    # The default (require_product_b=True) still rejects a malformed value, so
+    # a run that creates the Product B subscription cannot use bad config.
+    with pytest.raises(StHSubscriptionError, match="PRODUCT_B_AGGREGATE_ENTITY_ID"):
+        StHSubscriptionSettings.from_env(
+            {
+                "FIWARE_BASE_URL": "https://example.test",
+                "COMET_NOTIFY_URL": COMET_NOTIFY_URL,
+                "PRODUCT_B_AGGREGATE_ENTITY_ID": " malformed",
+            }
+        )
 
 
 def test_create_product_a_subscription_dry_run_does_not_post(
@@ -195,7 +321,6 @@ def test_create_product_a_subscription_posts_body_and_skip_initial_param() -> No
             dry_run=False,
             service="svc",
             service_path="/",
-            throttling_seconds=30,
             expires="2030-01-01T00:00:00Z",
         ),
         auth=fake_auth,
@@ -221,7 +346,7 @@ def test_create_product_a_subscription_posts_body_and_skip_initial_param() -> No
     assert body["notification"]["http"]["url"] == "http://internal-comet.example/notify"
     assert body["notification"]["metadata"] == ["TimeInstant"]
     assert body["expires"] == "2030-01-01T00:00:00Z"
-    assert body["throttling"] == 30
+    assert "throttling" not in body
 
 
 def test_create_product_a_subscription_skips_when_subscription_already_exists() -> None:
@@ -412,33 +537,49 @@ def test_create_product_a_subscription_reports_failure_without_secret_url(
     assert "internal-comet" not in messages[0]
 
 
-def test_build_product_b_subscription_uses_people_count_flow_attrs() -> None:
+def test_build_product_b_subscription_uses_exact_aggregate_shape() -> None:
     body = build_product_b_subscription_body(
-        settings(),
+        settings(
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
         now=datetime(2026, 5, 25, 12, 30, tzinfo=JST),
     )
 
-    assert body["subject"]["entities"] == [
-        {"idPattern": ".*", "type": "Blesensor.per300"},
-        {"idPattern": ".*", "type": "Blesensor.per3600"},
-    ]
-    assert body["subject"]["condition"]["attrs"] == list(PRODUCT_B_TRIGGER_ATTRS)
-    assert body["subject"]["condition"]["attrs"] == ["peopleCount_flow"]
-    assert body["notification"]["attrsFormat"] == "legacy"
-    assert body["notification"]["attrs"] == list(PRODUCT_B_HISTORY_ATTRS)
-    assert "peopleCount_flow" in body["notification"]["attrs"]
-    assert body["notification"]["metadata"] == ["TimeInstant"]
-    assert body["subject"]["condition"]["notifyOnMetadataChange"] is True
-    assert "notifyOnMetadataChange" not in body["notification"]
-    assert body["description"].startswith("Product B STH-Comet history")
+    assert body == {
+        "description": (
+            "Product B aggregate STH-Comet history set at 2026-05-25T12:30:00+09:00"
+        ),
+        "subject": {
+            "entities": [{"id": AGGREGATE_ENTITY_ID, "type": AGGREGATE_ENTITY_TYPE}],
+            "condition": {
+                "attrs": ["dateRetrieved"],
+                "notifyOnMetadataChange": True,
+            },
+        },
+        "notification": {
+            "http": {"url": COMET_NOTIFY_URL},
+            "attrsFormat": "legacy",
+            "metadata": ["TimeInstant"],
+        },
+    }
 
 
 def test_redacted_product_b_subscription_json_omits_private_notify_url() -> None:
-    rendered = redacted_product_b_subscription_json(settings())
+    rendered = redacted_product_b_subscription_json(
+        settings(
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        )
+    )
 
     assert "internal-comet.example" not in rendered
     assert "<COMET_NOTIFY_URL>" in rendered
-    assert '"Product B STH-Comet history' in rendered
+    assert '"Product B aggregate STH-Comet history' in rendered
+    assert f'"id": "{AGGREGATE_ENTITY_ID}"' in rendered
+    assert '"idPattern"' not in rendered
+    assert "attrs" not in json.loads(rendered)["notification"]
+    assert '"throttling"' not in rendered
 
 
 def test_redacted_subscription_json_remains_product_a_for_back_compat() -> None:
@@ -481,7 +622,11 @@ def test_create_product_b_subscription_posts_body_and_skip_initial_param() -> No
     )
 
     result = create_product_b_sth_subscription(
-        settings=settings(dry_run=False),
+        settings=settings(
+            dry_run=False,
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
         auth=FakeAuth(),
         session=fake_session,
     )
@@ -490,8 +635,20 @@ def test_create_product_b_subscription_posts_body_and_skip_initial_param() -> No
     assert result.subscription_ids == ("sub-b",)
     [post] = fake_session.posts
     body = json.loads(post["data"])
-    assert body["notification"]["attrs"] == list(PRODUCT_B_HISTORY_ATTRS)
-    assert body["description"].startswith("Product B STH-Comet history")
+    assert body["subject"] == {
+        "entities": [{"id": AGGREGATE_ENTITY_ID, "type": AGGREGATE_ENTITY_TYPE}],
+        "condition": {
+            "attrs": ["dateRetrieved"],
+            "notifyOnMetadataChange": True,
+        },
+    }
+    assert body["notification"] == {
+        "http": {"url": COMET_NOTIFY_URL},
+        "attrsFormat": "legacy",
+        "metadata": ["TimeInstant"],
+    }
+    assert body["description"].startswith("Product B aggregate STH-Comet history")
+    assert "throttling" not in body
 
 
 def test_create_product_b_subscription_does_not_skip_when_only_product_a_exists() -> (
@@ -539,9 +696,7 @@ def test_create_product_b_subscription_does_not_skip_when_only_product_a_exists(
     assert result.subscription_ids == ("sub-b",)
 
 
-def test_create_product_a_subscription_does_not_skip_when_only_product_b_exists() -> (
-    None
-):
+def test_create_product_a_ignores_legacy_product_b_subscription() -> None:
     fake_session = FakeSession(
         post_responses=[
             FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-a"}),
@@ -559,13 +714,17 @@ def test_create_product_a_subscription_does_not_skip_when_only_product_b_exists(
                                 {"idPattern": ".*", "type": "Blesensor.per3600"},
                             ],
                             "condition": {
-                                "attrs": list(PRODUCT_B_TRIGGER_ATTRS),
+                                "attrs": ["peopleCount_flow"],
                                 "notifyOnMetadataChange": True,
                             },
                         },
                         "notification": {
                             "attrsFormat": "legacy",
-                            "attrs": list(PRODUCT_B_HISTORY_ATTRS),
+                            "attrs": [
+                                "dateObservedFrom",
+                                "dateObservedTo",
+                                "peopleCount_flow",
+                            ],
                             "metadata": ["TimeInstant"],
                         },
                     }
@@ -584,30 +743,227 @@ def test_create_product_a_subscription_does_not_skip_when_only_product_b_exists(
     assert result.subscription_ids == ("sub-a",)
 
 
-def test_create_product_b_subscription_skips_when_already_exists() -> None:
+def test_create_product_a_ignores_exclusive_current_product_b_subscription() -> None:
     fake_session = FakeSession(
-        get_responses=[
-            FakeResponse(
-                200,
-                json_body=[
-                    {
-                        "id": "existing-product-b",
-                        "description": "Product B STH-Comet history set at ...",
-                    }
-                ],
-            )
+        post_responses=[
+            FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-a"}),
         ],
+        get_responses=[FakeResponse(200, json_body=[product_b_subscription()])],
     )
 
-    result = create_product_b_sth_subscription(
+    result = create_product_a_sth_subscription(
         settings=settings(dry_run=False),
         auth=FakeAuth(),
         session=fake_session,
     )
 
+    assert result.created == 1
+    assert result.subscription_ids == ("sub-a",)
+
+
+def test_create_product_b_subscription_skips_complete_shape_with_exact_url() -> None:
+    result, fake_session = create_product_b_with_existing(product_b_subscription())
+
     assert result.skipped == 1
-    assert result.subscription_ids == ("existing-product-b",)
+    assert result.subscription_ids == ("aggregate-sub",)
     assert fake_session.posts == []
+
+
+def test_create_product_b_subscription_skips_when_notification_attrs_empty() -> None:
+    existing = product_b_subscription()
+    existing["notification"]["attrs"] = []
+
+    result, fake_session = create_product_b_with_existing(existing)
+
+    assert result.skipped == 1
+    assert result.subscription_ids == ("aggregate-sub",)
+    assert fake_session.posts == []
+
+
+@pytest.mark.parametrize(
+    "missing_path",
+    [
+        pytest.param(("description",), id="description"),
+        pytest.param(("subject",), id="subject"),
+        pytest.param(("subject", "entities"), id="entities"),
+        pytest.param(("subject", "entities", 0, "id"), id="entity-id"),
+        pytest.param(("subject", "entities", 0, "type"), id="entity-type"),
+        pytest.param(("subject", "condition"), id="condition"),
+        pytest.param(("subject", "condition", "attrs"), id="condition-attrs"),
+        pytest.param(
+            ("subject", "condition", "notifyOnMetadataChange"),
+            id="metadata-change",
+        ),
+        pytest.param(("notification",), id="notification"),
+        pytest.param(("notification", "http"), id="http"),
+        pytest.param(("notification", "http", "url"), id="notification-url"),
+        pytest.param(("notification", "attrsFormat"), id="format"),
+        pytest.param(("notification", "metadata"), id="metadata"),
+    ],
+)
+def test_create_product_b_subscription_creates_when_required_field_missing(
+    missing_path: tuple[str | int, ...],
+) -> None:
+    existing = product_b_subscription()
+    remove_nested_field(existing, missing_path)
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == ("correct-sub",)
+
+
+@pytest.mark.parametrize(
+    "extra_attrs",
+    [
+        pytest.param(["dateRetrieved", "peopleCount_flow_1"], id="trigger-attrs"),
+        pytest.param(["dateRetrieved", "dateObservedFrom"], id="trigger-scalar"),
+    ],
+)
+def test_create_product_b_subscription_creates_with_extra_trigger_attrs(
+    extra_attrs: list[str],
+) -> None:
+    existing = product_b_subscription()
+    existing["subject"]["condition"]["attrs"] = extra_attrs
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+@pytest.mark.parametrize(
+    "entities",
+    [
+        pytest.param(
+            [{"id": "wrong.aggregate.entity", "type": AGGREGATE_ENTITY_TYPE}],
+            id="wrong-id",
+        ),
+        pytest.param(
+            [{"id": AGGREGATE_ENTITY_ID, "type": "Wrong.aggregate.type"}],
+            id="wrong-type",
+        ),
+        pytest.param(
+            [
+                {
+                    "id": AGGREGATE_ENTITY_ID,
+                    "idPattern": ".*",
+                    "type": AGGREGATE_ENTITY_TYPE,
+                }
+            ],
+            id="id-pattern",
+        ),
+        pytest.param(
+            [
+                {"id": AGGREGATE_ENTITY_ID, "type": AGGREGATE_ENTITY_TYPE},
+                {"id": "extra.aggregate.entity", "type": AGGREGATE_ENTITY_TYPE},
+            ],
+            id="extra-entity",
+        ),
+    ],
+)
+def test_create_product_b_subscription_creates_with_non_exact_entity_selector(
+    entities: list[dict[str, str]],
+) -> None:
+    existing = product_b_subscription()
+    existing["subject"]["entities"] = entities
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+def test_create_product_b_subscription_creates_when_notification_attrs_present() -> (
+    None
+):
+    existing = product_b_subscription()
+    existing["notification"]["attrs"] = ["dateRetrieved"]
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+def test_create_product_b_subscription_creates_with_wrong_attrs_format() -> None:
+    existing = product_b_subscription()
+    existing["notification"]["attrsFormat"] = "normalized"
+
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+def test_create_product_b_subscription_creates_with_metadata_change_disabled() -> None:
+    existing = product_b_subscription()
+    existing["subject"]["condition"]["notifyOnMetadataChange"] = False
+
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+def test_create_product_b_subscription_creates_with_extra_notification_metadata() -> (
+    None
+):
+    existing = product_b_subscription()
+    existing["notification"]["metadata"] = ["TimeInstant", "unitCode"]
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+def test_create_product_b_subscription_creates_with_wrong_notification_url() -> None:
+    existing = product_b_subscription(notify_url="http://stale-comet.example/notify")
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+def test_create_product_b_subscription_creates_for_old_prefix_and_shape() -> None:
+    old_subscription = {
+        "id": "old-product-b",
+        "description": "Product B STH-Comet history set at earlier",
+        "subject": {
+            "entities": [
+                {"idPattern": ".*", "type": "Blesensor.per300"},
+                {"idPattern": ".*", "type": "Blesensor.per3600"},
+            ],
+            "condition": {
+                "attrs": ["peopleCount_flow"],
+                "notifyOnMetadataChange": True,
+            },
+        },
+        "notification": {
+            "http": {"url": COMET_NOTIFY_URL},
+            "attrsFormat": "legacy",
+            "attrs": [
+                "dateObservedFrom",
+                "dateObservedTo",
+                "peopleCount_flow",
+            ],
+            "metadata": ["TimeInstant"],
+        },
+    }
+    result, _fake_session = create_product_b_with_existing(old_subscription)
+
+    assert result.created == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == ("correct-sub",)
+
+
+def test_create_product_b_subscription_creates_with_old_prefix_on_new_shape() -> None:
+    existing = product_b_subscription(
+        description="Product B STH-Comet history set at earlier"
+    )
+
+    result, _fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == ("correct-sub",)
 
 
 def test_create_product_b_aborts_when_product_a_uses_stale_shared_trigger(
@@ -623,10 +979,12 @@ def test_create_product_b_aborts_when_product_a_uses_stale_shared_trigger(
                         "description": "Product A STH-Comet history set at ...",
                         "subject": {
                             "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
+                                {
+                                    "idPattern": ".*",
+                                    "type": AGGREGATE_ENTITY_TYPE,
+                                }
                             ],
-                            "condition": {"attrs": ["dateObservedFrom"]},
+                            "condition": {"attrs": ["identifcation"]},
                         },
                         "notification": {
                             "attrsFormat": "legacy",
@@ -642,7 +1000,11 @@ def test_create_product_b_aborts_when_product_a_uses_stale_shared_trigger(
 
     with caplog.at_level("ERROR", logger="sendai_pipeline"):
         result = create_product_b_sth_subscription(
-            settings=settings(dry_run=False),
+            settings=settings(
+                dry_run=False,
+                product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+                product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+            ),
             auth=FakeAuth(),
             session=fake_session,
         )
@@ -662,32 +1024,16 @@ def test_create_aborts_on_stale_peer_even_when_own_subscription_exists() -> None
             FakeResponse(
                 200,
                 json_body=[
-                    {
-                        "id": "current-product-b",
-                        "description": "Product B STH-Comet history set at ...",
-                        "subject": {
-                            "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
-                            ],
-                            "condition": {
-                                "attrs": list(PRODUCT_B_TRIGGER_ATTRS),
-                                "notifyOnMetadataChange": True,
-                            },
-                        },
-                        "notification": {
-                            "attrsFormat": "legacy",
-                            "attrs": list(PRODUCT_B_HISTORY_ATTRS),
-                            "metadata": ["TimeInstant"],
-                        },
-                    },
+                    product_b_subscription(subscription_id="current-product-b"),
                     {
                         "id": "stale-product-a",
                         "description": "Product A STH-Comet history set at ...",
                         "subject": {
                             "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
+                                {
+                                    "idPattern": ".*",
+                                    "type": AGGREGATE_ENTITY_TYPE,
+                                }
                             ],
                             "condition": {"attrs": ["dateObservedFrom"]},
                         },
@@ -704,7 +1050,11 @@ def test_create_aborts_on_stale_peer_even_when_own_subscription_exists() -> None
     )
 
     result = create_product_b_sth_subscription(
-        settings=settings(dry_run=False),
+        settings=settings(
+            dry_run=False,
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
         auth=FakeAuth(),
         session=fake_session,
     )
@@ -714,7 +1064,7 @@ def test_create_aborts_on_stale_peer_even_when_own_subscription_exists() -> None
     assert fake_session.posts == []
 
 
-def test_create_product_a_aborts_when_product_b_uses_stale_shared_trigger() -> None:
+def test_create_product_a_aborts_when_current_product_b_uses_shared_trigger() -> None:
     fake_session = FakeSession(
         get_responses=[
             FakeResponse(
@@ -722,17 +1072,20 @@ def test_create_product_a_aborts_when_product_b_uses_stale_shared_trigger() -> N
                 json_body=[
                     {
                         "id": "stale-product-b",
-                        "description": "Product B STH-Comet history set at ...",
+                        "description": (
+                            "Product B aggregate STH-Comet history set at ..."
+                        ),
                         "subject": {
                             "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
+                                {
+                                    "id": AGGREGATE_ENTITY_ID,
+                                    "type": AGGREGATE_ENTITY_TYPE,
+                                }
                             ],
                             "condition": {"attrs": ["dateObservedFrom"]},
                         },
                         "notification": {
                             "attrsFormat": "legacy",
-                            "attrs": list(PRODUCT_B_HISTORY_ATTRS),
                             "metadata": ["TimeInstant"],
                             "notifyOnMetadataChange": True,
                         },
@@ -764,8 +1117,10 @@ def test_create_aborts_when_peer_subscription_has_no_trigger_attrs() -> None:
                         "description": "Product A STH-Comet history set at ...",
                         "subject": {
                             "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
+                                {
+                                    "idPattern": ".*",
+                                    "type": AGGREGATE_ENTITY_TYPE,
+                                }
                             ],
                             "condition": {},
                         },
@@ -781,7 +1136,11 @@ def test_create_aborts_when_peer_subscription_has_no_trigger_attrs() -> None:
     )
 
     result = create_product_b_sth_subscription(
-        settings=settings(dry_run=False),
+        settings=settings(
+            dry_run=False,
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
         auth=FakeAuth(),
         session=fake_session,
     )
@@ -791,9 +1150,15 @@ def test_create_aborts_when_peer_subscription_has_no_trigger_attrs() -> None:
     assert fake_session.posts == []
 
 
-def test_trigger_attrs_are_exclusive_between_products() -> None:
-    assert set(PRODUCT_A_TRIGGER_ATTRS).isdisjoint(PRODUCT_B_HISTORY_ATTRS)
-    assert set(PRODUCT_B_TRIGGER_ATTRS).isdisjoint(PRODUCT_A_HISTORY_ATTRS)
+def test_product_b_subscription_api_keeps_trigger_disjoint_from_product_a_history() -> (
+    None
+):
+    body = build_product_b_subscription_body(settings())
+
+    assert set(PRODUCT_A_TRIGGER_ATTRS).isdisjoint(PRODUCT_B_STABLE_WRITE_ATTRS)
+    trigger_attrs = body["subject"]["condition"]["attrs"]
+    assert set(trigger_attrs).isdisjoint(PRODUCT_A_HISTORY_ATTRS)
+    assert "attrs" not in body["notification"]
 
 
 def test_sth_subscription_logging_extras_are_allowed() -> None:

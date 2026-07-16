@@ -18,7 +18,6 @@ from sendai_pipeline.metadata import parse_entity_id
 from sendai_pipeline.orion_client import OrionSettings
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
-    PRODUCT_B_HISTORY_ATTRS,
 )
 
 logger = logging.getLogger(__name__)
@@ -46,7 +45,6 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     attrs = parser.add_mutually_exclusive_group()
     attrs.add_argument("--attrs", help="Comma-separated Comet attributes to purge.")
     attrs.add_argument("--flow-attrs", action="store_true")
-    attrs.add_argument("--direction-attrs", action="store_true")
     parser.add_argument("--reason", required=True)
     parser.add_argument("--send", action="store_true")
     parser.add_argument("--i-know-this-is-production", action="store_true")
@@ -284,8 +282,6 @@ def _attrs(args: argparse.Namespace) -> tuple[str, ...] | None:
     """Return selected purge attributes, or ``None`` for per-entity purge."""
     if args.flow_attrs:
         return PRODUCT_A_HISTORY_ATTRS
-    if args.direction_attrs:
-        return PRODUCT_B_HISTORY_ATTRS
     if args.attrs is None:
         return None
     attrs = tuple(part.strip() for part in args.attrs.split(",") if part.strip())

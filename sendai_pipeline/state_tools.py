@@ -997,13 +997,17 @@ def state_report_to_pretty(
     )
 
     failed_targets = _limited(report.failed_targets, top)
-    lines.extend(["", _target_section_heading("failed", top)])
-    lines.extend(
-        _target_issue_table_lines(
-            failed_targets,
-            sensor_labels=sensor_labels,
+    if report.product == "direction":
+        lines.extend(["", "Aggregate target failures"])
+        lines.extend(_aggregate_target_issue_table_lines(failed_targets))
+    else:
+        lines.extend(["", _target_section_heading("failed", top)])
+        lines.extend(
+            _target_issue_table_lines(
+                failed_targets,
+                sensor_labels=sensor_labels,
+            )
         )
-    )
     lines.extend(
         _hidden_hint(
             label="failed targets",
@@ -1163,6 +1167,24 @@ def _target_issue_table_lines(
                 _label_field(item.entity_id, sensor_labels, "place_number"),
                 _label_field(item.entity_id, sensor_labels, "batch"),
                 _label_field(item.entity_id, sensor_labels, "interval_min"),
+                str(item.count),
+                item.oldest_window,
+                item.newest_window,
+            )
+            for item in issues
+        ],
+    )
+
+
+def _aggregate_target_issue_table_lines(
+    issues: Iterable[TargetIssueSummary],
+) -> list[str]:
+    """Render aggregate target failures without per-place metadata columns."""
+    return _table_lines(
+        ("target", "count", "oldest", "newest"),
+        [
+            (
+                item.entity_id,
                 str(item.count),
                 item.oldest_window,
                 item.newest_window,

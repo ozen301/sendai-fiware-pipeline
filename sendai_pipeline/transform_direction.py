@@ -1,4 +1,4 @@
-"""Transform direction metric rows into NGSI v2 attribute payloads."""
+"""Transform one direction source window into an aggregate NGSI v2 payload."""
 
 import logging
 from collections.abc import Callable, Iterable, Mapping
@@ -12,121 +12,168 @@ logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
 _ALL = "ALL"
-_ALLOWED_INTERVALS = frozenset({5, 60})
+_DIRECTION_INTERVAL_MIN = 60
 _SOURCE_BATCH_PREFIXES = {
     "sendai2023.": "2023",
     "sendai202603.": "2026",
 }
 
-# _FlowSide  — one direction side: {"all": <int|None>, "101": <int|None>, ...}
-# _FlowValue — both sides:         {"from": _FlowSide, "to": _FlowSide}
-type _FlowSide = dict[str, int | None]
-type _FlowValue = dict[str, _FlowSide]
-
 
 @dataclass(frozen=True)
-class TransformDirectionResult:
-    """Outcome of transforming a batch of direction metric rows.
+class DirectionPayloadOutcome:
+    """A sendable aggregate direction payload.
 
     Attributes:
-        payloads: Orion-ready attribute payloads, one per active target per
-            window — including sentinel payloads for targets with no
-            observations.
-        rows_dropped: Source rows the transform filtered out before they
-            could contribute to any payload (unsupported interval, noise
-            prefix, metadata miss including source-prefix/metadata-batch
-            mismatch, device-type mismatch, or self-loop).
+        payload: The Orion write for the aggregate entity, shaped as
+            ``{"entity_id": str, "entity_type": str, "attrs": {...}}``. The
+            top-level values are two strings plus the nested ``attrs`` mapping,
+            and within ``attrs`` each attribute's own ``value`` also varies
+            (a timestamp string, the entity id, or a place's dense
+            ``from``/``to`` matrix), so ``payload`` is typed ``dict[str, Any]``.
+            ``attrs`` always carries the four scalars ``dateObservedFrom``,
+            ``dateObservedTo``, ``dateRetrieved``, and ``identifcation``, then
+            one ``peopleCount_flow_<N>`` per emitted place; each attribute is a
+            ``{"type", "value", "metadata"}`` dict. For example::
+
+                {
+                    "entity_id": "jp.sendai.Blesensor.flow",
+                    "entity_type": "Blesensor.flow",
+                    "attrs": {
+                        "dateObservedFrom": {
+                            "type": "DateTime", "value": "...", "metadata": {...}
+                        },
+                        # dateObservedTo, dateRetrieved, identifcation likewise
+                        "peopleCount_flow_105": {
+                            "type": "StructuredValue",
+                            "value": {
+                                "from": {"105": 7, "all": 85},
+                                "to": {"105": 7, "all": 82},
+                            },
+                            "metadata": {...},
+                        },
+                    },
+                }
+
+        rows_dropped: Count of source rows rejected by the transform filters.
     """
 
-    payloads: list[dict[str, Any]]
+    payload: dict[str, Any]
     rows_dropped: int
 
 
+@dataclass(frozen=True)
+class DirectionNoPayloadOutcome:
+    """A direction window with no surviving candidate places.
+
+    Attributes:
+        rows_dropped: Count of source rows rejected by the transform filters.
+    """
+
+    rows_dropped: int
+
+
+@dataclass(frozen=True)
+class DirectionSourceInvalidOutcome:
+    """A direction window whose candidate places lack required totals.
+
+    Attributes:
+        missing_from_all_place_numbers: Candidate place numbers without a
+            surviving ``ALL -> N`` source row.
+        missing_to_all_place_numbers: Candidate place numbers without a
+            surviving ``N -> ALL`` source row.
+        rows_dropped: Count of source rows rejected by the transform filters.
+    """
+
+    missing_from_all_place_numbers: tuple[int, ...]
+    missing_to_all_place_numbers: tuple[int, ...]
+    rows_dropped: int
+
+
+type DirectionTransformOutcome = (
+    DirectionPayloadOutcome | DirectionNoPayloadOutcome | DirectionSourceInvalidOutcome
+)
+
+
 @dataclass
-class _Window:
-    observed_from: datetime
-    interval_min: int
-    flows_by_place: dict[int, _FlowValue] = field(default_factory=dict)
+class _CandidateFlow:
+    """One candidate place's surviving totals and pairwise routes.
+
+    A candidate place is created the first time a surviving row references it;
+    each field stays ``None``/empty until a row supplies its count. A self-loop
+    ``N -> N`` row sets both ``incoming[N]`` and ``outgoing[N]``.
+
+    Attributes:
+        from_all: Count moving into this place from the ``ALL`` aggregate
+            (source ``ALL -> N`` row). ``None`` until that row is seen.
+        to_all: Count moving out of this place to the ``ALL`` aggregate
+            (source ``N -> ALL`` row). ``None`` until that row is seen.
+        incoming: Counts moving into this place, keyed by the other place
+            number (from each surviving ``other -> N`` pairwise row).
+        outgoing: Counts moving out of this place, keyed by the other place
+            number (from each surviving ``N -> other`` pairwise row).
+    """
+
+    from_all: int | None = None
+    to_all: int | None = None
+    incoming: dict[int, int] = field(default_factory=dict)
+    outgoing: dict[int, int] = field(default_factory=dict)
 
 
-def transform_direction_rows(
+def transform_direction_window(
     rows: Iterable[Mapping[str, Any]],
     metadata_index: Mapping[tuple[int, int], SensorPlace],
     *,
+    aggregate_entity_id: str,
+    aggregate_entity_type: str,
     ignored_place_prefixes: tuple[str, ...] = ("quick.", "test"),
     now: Callable[[], datetime] | None = None,
-) -> TransformDirectionResult:
-    """Transform direction metric rows into Orion-ready attribute payloads.
+) -> DirectionTransformOutcome:
+    """Build one aggregate Product B payload from one source window.
 
-    Row filter cascade (in order):
-
-    1. **Interval check** — drop rows whose ``interval_min`` is not in
-       ``{5, 60}``.
-    2. **Noise-prefix check** — drop rows where either source place key
-       matches an ``ignored_place_prefixes`` entry (``ALL`` is exempt).
-    3. **Place resolution** — drop rows where either non-``ALL`` side
-       cannot be resolved to a metadata entry (unknown place number, batch
-       mismatch, or unparseable key).
-    4. **Self-loop check** — drop rows where both sides resolve to the
-       same place number.
-    5. **Device-type check** — drop rows whose ``from_device_type`` /
-       ``to_device_type`` do not match the expected type for the oldest
-       active batch of the interval.
-    6. **Accumulate** — surviving rows are merged into per-window
-       ``_FlowValue`` buckets.
+    The transform accepts only 60-minute rows. It filters ignored source keys,
+    unresolved or inactive metadata places, and rows whose device types do not
+    match the oldest active source batch. Every place on a surviving row is a
+    candidate. A sendable candidate must have both source ``ALL`` totals; if
+    any candidate lacks either total, the whole window is source-invalid.
 
     Args:
-        rows: Source rows returned from a dict-style database cursor.
-        metadata_index: Sensor metadata keyed by place number and aggregation
-            interval.
-        ignored_place_prefixes: Source place-key prefixes to filter before
-            metadata lookup.
-        now: Optional clock used to populate ``dateRetrieved``. When omitted,
-            the current JST wall-clock time is used.
+        rows: Direction source rows from a dict-style database cursor.
+        metadata_index: Sensor metadata keyed by place number and interval.
+        aggregate_entity_id: Entity id for the single aggregate payload.
+        aggregate_entity_type: Entity type for the single aggregate payload.
+        ignored_place_prefixes: Source-key prefixes filtered before metadata
+            lookup.
+        now: Optional clock for ``dateRetrieved``. Naive values are treated as
+            JST; aware values are converted to JST.
 
     Returns:
-        A ``TransformDirectionResult`` whose ``payloads`` carry
-        ``entity_id``, ``entity_type``, and ``attrs`` keys.  For example::
+        A payload outcome when the window is sendable, a no-payload outcome
+        when no candidate survives, or a source-invalid outcome listing
+        candidates that lack required totals.
 
-            {
-                "entity_id": "jp.sendai.Blesensor.per300.10",
-                "entity_type": "Blesensor.per300",
-                "attrs": {
-                    "peopleCount_flow": {
-                        "type": "StructuredValue",
-                        "value": {"from": {"all": 85}, "to": {"all": None}},
-                        ...
-                    },
-                    ...
-                },
-            }
-
-        Each supported source window emits one payload for every active
-        metadata target in the same interval.  Targets with no valid
-        observations receive a ``peopleCount_flow`` sentinel with
-        ``null`` ``all`` values (``{"from": {"all": None}, "to": {"all": None}}``).
-        ``rows_dropped`` counts source rows the filter cascade rejected, so
-        they contribute no flow value. The payload set is fixed by which
-        ``(startdate, interval)`` source windows get created — one payload per
-        active target per window, carrying the sentinel ``null`` values above
-        where no surviving row fed that target. A window is created as soon as
-        any row clears the interval and noise-prefix filters, so rows rejected
-        at those two early stages can keep a window (and its payloads) from
-        existing at all, while rows rejected at the later stages (place
-        resolution, self-loop, device type) leave the payload set unchanged.
+    Raises:
+        ValueError: If accepted 60-minute source rows span more than one
+            source window.
     """
-    active_index = {key: place for key, place in metadata_index.items() if place.active}
-    active_places_by_interval = _active_places_by_interval(active_index.values())
-    selected_device_types = _selected_device_types_by_interval(active_index.values())
-    windows: dict[tuple[str, int], _Window] = {}
+    active_index = {
+        key: place
+        for key, place in metadata_index.items()
+        if place.active and place.interval_min == _DIRECTION_INTERVAL_MIN
+    }
+    expected_device_type = _selected_device_type(active_index.values())
+    # Candidate places discovered in this window, keyed by place number.
+    candidates: dict[int, _CandidateFlow] = {}
+    source_startdate: str | None = None
     rows_dropped = 0
 
     for row in rows:
+        # Keep only 60-minute rows; Product B does not publish 5-minute flow.
         interval_min = int(row["interval_min"])
-        if interval_min not in _ALLOWED_INTERVALS:
+        if interval_min != _DIRECTION_INTERVAL_MIN:
             rows_dropped += 1
             continue
 
+        # Drop noise rows whose source key matches an ignored prefix (ALL exempt).
         from_group_place_id = str(row["from_group_place_id"])
         to_group_place_id = str(row["to_group_place_id"])
         matched_prefix = _matched_row_prefix(
@@ -147,26 +194,24 @@ def transform_direction_rows(
             rows_dropped += 1
             continue
 
-        startdate = str(row["startdate"])
-        window_key = (startdate, interval_min)
-        window = windows.get(window_key)
-        if window is None:
-            window = _Window(
-                observed_from=_parse_startdate(startdate),
-                interval_min=interval_min,
+        # Require every 60-minute, non-ignored row to share one source startdate.
+        row_startdate = str(row["startdate"])
+        if source_startdate is None:
+            source_startdate = row_startdate
+        elif row_startdate != source_startdate:
+            raise ValueError(
+                "direction transform requires a single 60-minute source window"
             )
-            windows[window_key] = window
 
+        # Resolve each non-ALL side through active metadata; drop unknown places.
         from_place = _resolve_place(
             from_group_place_id,
-            interval_min,
             active_index,
             from_group_place_id=from_group_place_id,
             to_group_place_id=to_group_place_id,
         )
         to_place = _resolve_place(
             to_group_place_id,
-            interval_min,
             active_index,
             from_group_place_id=from_group_place_id,
             to_group_place_id=to_group_place_id,
@@ -177,137 +222,95 @@ def transform_direction_rows(
             rows_dropped += 1
             continue
 
-        from_device_type = str(row["from_device_type"])
-        to_device_type = str(row["to_device_type"])
-
-        if from_place is not None and to_place is not None:
-            if from_place.place_number == to_place.place_number:
-                rows_dropped += 1
-                continue
-
-        expected_place = from_place if to_place is None else to_place
-        if expected_place is None:
-            rows_dropped += 1
-            continue
-
-        expected_device_type = selected_device_types.get(interval_min)
+        # Drop rows unless both device types match the oldest active batch's.
         if expected_device_type is None:
             rows_dropped += 1
             continue
 
+        from_device_type = str(row["from_device_type"])
+        to_device_type = str(row["to_device_type"])
+        log_place = from_place if from_place is not None else to_place
+        if log_place is None:
+            rows_dropped += 1
+            continue
         if not _device_types_match(
-            expected_place,
+            log_place,
             expected_device_type=expected_device_type,
             from_device_type=from_device_type,
             to_device_type=to_device_type,
             from_group_place_id=from_group_place_id,
             to_group_place_id=to_group_place_id,
-            interval_min=interval_min,
         ):
             rows_dropped += 1
             continue
 
+        # Accumulate the surviving count into its per-place candidate buckets.
         count = int(row["count"])
         if from_group_place_id == _ALL and to_place is not None:
-            _flow_for(window, to_place.place_number)["from"]["all"] = count
+            _candidate_for(candidates, to_place.place_number).from_all = count
         elif to_group_place_id == _ALL and from_place is not None:
-            _flow_for(window, from_place.place_number)["to"]["all"] = count
+            _candidate_for(candidates, from_place.place_number).to_all = count
         elif from_place is not None and to_place is not None:
-            _flow_for(window, from_place.place_number)["to"][
-                str(to_place.place_number)
-            ] = count
-            _flow_for(window, to_place.place_number)["from"][
-                str(from_place.place_number)
-            ] = count
+            from_number = from_place.place_number
+            to_number = to_place.place_number
+            _candidate_for(candidates, from_number).outgoing[to_number] = count
+            _candidate_for(candidates, to_number).incoming[from_number] = count
 
-    if not windows:
-        return TransformDirectionResult(payloads=[], rows_dropped=rows_dropped)
+    if not candidates:
+        return DirectionNoPayloadOutcome(rows_dropped=rows_dropped)
 
+    place_numbers = sorted(candidates)
+    missing_from_all = tuple(
+        place_number
+        for place_number in place_numbers
+        if candidates[place_number].from_all is None
+    )
+    missing_to_all = tuple(
+        place_number
+        for place_number in place_numbers
+        if candidates[place_number].to_all is None
+    )
+    if missing_from_all or missing_to_all:
+        return DirectionSourceInvalidOutcome(
+            missing_from_all_place_numbers=missing_from_all,
+            missing_to_all_place_numbers=missing_to_all,
+            rows_dropped=rows_dropped,
+        )
+
+    # Type guard only: non-empty candidates always have a source startdate.
+    if source_startdate is None:
+        return DirectionNoPayloadOutcome(rows_dropped=rows_dropped)
+
+    observed_from = _parse_startdate(source_startdate)
     retrieved_at = _retrieved_at(now)
-    payloads: list[dict[str, Any]] = []
-    for window in windows.values():
-        for place in active_places_by_interval.get(window.interval_min, ()):
-            payloads.append(
-                {
-                    "entity_id": place.entity_id,
-                    "entity_type": place.entity_type,
-                    "attrs": _attrs(
-                        place=place,
-                        window=window,
-                        retrieved_at=retrieved_at,
-                    ),
-                }
-            )
-
-    return TransformDirectionResult(payloads=payloads, rows_dropped=rows_dropped)
+    return DirectionPayloadOutcome(
+        payload={
+            "entity_id": aggregate_entity_id,
+            "entity_type": aggregate_entity_type,
+            "attrs": _aggregate_attrs(
+                aggregate_entity_id=aggregate_entity_id,
+                observed_from=observed_from,
+                retrieved_at=retrieved_at,
+                candidates=candidates,
+                place_numbers=place_numbers,
+            ),
+        },
+        rows_dropped=rows_dropped,
+    )
 
 
-def _active_places_by_interval(
-    places: Iterable[SensorPlace],
-) -> dict[int, list[SensorPlace]]:
-    """Group active metadata places by aggregation interval.
-
-    Used to emit one payload per active target per window so that targets with
-    no surviving rows still receive a sentinel ``peopleCount_flow``.
-    """
-    places_by_interval: dict[int, list[SensorPlace]] = {}
+def _selected_device_type(places: Iterable[SensorPlace]) -> str | None:
+    """Return the expected device type from the oldest active batch."""
+    selected: tuple[tuple[int, str], str] | None = None
     for place in places:
-        if place.interval_min in _ALLOWED_INTERVALS:
-            places_by_interval.setdefault(place.interval_min, []).append(place)
-    return places_by_interval
-
-
-def _selected_device_types_by_interval(
-    places: Iterable[SensorPlace],
-) -> dict[int, str]:
-    """Pick Product B's device population from the oldest active batch.
-
-    The metadata ``batch`` value is the installation year label in current
-    deployments (for example ``"2023"`` and ``"2026"``). Product B must use
-    the expected device type from the smallest chronological batch per
-    interval, so a mixed 2023/2026 run selects ``Pixel3aUT`` for both
-    pairwise rows and ``ALL`` rows.
-
-    For each interval, ``selected`` stores the best candidate seen so far as
-    ``(batch_order_key, expected_device_type)``. The ``batch_order_key`` is
-    produced by :func:`_batch_sort_key`; lower keys are older batches. The
-    comparison happens in this function: each row's ``batch_order_key`` is
-    compared with the currently selected row's key for the same interval.
-    """
-    selected: dict[int, tuple[tuple[int, str], str]] = {}
-    for place in places:
-        if place.interval_min not in _ALLOWED_INTERVALS:
-            continue
-        batch_order_key = _batch_sort_key(place.batch)
-        current = selected.get(place.interval_min)
-        current_batch_order_key = current[0] if current is not None else None
-        # Lower order keys represent older batches, e.g. 2023 before 2026.
-        if current_batch_order_key is None or batch_order_key < current_batch_order_key:
-            selected[place.interval_min] = (
-                batch_order_key,
-                place.expected_device_type,
-            )
-    return {
-        interval_min: expected_device_type
-        for interval_min, (_batch_key, expected_device_type) in selected.items()
-    }
+        candidate = (_batch_sort_key(place.batch), place.expected_device_type)
+        if selected is None or candidate[0] < selected[0]:
+            selected = candidate
+    return None if selected is None else selected[1]
 
 
 def _batch_sort_key(batch: str) -> tuple[int, str]:
-    """Return a stable chronological key for metadata batch labels.
-
-    The returned tuple is a sortable representation of one metadata batch
-    label. Callers compare these returned keys to decide which batch is older.
-
-    Examples:
-        ``_batch_sort_key("2023")`` returns ``(2023, "2023")``.
-        ``_batch_sort_key("2026")`` returns ``(2026, "2026")``.
-        ``_batch_sort_key("legacy")`` returns ``(1000000000, "legacy")``.
-
-    Numeric year-like labels sort by integer value. The original string is
-    kept as a tie-breaker to make ordering deterministic. Non-numeric labels
-    sort after numeric labels.
-    """
+    """Return a stable chronological key for a metadata batch label."""
     try:
         return (int(batch), batch)
     except ValueError:
@@ -319,53 +322,35 @@ def _matched_row_prefix(
     to_group_place_id: str,
     prefixes: Iterable[str],
 ) -> str | None:
-    """Return the noise prefix matched on either side, or None.
-
-    The literal ``ALL`` aggregate marker is exempt from prefix matching — only
-    real source place keys are inspected.
-    """
+    """Return the ignored prefix matched on either non-``ALL`` side."""
     for group_place_id in (from_group_place_id, to_group_place_id):
         if group_place_id == _ALL:
             continue
-        matched_prefix = _matched_prefix(group_place_id, prefixes)
-        if matched_prefix is not None:
-            return matched_prefix
-    return None
-
-
-def _matched_prefix(value: str, prefixes: Iterable[str]) -> str | None:
-    """Return the first prefix that ``value`` starts with, or ``None``."""
-    for prefix in prefixes:
-        if value.startswith(prefix):
-            return prefix
+        for prefix in prefixes:
+            if group_place_id.startswith(prefix):
+                return prefix
     return None
 
 
 def _resolve_place(
     group_place_id: str,
-    interval_min: int,
     metadata_index: Mapping[tuple[int, int], SensorPlace],
     *,
     from_group_place_id: str,
     to_group_place_id: str,
 ) -> SensorPlace | None:
-    """Look up the metadata target for a source place key.
-
-    Returns ``None`` for the ``ALL`` aggregate marker, for unparseable keys,
-    when no metadata exists for the (place_number, interval) pair, or when the
-    source-side batch derived from the key prefix disagrees with the metadata
-    batch (guards against place-number collisions between the 2023 and 2026
-    install batches).
-    """
+    """Resolve a non-``ALL`` source key through active 60-minute metadata."""
     if group_place_id == _ALL:
         return None
 
     parsed = _parse_source_place(group_place_id)
-    if parsed is None:
-        return None
-
-    place_number, source_batch = parsed
-    place = metadata_index.get((place_number, interval_min))
+    place_number = parsed[0] if parsed is not None else None
+    source_batch = parsed[1] if parsed is not None else None
+    place = (
+        metadata_index.get((place_number, _DIRECTION_INTERVAL_MIN))
+        if place_number is not None
+        else None
+    )
     if place is None or source_batch != place.batch:
         logger.debug(
             "direction metric row has no metadata target",
@@ -374,21 +359,15 @@ def _resolve_place(
                 "from_group_place_id": from_group_place_id,
                 "to_group_place_id": to_group_place_id,
                 "place_number": place_number,
-                "interval_min": interval_min,
+                "interval_min": _DIRECTION_INTERVAL_MIN,
             },
         )
         return None
-
     return place
 
 
 def _parse_source_place(group_place_id: str) -> tuple[int, str | None] | None:
-    """Split a source place key into (place_number, batch).
-
-    Batch is the install-batch tag derived from the key prefix (``"2023"`` or
-    ``"2026"``), or ``None`` when the key has no recognized batch prefix; the
-    caller then treats the row as a batch-mismatch and skips it.
-    """
+    """Split a source key into its numeric place and metadata batch."""
     try:
         place_number = int(group_place_id.rsplit(".", 1)[-1])
     except ValueError:
@@ -397,12 +376,11 @@ def _parse_source_place(group_place_id: str) -> tuple[int, str | None] | None:
     for prefix, batch in _SOURCE_BATCH_PREFIXES.items():
         if group_place_id.startswith(prefix):
             return place_number, batch
-
     return place_number, None
 
 
 def _resolution_failed(group_place_id: str, place: SensorPlace | None) -> bool:
-    """True when a non-ALL side resolved to no metadata target (drop the row)."""
+    """Return whether a non-``ALL`` source side failed metadata resolution."""
     return group_place_id != _ALL and place is None
 
 
@@ -414,14 +392,8 @@ def _device_types_match(
     to_device_type: str,
     from_group_place_id: str,
     to_group_place_id: str,
-    interval_min: int,
 ) -> bool:
-    """True when both row sides report Product B's selected device type.
-
-    The source table emits parallel rows under both ``(Pixel3aUT, Pixel3aUT)``
-    and ``(M5Stack, M5Stack)`` for every per-place target, so this filter is a
-    required disambiguator — without it every count would be double-counted.
-    """
+    """Return whether both row sides use the selected source device type."""
     if (
         from_device_type == expected_device_type
         and to_device_type == expected_device_type
@@ -437,109 +409,90 @@ def _device_types_match(
             "from_device_type": from_device_type,
             "to_device_type": to_device_type,
             "place_number": place.place_number,
-            "interval_min": interval_min,
+            "interval_min": _DIRECTION_INTERVAL_MIN,
             "expected_device_type": expected_device_type,
         },
     )
     return False
 
 
-def _flow_for(window: _Window, place_number: int) -> _FlowValue:
-    """Return the mutable flow bucket for a place, seeding the sentinel on first use.
-
-    Callers mutate the returned dict directly, e.g.::
-
-        _flow_for(window, 10)["from"]["all"] = 85
-        _flow_for(window, 10)["to"]["101"] = 12
-    """
-    return window.flows_by_place.setdefault(place_number, _sentinel_flow())
+def _candidate_for(
+    candidates: dict[int, _CandidateFlow], place_number: int
+) -> _CandidateFlow:
+    """Return a mutable candidate bucket, creating it when necessary."""
+    return candidates.setdefault(place_number, _CandidateFlow())
 
 
-def _sentinel_flow() -> _FlowValue:
-    """Default ``peopleCount_flow`` value meaning 'no observation this window'.
-
-    Distinct from an observed zero: ``null`` here signals the sensor reported
-    nothing, while ``0`` would mean it reported zero people.
-    """
-    return {"from": {"all": None}, "to": {"all": None}}
-
-
-def _attrs(
+def _aggregate_attrs(
     *,
-    place: SensorPlace,
-    window: _Window,
+    aggregate_entity_id: str,
+    observed_from: datetime,
     retrieved_at: datetime,
+    candidates: Mapping[int, _CandidateFlow],
+    place_numbers: list[int],
 ) -> dict[str, Any]:
-    observed_to = window.observed_from + timedelta(minutes=window.interval_min)
-    timeinstant_value = window.observed_from.isoformat()
-
-    return {
-        # "identifcation" is intentionally misspelled — it matches the live
-        # platform's attribute name exactly.  Do not "fix" this spelling.
-        "identifcation": {
-            "type": "Text",
-            "value": place.identifcation,
-            "metadata": _timeinstant_metadata(timeinstant_value),
-        },
-        "dateObservedFrom": {
-            "type": "DateTime",
-            "value": window.observed_from.isoformat(),
-            "metadata": _timeinstant_metadata(timeinstant_value),
-        },
-        "dateObservedTo": {
-            "type": "DateTime",
-            "value": observed_to.isoformat(),
-            "metadata": _timeinstant_metadata(timeinstant_value),
-        },
-        "dateRetrieved": {
-            "type": "DateTime",
-            "value": retrieved_at.isoformat(),
-            "metadata": _timeinstant_metadata(timeinstant_value),
-        },
-        "peopleCount_flow": {
-            "type": "StructuredValue",
-            "value": _flow_value(window, place.place_number),
-            "metadata": _timeinstant_metadata(timeinstant_value),
-        },
+    """Build the exact aggregate NGSI attribute mapping."""
+    timeinstant_value = observed_from.isoformat()
+    observed_to = observed_from + timedelta(minutes=_DIRECTION_INTERVAL_MIN)
+    attrs: dict[str, Any] = {
+        "dateObservedFrom": _attribute(
+            "DateTime", observed_from.isoformat(), timeinstant_value
+        ),
+        "dateObservedTo": _attribute(
+            "DateTime", observed_to.isoformat(), timeinstant_value
+        ),
+        "dateRetrieved": _attribute(
+            "DateTime", retrieved_at.isoformat(), timeinstant_value
+        ),
+        # The spelling matches the platform contract.
+        "identifcation": _attribute("Text", aggregate_entity_id, timeinstant_value),
     }
+    for place_number in place_numbers:
+        flow = candidates[place_number]
+        attrs[f"peopleCount_flow_{place_number}"] = _attribute(
+            "StructuredValue",
+            {
+                "from": {
+                    **{
+                        str(other_number): flow.incoming.get(other_number, 0)
+                        for other_number in place_numbers
+                    },
+                    "all": flow.from_all,
+                },
+                "to": {
+                    **{
+                        str(other_number): flow.outgoing.get(other_number, 0)
+                        for other_number in place_numbers
+                    },
+                    "all": flow.to_all,
+                },
+            },
+            timeinstant_value,
+        )
+    return attrs
 
 
-def _flow_value(window: _Window, place_number: int) -> _FlowValue:
-    """Snapshot a place's flow bucket for payload emission.
-
-    Returns a shallow copy so later mutations to the window's internal state
-    cannot leak into already-emitted payloads.
-
-    Returns:
-        A ``_FlowValue`` snapshot, e.g.::
-
-            {"from": {"all": 85}, "to": {"all": None}}
-
-        Falls back to a sentinel (all ``None``) when the place has no
-        observations in this window.
-    """
-    observed = window.flows_by_place.get(place_number)
-    if observed is None:
-        return _sentinel_flow()
+def _attribute(attribute_type: str, value: Any, timeinstant: str) -> dict[str, Any]:
+    """Build one NGSI attribute with the Product B time metadata."""
     return {
-        "from": dict(observed["from"]),
-        "to": dict(observed["to"]),
+        "type": attribute_type,
+        "value": value,
+        "metadata": {
+            "TimeInstant": {
+                "type": "DateTime",
+                "value": timeinstant,
+            }
+        },
     }
 
 
 def _parse_startdate(value: str) -> datetime:
-    """Parse a ``YYYYMMDD_HHMM`` source startdate string as JST."""
+    """Parse a ``YYYYMMDD_HHMM`` source startdate as JST."""
     return datetime.strptime(value, "%Y%m%d_%H%M").replace(tzinfo=JST)
 
 
 def _retrieved_at(now: Callable[[], datetime] | None) -> datetime:
-    """Resolve the ``dateRetrieved`` timestamp, normalizing to JST.
-
-    Naive values from the injected clock are assumed JST; aware values are
-    converted. Falls back to the real wall clock when no clock is injected.
-    The result is truncated to whole seconds because Orion v2 rejects
-    DateTime values whose fractional-second precision exceeds milliseconds.
-    """
+    """Resolve ``dateRetrieved`` in JST and truncate it to whole seconds."""
     if now is None:
         value = datetime.now(JST)
     else:
@@ -549,8 +502,3 @@ def _retrieved_at(now: Callable[[], datetime] | None) -> datetime:
         else:
             value = value.astimezone(JST)
     return value.replace(microsecond=0)
-
-
-def _timeinstant_metadata(value: str) -> dict[str, dict[str, str]]:
-    """NGSI metadata block telling STH-Comet which timestamp to index history by."""
-    return {"TimeInstant": {"type": "DateTime", "value": value}}

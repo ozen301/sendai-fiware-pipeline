@@ -1,31 +1,25 @@
-import json
 import logging
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-from sendai_pipeline.logging_setup import _ALLOWED_EXTRA_KEYS
-from sendai_pipeline.metadata import SensorPlace, index_by_place_interval, load_metadata
+from sendai_pipeline.metadata import SensorPlace
 from sendai_pipeline.transform_direction import (
-    TransformDirectionResult,
-    transform_direction_rows,
+    DirectionNoPayloadOutcome,
+    DirectionPayloadOutcome,
+    DirectionSourceInvalidOutcome,
+    DirectionTransformOutcome,
+    transform_direction_window,
 )
 
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
 JST = timezone(timedelta(hours=9))
-
-TRANSFORM_EVENTS = frozenset(
-    {
-        "ignored_place_prefix",
-        "unknown_place_interval",
-        "device_mismatch",
-    }
-)
-
-FIXED_NOW = datetime(2026, 5, 24, 13, 25, 43, tzinfo=JST)
+AGGREGATE_ENTITY_ID = "test.aggregate.direction"
+AGGREGATE_ENTITY_TYPE = "TestAggregateDirection"
+FIXED_NOW = datetime(2026, 5, 24, 13, 25, 43, 288677, tzinfo=JST)
 FIXED_NOW_ISO = "2026-05-24T13:25:43+09:00"
+OBSERVED_FROM = "2026-05-23T09:00:00+09:00"
+OBSERVED_TO = "2026-05-23T10:00:00+09:00"
 
 
 def fixed_clock() -> datetime:
@@ -69,7 +63,7 @@ def direction_row(**overrides: Any) -> dict[str, Any]:
     return values
 
 
-def timeinstant(value: str = "2026-05-23T09:00:00+09:00") -> dict[str, Any]:
+def timeinstant(value: str = OBSERVED_FROM) -> dict[str, Any]:
     return {"TimeInstant": {"type": "DateTime", "value": value}}
 
 
@@ -79,588 +73,56 @@ def records(caplog: pytest.LogCaptureFixture, event: str) -> list[Any]:
     ]
 
 
-def payloads_by_entity(
-    result: TransformDirectionResult,
-) -> dict[str, dict[str, Any]]:
-    return {payload["entity_id"]: payload for payload in result.payloads}
+def transform(
+    rows: list[dict[str, Any]],
+    metadata_index: dict[tuple[int, int], SensorPlace],
+) -> DirectionTransformOutcome:
+    return transform_direction_window(
+        rows,
+        metadata_index,
+        aggregate_entity_id=AGGREGATE_ENTITY_ID,
+        aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        now=fixed_clock,
+    )
 
 
-def test_transform_direction_emits_per3600_payload_with_pairwise_and_all_keys() -> None:
-    metadata_index = {
-        (105, 60): place(place_number=105, identifcation="105"),
-        (106, 60): place(
-            place_number=106,
-            entity_id="jp.sendai.Blesensor.per3600.106",
-            identifcation="106",
-        ),
-    }
+def payload_from(outcome: DirectionTransformOutcome) -> dict[str, Any]:
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    return outcome.payload
 
-    rows = [
+
+def complete_totals(
+    source_id: str,
+    *,
+    from_all: int,
+    to_all: int,
+    device_type: str = "M5Stack",
+    interval_min: int = 60,
+    startdate: str = "20260523_0900",
+) -> list[dict[str, Any]]:
+    return [
         direction_row(
-            from_group_place_id="sendai202603.105",
-            to_group_place_id="sendai202603.106",
-            count=12,
-        ),
-        direction_row(
-            from_group_place_id="sendai202603.106",
-            to_group_place_id="sendai202603.105",
-            count=9,
-        ),
-        direction_row(
+            startdate=startdate,
             from_group_place_id="ALL",
-            to_group_place_id="sendai202603.105",
-            count=85,
+            to_group_place_id=source_id,
+            from_device_type=device_type,
+            to_device_type=device_type,
+            interval_min=interval_min,
+            count=from_all,
         ),
         direction_row(
-            from_group_place_id="sendai202603.105",
+            startdate=startdate,
+            from_group_place_id=source_id,
             to_group_place_id="ALL",
-            count=82,
-        ),
-        direction_row(
-            from_group_place_id="ALL",
-            to_group_place_id="sendai202603.106",
-            count=67,
-        ),
-        direction_row(
-            from_group_place_id="sendai202603.106",
-            to_group_place_id="ALL",
-            count=71,
+            from_device_type=device_type,
+            to_device_type=device_type,
+            interval_min=interval_min,
+            count=to_all,
         ),
     ]
 
-    result = transform_direction_rows(rows, metadata_index, now=fixed_clock)
-    by_entity = payloads_by_entity(result)
 
-    assert set(by_entity) == {
-        "jp.sendai.Blesensor.per3600.105",
-        "jp.sendai.Blesensor.per3600.106",
-    }
-    payload_105 = by_entity["jp.sendai.Blesensor.per3600.105"]
-    assert payload_105["entity_type"] == "Blesensor.per3600"
-    assert payload_105["attrs"]["identifcation"] == {
-        "type": "Text",
-        "value": "105",
-        "metadata": timeinstant(),
-    }
-    assert payload_105["attrs"]["dateObservedFrom"] == {
-        "type": "DateTime",
-        "value": "2026-05-23T09:00:00+09:00",
-        "metadata": timeinstant(),
-    }
-    assert payload_105["attrs"]["dateObservedTo"] == {
-        "type": "DateTime",
-        "value": "2026-05-23T10:00:00+09:00",
-        "metadata": timeinstant(),
-    }
-    assert payload_105["attrs"]["dateRetrieved"] == {
-        "type": "DateTime",
-        "value": FIXED_NOW_ISO,
-        "metadata": timeinstant(),
-    }
-    assert payload_105["attrs"]["peopleCount_flow"] == {
-        "type": "StructuredValue",
-        "value": {
-            "from": {"all": 85, "106": 9},
-            "to": {"all": 82, "106": 12},
-        },
-        "metadata": timeinstant(),
-    }
-    payload_106 = by_entity["jp.sendai.Blesensor.per3600.106"]
-    assert payload_106["attrs"]["identifcation"]["value"] == "106"
-    assert payload_106["attrs"]["peopleCount_flow"]["value"] == {
-        "from": {"all": 67, "105": 12},
-        "to": {"all": 71, "105": 9},
-    }
-
-
-def test_transform_direction_builds_per300_payload_for_five_minute_window() -> None:
-    metadata_index = {
-        (10, 5): place(
-            place_number=10,
-            interval_min=5,
-            entity_id="jp.sendai.Blesensor.per300.10",
-            entity_type="Blesensor.per300",
-            batch="2023",
-            expected_device_type="Pixel3aUT",
-        )
-    }
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                startdate="20260523_2355",
-                from_group_place_id="ALL",
-                to_group_place_id="sendai2023.10",
-                from_device_type="Pixel3aUT",
-                to_device_type="Pixel3aUT",
-                interval_min=5,
-                count=4,
-            )
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-
-    assert len(result.payloads) == 1
-    payload = result.payloads[0]
-    assert payload["entity_id"] == "jp.sendai.Blesensor.per300.10"
-    assert payload["entity_type"] == "Blesensor.per300"
-    assert payload["attrs"]["dateObservedFrom"]["value"] == (
-        "2026-05-23T23:55:00+09:00"
-    )
-    assert payload["attrs"]["dateObservedTo"]["value"] == ("2026-05-24T00:00:00+09:00")
-    assert payload["attrs"]["dateRetrieved"]["value"] == FIXED_NOW_ISO
-    assert payload["attrs"]["peopleCount_flow"]["value"] == {
-        "from": {"all": 4},
-        "to": {"all": None},
-    }
-
-
-def test_transform_direction_returns_empty_list_for_empty_input(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows([], metadata_index, now=fixed_clock)
-
-    assert result == TransformDirectionResult(payloads=[], rows_dropped=0)
-    assert caplog.records == []
-
-
-def test_transform_direction_emits_sentinel_for_target_with_no_rows_in_window() -> None:
-    metadata_index = {
-        (105, 60): place(place_number=105, identifcation="105"),
-        (106, 60): place(
-            place_number=106,
-            entity_id="jp.sendai.Blesensor.per3600.106",
-            identifcation="106",
-        ),
-    }
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                count=85,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
-
-    assert set(by_entity) == {
-        "jp.sendai.Blesensor.per3600.105",
-        "jp.sendai.Blesensor.per3600.106",
-    }
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": 85},
-        "to": {"all": None},
-    }
-    assert by_entity["jp.sendai.Blesensor.per3600.106"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None},
-        "to": {"all": None},
-    }
-
-
-def test_transform_direction_skips_inactive_metadata_entries() -> None:
-    metadata_index = {
-        (105, 60): place(place_number=105, identifcation="105"),
-        (999, 60): place(
-            place_number=999,
-            entity_id="jp.sendai.Blesensor.per3600.999",
-            identifcation="999",
-            active=False,
-        ),
-    }
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                count=85,
-            )
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
-
-    assert set(by_entity) == {"jp.sendai.Blesensor.per3600.105"}
-
-
-def test_transform_direction_preserves_observed_zero_distinct_from_null() -> None:
-    metadata_index = {
-        (105, 60): place(place_number=105),
-        (106, 60): place(
-            place_number=106,
-            entity_id="jp.sendai.Blesensor.per3600.106",
-        ),
-    }
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="sendai202603.106",
-                to_group_place_id="sendai202603.105",
-                count=0,
-            ),
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                count=0,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
-    payload_105 = by_entity["jp.sendai.Blesensor.per3600.105"]
-
-    assert payload_105["attrs"]["peopleCount_flow"]["value"] == {
-        "from": {"all": 0, "106": 0},
-        "to": {"all": None},
-    }
-
-
-def test_transform_direction_drops_unsupported_interval_without_log(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows(
-            [direction_row(interval_min=1)],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    by_entity = payloads_by_entity(result)
-    assert "jp.sendai.Blesensor.per3600.105" not in by_entity
-    assert caplog.records == []
-
-
-def test_transform_direction_drops_default_noise_prefix_before_metadata_lookup(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="quick.106",
-                    to_group_place_id="sendai202603.105",
-                ),
-                direction_row(
-                    from_group_place_id="sendai202603.105",
-                    to_group_place_id="test.106",
-                ),
-            ],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    ignored = records(caplog, "ignored_place_prefix")
-    assert {record.matched_prefix for record in ignored} == {"quick.", "test"}
-    assert all(record.levelname == "DEBUG" for record in ignored)
-    assert records(caplog, "unknown_place_interval") == []
-
-
-def test_transform_direction_does_not_treat_literal_all_as_noise_prefix(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="ALL",
-                    to_group_place_id="sendai202603.105",
-                    count=85,
-                ),
-            ],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    by_entity = payloads_by_entity(result)
-    assert (
-        by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-            "value"
-        ]["from"]["all"]
-        == 85
-    )
-    assert records(caplog, "ignored_place_prefix") == []
-
-
-def test_transform_direction_uses_custom_noise_prefixes_instead_of_defaults(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {
-        (105, 60): place(place_number=105),
-        (106, 60): place(
-            place_number=106,
-            entity_id="jp.sendai.Blesensor.per3600.106",
-        ),
-    }
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="foo.106",
-                    to_group_place_id="sendai202603.105",
-                ),
-                direction_row(
-                    from_group_place_id="quick.106",
-                    to_group_place_id="sendai202603.105",
-                    count=7,
-                ),
-            ],
-            metadata_index,
-            ignored_place_prefixes=("foo.",),
-            now=fixed_clock,
-        )
-
-    by_entity = payloads_by_entity(result)
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ]["from"] == {"all": None}
-    ignored = records(caplog, "ignored_place_prefix")
-    assert [record.matched_prefix for record in ignored] == ["foo."]
-
-
-def test_transform_direction_logs_unknown_pairwise_place_at_debug(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="sendai2023.1001",
-                    to_group_place_id="sendai202603.105",
-                    count=3,
-                ),
-            ],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    by_entity = payloads_by_entity(result)
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None},
-        "to": {"all": None},
-    }
-    unknown = records(caplog, "unknown_place_interval")
-    assert len(unknown) == 1
-    assert unknown[0].levelname == "DEBUG"
-    assert unknown[0].place_number == 1001
-    assert unknown[0].interval_min == 60
-
-
-def test_transform_direction_logs_device_mismatch_at_debug(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="ALL",
-                    to_group_place_id="sendai202603.105",
-                    from_device_type="Pixel3aUT",
-                    to_device_type="Pixel3aUT",
-                    count=99,
-                ),
-            ],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    by_entity = payloads_by_entity(result)
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None},
-        "to": {"all": None},
-    }
-    mismatches = records(caplog, "device_mismatch")
-    assert len(mismatches) == 1
-    assert mismatches[0].levelname == "DEBUG"
-    assert mismatches[0].expected_device_type == "M5Stack"
-
-
-def test_transform_direction_drops_mixed_device_type_rows() -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                from_device_type="Pixel3aUT",
-                to_device_type="M5Stack",
-                count=99,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-
-    by_entity = payloads_by_entity(result)
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None},
-        "to": {"all": None},
-    }
-
-
-def test_transform_direction_keeps_cross_batch_pair_with_oldest_batch_device_type(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    metadata_index = {
-        (10, 60): place(
-            place_number=10,
-            entity_id="jp.sendai.Blesensor.per3600.10",
-            batch="2023",
-            expected_device_type="Pixel3aUT",
-        ),
-        (105, 60): place(
-            place_number=105,
-            entity_id="jp.sendai.Blesensor.per3600.105",
-            batch="2026",
-            expected_device_type="M5Stack",
-        ),
-    }
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        result = transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="sendai2023.10",
-                    to_group_place_id="sendai202603.105",
-                    from_device_type="Pixel3aUT",
-                    to_device_type="Pixel3aUT",
-                    count=3,
-                ),
-                direction_row(
-                    from_group_place_id="sendai2023.10",
-                    to_group_place_id="sendai202603.105",
-                    from_device_type="M5Stack",
-                    to_device_type="M5Stack",
-                    count=99,
-                ),
-            ],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    by_entity = payloads_by_entity(result)
-    assert by_entity["jp.sendai.Blesensor.per3600.10"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None},
-        "to": {"all": None, "105": 3},
-    }
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None, "10": 3},
-        "to": {"all": None},
-    }
-    assert result.rows_dropped == 1
-    assert records(caplog, "device_mismatch")
-
-
-def test_transform_direction_uses_oldest_batch_device_type_for_mixed_targets() -> None:
-    metadata_index = {
-        (10, 60): place(
-            place_number=10,
-            entity_id="jp.sendai.Blesensor.per3600.10",
-            batch="2023",
-            expected_device_type="Pixel3aUT",
-        ),
-        (105, 60): place(
-            place_number=105,
-            entity_id="jp.sendai.Blesensor.per3600.105",
-            batch="2026",
-            expected_device_type="M5Stack",
-        ),
-        (106, 60): place(
-            place_number=106,
-            entity_id="jp.sendai.Blesensor.per3600.106",
-            batch="2026",
-            expected_device_type="M5Stack",
-        ),
-    }
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                from_device_type="Pixel3aUT",
-                to_device_type="Pixel3aUT",
-                count=85,
-            ),
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                from_device_type="M5Stack",
-                to_device_type="M5Stack",
-                count=99,
-            ),
-            direction_row(
-                from_group_place_id="sendai202603.105",
-                to_group_place_id="sendai202603.106",
-                from_device_type="Pixel3aUT",
-                to_device_type="Pixel3aUT",
-                count=7,
-            ),
-            direction_row(
-                from_group_place_id="sendai202603.105",
-                to_group_place_id="sendai202603.106",
-                from_device_type="M5Stack",
-                to_device_type="M5Stack",
-                count=13,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
-
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": 85},
-        "to": {"all": None, "106": 7},
-    }
-    assert by_entity["jp.sendai.Blesensor.per3600.106"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None, "105": 7},
-        "to": {"all": None},
-    }
-    assert result.rows_dropped == 2
-
-
-def test_transform_direction_does_not_sum_pairwise_to_approximate_all() -> None:
+def test_transform_direction_builds_aggregate_with_exact_ngsi_contract() -> None:
     metadata_index = {
         (105, 60): place(place_number=105),
         (106, 60): place(
@@ -672,244 +134,212 @@ def test_transform_direction_does_not_sum_pairwise_to_approximate_all() -> None:
             entity_id="jp.sendai.Blesensor.per3600.107",
         ),
     }
+    rows = [
+        direction_row(count=12),
+        direction_row(
+            from_group_place_id="sendai202603.105",
+            to_group_place_id="sendai202603.105",
+            count=7,
+        ),
+        *complete_totals("sendai202603.105", from_all=85, to_all=82),
+        *complete_totals("sendai202603.106", from_all=67, to_all=71),
+    ]
 
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="sendai202603.106",
-                to_group_place_id="sendai202603.105",
-                count=10,
-            ),
-            direction_row(
-                from_group_place_id="sendai202603.107",
-                to_group_place_id="sendai202603.105",
-                count=20,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
+    outcome = transform(rows, metadata_index)
 
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ]["from"] == {"all": None, "106": 10, "107": 20}
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    assert outcome.rows_dropped == 0
+    assert outcome.payload == {
+        "entity_id": AGGREGATE_ENTITY_ID,
+        "entity_type": AGGREGATE_ENTITY_TYPE,
+        "attrs": {
+            "dateObservedFrom": {
+                "type": "DateTime",
+                "value": OBSERVED_FROM,
+                "metadata": timeinstant(),
+            },
+            "dateObservedTo": {
+                "type": "DateTime",
+                "value": OBSERVED_TO,
+                "metadata": timeinstant(),
+            },
+            "dateRetrieved": {
+                "type": "DateTime",
+                "value": FIXED_NOW_ISO,
+                "metadata": timeinstant(),
+            },
+            "identifcation": {
+                "type": "Text",
+                "value": AGGREGATE_ENTITY_ID,
+                "metadata": timeinstant(),
+            },
+            "peopleCount_flow_105": {
+                "type": "StructuredValue",
+                "value": {
+                    "from": {"105": 7, "106": 0, "all": 85},
+                    "to": {"105": 7, "106": 12, "all": 82},
+                },
+                "metadata": timeinstant(),
+            },
+            "peopleCount_flow_106": {
+                "type": "StructuredValue",
+                "value": {
+                    "from": {"105": 12, "106": 0, "all": 67},
+                    "to": {"105": 0, "106": 0, "all": 71},
+                },
+                "metadata": timeinstant(),
+            },
+        },
+    }
 
 
-def test_transform_direction_emits_one_payload_per_window_interval_and_target() -> None:
+def test_transform_direction_ignores_five_minute_rows_in_sendable_window() -> None:
+    metadata_index = {
+        (5, 5): place(
+            place_number=5,
+            interval_min=5,
+            entity_type="Blesensor.per300",
+            entity_id="jp.sendai.Blesensor.per300.5",
+        ),
+        (105, 60): place(place_number=105),
+    }
+    rows = [
+        *complete_totals("sendai202603.105", from_all=8, to_all=6),
+        *complete_totals(
+            "sendai202603.5",
+            from_all=4,
+            to_all=3,
+            interval_min=5,
+            startdate="20260523_0955",
+        ),
+    ]
+
+    outcome = transform(rows, metadata_index)
+    payload = payload_from(outcome)
+
+    assert outcome.rows_dropped == 2
+    assert set(payload["attrs"]) == {
+        "dateObservedFrom",
+        "dateObservedTo",
+        "dateRetrieved",
+        "identifcation",
+        "peopleCount_flow_105",
+    }
+    assert payload["attrs"]["dateObservedFrom"]["value"] == OBSERVED_FROM
+    assert payload["attrs"]["dateObservedTo"]["value"] == OBSERVED_TO
+
+
+def test_transform_direction_rejects_rows_from_multiple_sixty_minute_windows() -> None:
+    metadata_index = {(105, 60): place(place_number=105)}
+    rows = [
+        *complete_totals("sendai202603.105", from_all=8, to_all=6),
+        *complete_totals(
+            "sendai202603.105",
+            from_all=7,
+            to_all=5,
+            startdate="20260523_1000",
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="single 60-minute source window"):
+        transform(rows, metadata_index)
+
+
+def test_transform_direction_keeps_cross_batch_rows_for_oldest_device_type() -> None:
+    metadata_index = {
+        (9, 60): place(
+            place_number=9,
+            entity_id="jp.sendai.Blesensor.per3600.9",
+            batch="2023",
+            expected_device_type="M5Stack",
+            active=False,
+        ),
+        (10, 60): place(
+            place_number=10,
+            entity_id="jp.sendai.Blesensor.per3600.10",
+            batch="2023",
+            expected_device_type="Pixel3aUT",
+        ),
+        (105, 60): place(place_number=105),
+    }
+    pixel_rows = [
+        direction_row(
+            from_group_place_id="sendai2023.10",
+            to_group_place_id="sendai202603.105",
+            from_device_type="Pixel3aUT",
+            to_device_type="Pixel3aUT",
+            count=14,
+        ),
+        *complete_totals(
+            "sendai2023.10",
+            from_all=31,
+            to_all=29,
+            device_type="Pixel3aUT",
+        ),
+        *complete_totals(
+            "sendai202603.105",
+            from_all=41,
+            to_all=43,
+            device_type="Pixel3aUT",
+        ),
+    ]
+    newer_device_rows = [
+        {
+            **row,
+            "from_device_type": "M5Stack",
+            "to_device_type": "M5Stack",
+            "count": 999,
+        }
+        for row in pixel_rows
+    ]
+
+    outcome = transform([*pixel_rows, *newer_device_rows], metadata_index)
+    payload = payload_from(outcome)
+
+    assert outcome.rows_dropped == len(newer_device_rows)
+    assert payload["attrs"]["peopleCount_flow_10"]["value"] == {
+        "from": {"10": 0, "105": 0, "all": 31},
+        "to": {"10": 0, "105": 14, "all": 29},
+    }
+    assert payload["attrs"]["peopleCount_flow_105"]["value"] == {
+        "from": {"10": 14, "105": 0, "all": 41},
+        "to": {"10": 0, "105": 0, "all": 43},
+    }
+
+
+def test_transform_direction_emits_candidate_with_totals_and_no_pairwise_rows() -> None:
     metadata_index = {
         (105, 60): place(place_number=105),
         (106, 60): place(
             place_number=106,
             entity_id="jp.sendai.Blesensor.per3600.106",
         ),
-        (105, 5): place(
-            place_number=105,
-            interval_min=5,
-            entity_id="jp.sendai.Blesensor.per300.105",
-            entity_type="Blesensor.per300",
-        ),
-        (106, 5): place(
-            place_number=106,
-            interval_min=5,
-            entity_id="jp.sendai.Blesensor.per300.106",
-            entity_type="Blesensor.per300",
-        ),
     }
 
-    result = transform_direction_rows(
-        [
-            direction_row(
-                startdate="20260523_0900",
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                interval_min=60,
-                count=85,
-            ),
-            direction_row(
-                startdate="20260523_0900",
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                interval_min=5,
-                count=7,
-            ),
-            direction_row(
-                startdate="20260523_0905",
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.106",
-                interval_min=5,
-                count=4,
-            ),
-        ],
+    outcome = transform(
+        complete_totals("sendai202603.105", from_all=5, to_all=4),
         metadata_index,
-        now=fixed_clock,
     )
+    payload = payload_from(outcome)
 
-    keyed = {
-        (
-            payload["entity_id"],
-            payload["attrs"]["dateObservedFrom"]["value"],
-        ): payload
-        for payload in result.payloads
+    assert set(payload["attrs"]) == {
+        "dateObservedFrom",
+        "dateObservedTo",
+        "dateRetrieved",
+        "identifcation",
+        "peopleCount_flow_105",
     }
-
-    assert set(keyed) == {
-        ("jp.sendai.Blesensor.per3600.105", "2026-05-23T09:00:00+09:00"),
-        ("jp.sendai.Blesensor.per3600.106", "2026-05-23T09:00:00+09:00"),
-        ("jp.sendai.Blesensor.per300.105", "2026-05-23T09:00:00+09:00"),
-        ("jp.sendai.Blesensor.per300.106", "2026-05-23T09:00:00+09:00"),
-        ("jp.sendai.Blesensor.per300.105", "2026-05-23T09:05:00+09:00"),
-        ("jp.sendai.Blesensor.per300.106", "2026-05-23T09:05:00+09:00"),
+    assert payload["attrs"]["peopleCount_flow_105"]["value"] == {
+        "from": {"105": 0, "all": 5},
+        "to": {"105": 0, "all": 4},
     }
-    assert (
-        keyed[("jp.sendai.Blesensor.per3600.105", "2026-05-23T09:00:00+09:00")][
-            "attrs"
-        ]["peopleCount_flow"]["value"]["from"]["all"]
-        == 85
-    )
-    assert keyed[("jp.sendai.Blesensor.per3600.106", "2026-05-23T09:00:00+09:00")][
-        "attrs"
-    ]["peopleCount_flow"]["value"] == {
-        "from": {"all": None},
-        "to": {"all": None},
-    }
-    assert (
-        keyed[("jp.sendai.Blesensor.per300.105", "2026-05-23T09:00:00+09:00")]["attrs"][
-            "peopleCount_flow"
-        ]["value"]["from"]["all"]
-        == 7
-    )
-    assert (
-        keyed[("jp.sendai.Blesensor.per300.106", "2026-05-23T09:05:00+09:00")]["attrs"][
-            "peopleCount_flow"
-        ]["value"]["from"]["all"]
-        == 4
+    assert "peopleCount_flow_106" not in payload["attrs"]
+    assert all(
+        attribute["value"] is not None for attribute in payload["attrs"].values()
     )
 
 
-def test_transform_direction_filters_self_loops() -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="sendai202603.105",
-                to_group_place_id="sendai202603.105",
-                count=5,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
-
-    assert by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-        "value"
-    ] == {
-        "from": {"all": None},
-        "to": {"all": None},
-    }
-
-
-def test_transform_direction_payload_is_json_serializable() -> None:
-    metadata_index = {(105, 60): place(place_number=105)}
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                count=85,
-            )
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-
-    [payload] = result.payloads
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    assert '"peopleCount_flow":{' in serialized
-    assert '"StructuredValue"' in serialized
-    assert '"all":85' in serialized
-    assert '"identifcation":{' in serialized
-    assert '"dateRetrieved":{' in serialized
-
-
-def test_transform_direction_reads_entity_and_identifcation_from_metadata() -> None:
-    metadata_index = {
-        (10, 60): place(
-            place_number=10,
-            interval_min=60,
-            entity_id="jp.sendai.Blesensor.per3600.10.custom-suffix",
-            entity_type="Custom.Blesensor.Type",
-            batch="2023",
-            expected_device_type="Pixel3aUT",
-            identifcation="custom-identifcation",
-        )
-    }
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai2023.10",
-                from_device_type="Pixel3aUT",
-                to_device_type="Pixel3aUT",
-                count=3,
-            )
-        ],
-        metadata_index,
-        now=fixed_clock,
-    )
-
-    assert len(result.payloads) == 1
-    payload = result.payloads[0]
-    assert payload["entity_id"] == "jp.sendai.Blesensor.per3600.10.custom-suffix"
-    assert payload["entity_type"] == "Custom.Blesensor.Type"
-    assert payload["attrs"]["identifcation"]["value"] == "custom-identifcation"
-
-
-def test_transform_direction_builds_payload_against_csv_loaded_metadata_index() -> None:
-    metadata = load_metadata(FIXTURES_DIR / "sensors_minimal.csv")
-    index = index_by_place_interval(metadata)
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                from_device_type="Pixel3aUT",
-                to_device_type="Pixel3aUT",
-                count=85,
-            ),
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai2023.10",
-                from_device_type="Pixel3aUT",
-                to_device_type="Pixel3aUT",
-                count=3,
-            ),
-        ],
-        index,
-        now=fixed_clock,
-    )
-    by_entity = payloads_by_entity(result)
-
-    assert (
-        by_entity["jp.sendai.Blesensor.per3600.105"]["attrs"]["peopleCount_flow"][
-            "value"
-        ]["from"]["all"]
-        == 85
-    )
-    assert (
-        by_entity["jp.sendai.Blesensor.per3600.10"]["attrs"]["peopleCount_flow"][
-            "value"
-        ]["from"]["all"]
-        == 3
-    )
-
-
-def test_transform_direction_emits_only_known_structured_events(
+def test_transform_direction_returns_typed_no_payload_for_zero_candidates(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     metadata_index = {
@@ -920,132 +350,201 @@ def test_transform_direction_emits_only_known_structured_events(
             expected_device_type="Pixel3aUT",
         ),
         (105, 60): place(place_number=105),
-    }
-
-    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        transform_direction_rows(
-            [
-                direction_row(
-                    from_group_place_id="quick.106",
-                    to_group_place_id="sendai202603.105",
-                ),
-                direction_row(
-                    from_group_place_id="sendai2023.99",
-                    to_group_place_id="sendai202603.105",
-                ),
-                direction_row(
-                    from_group_place_id="ALL",
-                    to_group_place_id="sendai202603.105",
-                    from_device_type="Pixel3aUT",
-                    to_device_type="Pixel3aUT",
-                ),
-                direction_row(
-                    from_group_place_id="sendai2023.10",
-                    to_group_place_id="sendai202603.105",
-                    from_device_type="M5Stack",
-                    to_device_type="M5Stack",
-                ),
-            ],
-            metadata_index,
-            now=fixed_clock,
-        )
-
-    events = [getattr(record, "event", None) for record in caplog.records]
-    assert set(events) <= TRANSFORM_EVENTS
-
-
-def test_transform_direction_counts_rows_dropped_for_each_filter_path() -> None:
-    metadata_index = {
-        (105, 60): place(place_number=105, identifcation="105"),
-        (106, 60): place(
-            place_number=106,
-            entity_id="jp.sendai.Blesensor.per3600.106",
-            identifcation="106",
+        (108, 60): place(
+            place_number=108,
+            entity_id="jp.sendai.Blesensor.per3600.108",
+            active=False,
+        ),
+        (109, 5): place(
+            place_number=109,
+            interval_min=5,
+            entity_type="Blesensor.per300",
+            entity_id="jp.sendai.Blesensor.per300.109",
         ),
     }
     rows = [
-        direction_row(interval_min=15, count=1),
+        direction_row(interval_min=5),
+        direction_row(interval_min=15),
+        direction_row(from_group_place_id="quick.10"),
+        direction_row(from_group_place_id="sendai2023.999"),
         direction_row(
-            from_group_place_id="quick.105",
-            to_group_place_id="sendai202603.106",
-            count=2,
+            from_group_place_id="sendai2023.105",
+            to_group_place_id="ALL",
         ),
         direction_row(
-            from_group_place_id="sendai202603.999",
-            to_group_place_id="sendai202603.106",
-            count=3,
+            from_group_place_id="sendai202603.108",
+            to_group_place_id="ALL",
         ),
         direction_row(
-            from_group_place_id="sendai202603.105",
+            from_group_place_id="sendai202603.109",
+            to_group_place_id="ALL",
+        ),
+        direction_row(
+            from_group_place_id="sendai2023.10",
             to_group_place_id="sendai202603.105",
-            count=4,
-        ),
-        direction_row(
-            from_group_place_id="sendai202603.105",
-            to_group_place_id="sendai202603.106",
-            from_device_type="Pixel3aUT",
+            from_device_type="M5Stack",
             to_device_type="M5Stack",
-            count=5,
-        ),
-        direction_row(
-            from_group_place_id="sendai202603.105",
-            to_group_place_id="sendai202603.106",
-            count=6,
         ),
     ]
 
-    result = transform_direction_rows(rows, metadata_index, now=fixed_clock)
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        outcome = transform(rows, metadata_index)
 
-    assert result.rows_dropped == 5
+    assert isinstance(outcome, DirectionNoPayloadOutcome)
+    assert not isinstance(outcome, DirectionSourceInvalidOutcome)
+    assert outcome.rows_dropped == len(rows)
+    assert records(caplog, "ignored_place_prefix")
+    assert records(caplog, "unknown_place_interval")
+    assert records(caplog, "device_mismatch")
+    assert all(record.levelno == logging.DEBUG for record in caplog.records)
 
 
-def test_transform_direction_returns_zero_rows_dropped_when_all_rows_survive() -> None:
-    metadata_index = {(105, 60): place(place_number=105, identifcation="105")}
-
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                count=85,
-            ),
-        ],
-        metadata_index,
-        now=fixed_clock,
+def test_transform_direction_drops_unsupported_interval_before_logging(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    row = direction_row(
+        from_group_place_id="unknown.from",
+        to_group_place_id="unknown.to",
+        interval_min=15,
     )
 
-    assert result.rows_dropped == 0
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        outcome = transform([row], {})
+
+    assert isinstance(outcome, DirectionNoPayloadOutcome)
+    assert outcome.rows_dropped == 1
+    assert caplog.records == []
 
 
-def test_transform_direction_truncates_date_retrieved_to_whole_seconds() -> None:
-    metadata_index = {(105, 60): place(place_number=105, identifcation="105")}
-    micros_clock = datetime(2026, 5, 25, 11, 40, 3, 288677, tzinfo=JST)
+@pytest.mark.parametrize(
+    ("source_id", "ignored_prefixes", "expected_prefix"),
+    [
+        ("quick.999", ("quick.", "test"), "quick."),
+        ("noise.999", ("noise.",), "noise."),
+    ],
+    ids=("default-prefix", "custom-prefix"),
+)
+def test_transform_direction_drops_ignored_prefix_before_metadata_lookup(
+    source_id: str,
+    ignored_prefixes: tuple[str, ...],
+    expected_prefix: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        outcome = transform_direction_window(
+            [
+                direction_row(
+                    from_group_place_id=source_id,
+                    to_group_place_id="sendai202603.999",
+                )
+            ],
+            {},
+            aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+            ignored_place_prefixes=ignored_prefixes,
+            now=fixed_clock,
+        )
 
-    result = transform_direction_rows(
-        [
-            direction_row(
-                from_group_place_id="ALL",
-                to_group_place_id="sendai202603.105",
-                count=1,
-            ),
-        ],
-        metadata_index,
-        now=lambda: micros_clock,
-    )
-
-    [payload] = result.payloads
-    assert payload["attrs"]["dateRetrieved"]["value"] == "2026-05-25T11:40:03+09:00"
+    assert isinstance(outcome, DirectionNoPayloadOutcome)
+    assert outcome.rows_dropped == 1
+    [ignored_record] = records(caplog, "ignored_place_prefix")
+    assert ignored_record.matched_prefix == expected_prefix
+    assert records(caplog, "unknown_place_interval") == []
 
 
-def test_transform_direction_logging_extras_are_allowed() -> None:
-    required = {
-        "from_group_place_id",
-        "to_group_place_id",
-        "from_device_type",
-        "to_device_type",
-        "place_number",
-        "interval_min",
-        "matched_prefix",
-        "expected_device_type",
+def test_transform_direction_rejects_pairwise_candidate_without_totals() -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(
+            place_number=106,
+            entity_id="jp.sendai.Blesensor.per3600.106",
+        ),
     }
-    assert required <= _ALLOWED_EXTRA_KEYS
+    rows = [
+        direction_row(count=12),
+        *complete_totals("sendai202603.105", from_all=85, to_all=82),
+    ]
+
+    outcome = transform(rows, metadata_index)
+
+    assert isinstance(outcome, DirectionSourceInvalidOutcome)
+    assert not isinstance(outcome, DirectionNoPayloadOutcome)
+    assert outcome.missing_from_all_place_numbers == (106,)
+    assert outcome.missing_to_all_place_numbers == (106,)
+    assert outcome.rows_dropped == 0
+    assert not hasattr(outcome, "payload")
+
+
+def test_transform_direction_sorts_multiple_missing_total_places_ascending() -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (210, 60): place(
+            place_number=210,
+            entity_id="jp.sendai.Blesensor.per3600.210",
+        ),
+    }
+    rows = [
+        direction_row(
+            from_group_place_id="sendai202603.210",
+            to_group_place_id="sendai202603.105",
+        )
+    ]
+
+    outcome = transform(rows, metadata_index)
+
+    assert isinstance(outcome, DirectionSourceInvalidOutcome)
+    assert outcome.missing_from_all_place_numbers == (105, 210)
+    assert outcome.missing_to_all_place_numbers == (105, 210)
+    assert outcome.rows_dropped == 0
+    assert not hasattr(outcome, "payload")
+
+
+@pytest.mark.parametrize(
+    ("row", "missing_from", "missing_to"),
+    [
+        (
+            direction_row(
+                from_group_place_id="ALL",
+                to_group_place_id="sendai202603.106",
+                count=8,
+            ),
+            (),
+            (106,),
+        ),
+        (
+            direction_row(
+                from_group_place_id="sendai202603.106",
+                to_group_place_id="ALL",
+                count=6,
+            ),
+            (106,),
+            (),
+        ),
+    ],
+    ids=("only-all-to-place", "only-place-to-all"),
+)
+def test_transform_direction_rejects_candidate_whose_only_row_is_one_total(
+    row: dict[str, Any],
+    missing_from: tuple[int, ...],
+    missing_to: tuple[int, ...],
+) -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(
+            place_number=106,
+            entity_id="jp.sendai.Blesensor.per3600.106",
+        ),
+    }
+    outcome = transform(
+        [
+            *complete_totals("sendai202603.105", from_all=5, to_all=4),
+            row,
+        ],
+        metadata_index,
+    )
+
+    assert isinstance(outcome, DirectionSourceInvalidOutcome)
+    assert outcome.missing_from_all_place_numbers == missing_from
+    assert outcome.missing_to_all_place_numbers == missing_to
+    assert outcome.rows_dropped == 0
+    assert not hasattr(outcome, "payload")

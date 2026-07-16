@@ -1,11 +1,12 @@
 """Read Orion current values or STH-Comet history for operator inspection."""
 
 import argparse
+import csv
 import json
 import logging
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,15 +24,18 @@ from sendai_pipeline.metadata import (
     parse_entity_id,
 )
 from sendai_pipeline.orion_client import OrionClient, OrionSettings
+from sendai_pipeline.settings_validation import validate_exact_value
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
-    PRODUCT_B_HISTORY_ATTRS,
+    PRODUCT_B_STABLE_WRITE_ATTRS,
 )
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LAST_N = 10
 DEFAULT_METADATA_PATH = Path("metadata/sensors.csv")
+_DEFAULT_PRODUCT_B_AGGREGATE_ENTITY_ID = "jp.sendai.Blesensor.flow"
+_DEFAULT_PRODUCT_B_AGGREGATE_ENTITY_TYPE = "Blesensor.flow"
 _WINDOW_FORMAT = "%Y%m%d_%H%M"
 _JST = timezone(timedelta(hours=9), name="JST")
 
@@ -46,6 +50,81 @@ class EntityTarget:
 
 class ShowDataConfigError(RuntimeError):
     """Raised when show-data arguments are invalid."""
+
+
+@dataclass(frozen=True)
+class ShowDataSettings:
+    """Configuration used to identify the Product B aggregate entity.
+
+    The Product B aggregate identity is validated lazily via
+    :meth:`product_b_aggregate_target`, not in :meth:`from_env`. A target is
+    classified as the aggregate by comparing its id against the *unvalidated*
+    configured id (:meth:`product_b_aggregate_entity_id_raw`). The
+    ``PRODUCT_B_AGGREGATE_*`` values are validated only when the aggregate type
+    must be resolved from configuration — a matched bare id with no ``--type``;
+    an explicit ``--type`` supplies the type and bypasses that validation. A
+    Product A read (whose id differs from the configured aggregate id) never
+    validates ``PRODUCT_B_AGGREGATE_*``, so a malformed value cannot fail it.
+    """
+
+    metadata_path: Path = DEFAULT_METADATA_PATH
+    # Raw, unvalidated env values for the aggregate identity (``None`` when
+    # unset). Validated on demand by ``product_b_aggregate_target``.
+    _product_b_entity_id_env: str | None = None
+    _product_b_entity_type_env: str | None = None
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str] | None = None) -> "ShowDataSettings":
+        """Build aggregate entity settings from environment variables."""
+        source = os.environ if env is None else env
+        metadata_path = source.get("SENSOR_METADATA_PATH", "").strip()
+        return cls(
+            metadata_path=Path(metadata_path)
+            if metadata_path
+            else DEFAULT_METADATA_PATH,
+            _product_b_entity_id_env=source.get("PRODUCT_B_AGGREGATE_ENTITY_ID"),
+            _product_b_entity_type_env=source.get("PRODUCT_B_AGGREGATE_ENTITY_TYPE"),
+        )
+
+    def product_b_aggregate_entity_id_raw(self) -> str:
+        """Return the configured aggregate id, default applied, *unvalidated*.
+
+        Used to test whether a target is the aggregate entity before deciding
+        whether to validate the full identity. Comparing against this raw value
+        (rather than a canonical-shape heuristic) keeps a canonical-shaped
+        aggregate override working, while a Product A target that does not match
+        it never triggers ``PRODUCT_B_AGGREGATE_*`` validation.
+        """
+        if self._product_b_entity_id_env is None:
+            return _DEFAULT_PRODUCT_B_AGGREGATE_ENTITY_ID
+        return self._product_b_entity_id_env
+
+    def product_b_aggregate_target(self) -> tuple[str, str]:
+        """Return the validated Product B aggregate ``(entity_id, entity_type)``.
+
+        Call this only for a confirmed aggregate target — one whose id equals
+        :meth:`product_b_aggregate_entity_id_raw`. A Product A read never calls
+        it and so never touches ``PRODUCT_B_AGGREGATE_*``.
+
+        Raises:
+            ShowDataConfigError: If either ``PRODUCT_B_AGGREGATE_*`` value is
+                empty, has surrounding whitespace, or contains a control
+                character.
+        """
+        return (
+            validate_exact_value(
+                self._product_b_entity_id_env,
+                "PRODUCT_B_AGGREGATE_ENTITY_ID",
+                _DEFAULT_PRODUCT_B_AGGREGATE_ENTITY_ID,
+                ShowDataConfigError,
+            ),
+            validate_exact_value(
+                self._product_b_entity_type_env,
+                "PRODUCT_B_AGGREGATE_ENTITY_TYPE",
+                _DEFAULT_PRODUCT_B_AGGREGATE_ENTITY_TYPE,
+                ShowDataConfigError,
+            ),
+        )
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -71,11 +150,6 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--flow-attrs",
         action="store_true",
         help="Use the Product A attribute set.",
-    )
-    attrs.add_argument(
-        "--direction-attrs",
-        action="store_true",
-        help="Use the Product B attribute set.",
     )
     parser.add_argument("--place", type=int, action="append", default=[])
     parser.add_argument(
@@ -103,8 +177,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parse_args(argv)
         configure_logging(LoggingSettings.from_env(), product="show_data")
-        targets = _resolve_targets(args)
-        attrs = _attrs(args)
+        settings = ShowDataSettings.from_env()
+        targets = _resolve_targets(args, settings=settings)
+        attrs = _attrs(args, targets=targets, settings=settings)
         _validate_source_args(args, attrs=attrs, targets=targets)
         comet_attrs = _split_attrs(attrs) if args.source == "comet" else []
         history_query = _history_query(args) if args.source == "comet" else None
@@ -165,15 +240,27 @@ def _validate_source_args(
                 )
 
 
-def _resolve_targets(args: argparse.Namespace) -> list[EntityTarget]:
+def _resolve_targets(
+    args: argparse.Namespace,
+    *,
+    settings: ShowDataSettings,
+) -> list[EntityTarget]:
     """Resolve explicit entity specs or place numbers to entity targets."""
     explicit_specs = [*args.entity_id, *args.entity_specs]
     if args.place and explicit_specs:
         raise ShowDataConfigError("--place and --entity-id are mutually exclusive")
     if args.place:
-        return _targets_from_places(args.place, interval_min=args.interval_min)
+        return _targets_from_places(
+            args.place,
+            interval_min=args.interval_min,
+            metadata_path=settings.metadata_path,
+        )
     if explicit_specs:
-        return _parse_entity_specs(explicit_specs, default_type=args.entity_type)
+        return _parse_entity_specs(
+            explicit_specs,
+            default_type=args.entity_type,
+            settings=settings,
+        )
     raise ShowDataConfigError(
         "at least one --place, --entity-id, or ENTITY_SPEC is required"
     )
@@ -183,6 +270,7 @@ def _targets_from_places(
     place_numbers: Sequence[int],
     *,
     interval_min: int | None,
+    metadata_path: Path,
 ) -> list[EntityTarget]:
     """Resolve place numbers to entity targets through runtime metadata.
 
@@ -191,6 +279,7 @@ def _targets_from_places(
         interval_min: Aggregation interval to select. When ``None``
             (``--interval-min`` omitted), every active interval for the place
             is returned — usually both the 5-minute and 60-minute entities.
+        metadata_path: Sensor metadata CSV to read.
 
     Returns:
         Resolved :class:`EntityTarget` rows. With ``interval_min=None`` a
@@ -200,9 +289,7 @@ def _targets_from_places(
         ShowDataConfigError: If a place has no active metadata row (at the
             requested interval, when one is given).
     """
-    places = [
-        place for place in load_metadata(_metadata_path_from_env()) if place.active
-    ]
+    places = [place for place in load_metadata(metadata_path) if place.active]
     # Index is keyed by (place_number, interval_min); see metadata module.
     index = index_by_place_interval(places)
 
@@ -237,17 +324,43 @@ def _parse_entity_specs(
     specs: Sequence[str],
     *,
     default_type: str | None,
+    settings: ShowDataSettings,
 ) -> list[EntityTarget]:
     """Parse ``ENTITY_ID[:ENTITY_TYPE]`` command-line specs into targets.
 
-    The entity type is optional. Precedence is: explicit ``:ENTITY_TYPE``, else
-    the ``--type`` flag (*default_type*), else the type inferred from a
-    canonical id (see :func:`sendai_pipeline.metadata.parse_entity_id`).
+    A spec equal to the configured aggregate id is treated as a bare aggregate
+    id before any ``:TYPE`` split, so a colon-bearing configured id (e.g. a URN)
+    is not mis-split. Otherwise the entity type is optional, with precedence:
+    explicit ``:ENTITY_TYPE``, else the ``--type`` flag (*default_type*), else
+    the type inferred from a canonical id (see
+    :func:`sendai_pipeline.metadata.parse_entity_id`). An inline ``:TYPE``
+    applies only to the spec it is attached to, unlike ``--type``, which is
+    the fallback for every spec in the batch that has no inline type.
+
+    The inline split uses ``str.rpartition(":")``, the *last* colon in the
+    spec, which has two consequences for a colon-bearing (e.g. URN-style)
+    non-aggregate id:
+
+    - It cannot be passed bare: a bare ``urn:ngsi-ld:Foo:Bar`` is mis-split
+      into id ``urn:ngsi-ld:Foo`` and type ``Bar``. Because the split
+      happens before the ``--type`` fallback is consulted, that ``Bar`` wins
+      and ``--type`` does not rescue it. Give it a colon-free inline type
+      instead, e.g. ``urn:ngsi-ld:Foo:Bar:SomeType``: the last colon splits
+      off ``SomeType`` as the type and keeps the full id intact.
+    - Its type cannot itself contain a colon inline (that colon would be the
+      split point). Pass such a type with ``--type`` — but that only works
+      when the id is colon-free or is the configured aggregate id.
+
+    The configured aggregate id is exempt from the bare-id mis-split above:
+    the exact-match check resolves it as a whole before any split, so it works
+    bare whether or not it contains colons. (An inline colon-bearing type on it
+    still re-enters the split, so pass such a type with ``--type``.)
 
     Args:
         specs: Raw ``ENTITY_ID`` or ``ENTITY_ID:ENTITY_TYPE`` strings.
         default_type: Fallback entity type from ``--type``, used for bare ids
             when no inline type is given.
+        settings: Configured Product B aggregate identity.
 
     Returns:
         One :class:`EntityTarget` per spec, in input order.
@@ -258,6 +371,20 @@ def _parse_entity_specs(
     """
     targets: list[EntityTarget] = []
     for spec in specs:
+        # An exact match to the configured aggregate id is a bare aggregate id,
+        # resolved before any ":TYPE" split: the configured id may itself
+        # contain colons (e.g. a URN), which rpartition would otherwise
+        # mis-split as an inline type. An explicit ``ID:TYPE`` (spec differs
+        # from the configured id) still falls through to the inline path below.
+        if spec == settings.product_b_aggregate_entity_id_raw():
+            entity_type = _entity_type_for_spec(
+                spec,
+                explicit_type=default_type,
+                settings=settings,
+                error_hint="pass an explicit :TYPE or --type",
+            )
+            targets.append(EntityTarget(spec, entity_type))
+            continue
         # rpartition on ":" splits off an inline type; no ":" means bare id.
         entity_id, separator, entity_type = spec.rpartition(":")
         if not separator:
@@ -268,6 +395,7 @@ def _parse_entity_specs(
             entity_type = _entity_type_for_spec(
                 entity_id,
                 explicit_type=default_type,
+                settings=settings,
                 error_hint="pass an explicit :TYPE or --type",
             )
             targets.append(EntityTarget(entity_id, entity_type))
@@ -284,16 +412,23 @@ def _entity_type_for_spec(
     entity_id: str,
     *,
     explicit_type: str | None,
+    settings: ShowDataSettings,
     error_hint: str,
 ) -> str:
     """Resolve the entity type for a bare id from ``--type`` or the id itself.
 
-    An explicit *explicit_type* (the ``--type`` flag) wins and shadows any
-    inferred type; otherwise the type is inferred from the canonical id.
+    Precedence: an explicit *explicit_type* (the ``--type`` flag) wins;
+    otherwise, if *entity_id* equals the configured aggregate id, the validated
+    Product B type; otherwise a canonical id's inferred type. The aggregate id
+    is matched against the *unvalidated* configured id, so any configured
+    aggregate id — including a canonical-shaped one — gets the configured type;
+    a target that does not match never validates ``PRODUCT_B_AGGREGATE_*``, so a
+    malformed value cannot fail a Product A read.
 
     Args:
         entity_id: Bare entity id (no inline ``:TYPE``).
         explicit_type: The ``--type`` flag value, or ``None`` if unset.
+        settings: Configured Product B aggregate identity.
         error_hint: Trailing guidance appended to the error message naming
             the flags this tool accepts.
 
@@ -301,13 +436,18 @@ def _entity_type_for_spec(
         The resolved entity type.
 
     Raises:
-        ShowDataConfigError: If no ``--type`` is given and *entity_id* is not
-            canonical, so no type can be inferred.
+        ShowDataConfigError: If no ``--type`` is given and *entity_id* is
+            neither the configured aggregate id nor canonical, so no type can
+            be inferred; or if it is the aggregate id but the configured
+            ``PRODUCT_B_AGGREGATE_*`` values are malformed.
     """
-    parsed = parse_entity_id(entity_id)
     if explicit_type is not None:
         _log_if_type_override(entity_id, explicit_type)
         return explicit_type
+    if entity_id == settings.product_b_aggregate_entity_id_raw():
+        _, aggregate_type = settings.product_b_aggregate_target()
+        return aggregate_type
+    parsed = parse_entity_id(entity_id)
     if parsed is not None:
         return parsed.entity_type
     raise ShowDataConfigError(
@@ -330,13 +470,83 @@ def _log_if_type_override(entity_id: str, explicit_type: str) -> None:
         )
 
 
-def _attrs(args: argparse.Namespace) -> str | None:
+def _attrs(
+    args: argparse.Namespace,
+    *,
+    targets: Sequence[EntityTarget],
+    settings: ShowDataSettings,
+) -> str | None:
     """Return the selected comma-separated attribute list."""
     if args.flow_attrs:
         return ",".join(PRODUCT_A_HISTORY_ATTRS)
-    if args.direction_attrs:
-        return ",".join(PRODUCT_B_HISTORY_ATTRS)
+    if args.attrs is not None:
+        return args.attrs
+    if args.source == "comet" and targets and _targets_are_aggregate(targets, settings):
+        return ",".join(_aggregate_history_attrs(settings.metadata_path))
     return args.attrs
+
+
+def _targets_are_aggregate(
+    targets: Sequence[EntityTarget],
+    settings: ShowDataSettings,
+) -> bool:
+    """Whether every target is the configured Product B aggregate entity.
+
+    Compares each target id against the *unvalidated* configured aggregate id,
+    so a Product A read (whose ids differ from it) never validates the Product B
+    config — a malformed ``PRODUCT_B_AGGREGATE_*`` cannot fail it. This
+    comparison does not itself validate the aggregate config; that happens
+    earlier if the aggregate type is resolved from configuration (a bare
+    aggregate id with no ``--type``).
+    """
+    aggregate_id = settings.product_b_aggregate_entity_id_raw()
+    return all(target.entity_id == aggregate_id for target in targets)
+
+
+def _aggregate_history_attrs(metadata_path: Path) -> tuple[str, ...]:
+    """Return scalar and active 60-minute dynamic aggregate attributes.
+
+    Enumerates one ``peopleCount_flow_<place_number>`` per active 60-minute
+    metadata row, appended to the stable scalar attrs.
+
+    This reads the CSV directly rather than through ``metadata.load_metadata``
+    on purpose: enumeration must be *batch-independent* so an operator can
+    inspect the history of any active place, including one whose ``batch`` is
+    not among the values ``load_metadata`` recognises. ``load_metadata``
+    validates ``batch`` against its own hard-coded set of known batch values
+    and raises on any other value, which would hide that row's attribute from
+    inspection. (That check is separate from the configured publish-target
+    batches, which the pipeline filters on elsewhere.)
+    """
+    active_place_numbers: set[int] = set()
+    try:
+        with metadata_path.open(newline="", encoding="utf-8-sig") as handle:
+            for row_number, row in enumerate(csv.DictReader(handle), start=2):
+                active = (row.get("active") or "").strip().lower()
+                if active not in {"true", "false"}:
+                    raise ShowDataConfigError(
+                        "metadata column active at row "
+                        f"{row_number} must be true or false"
+                    )
+                if active == "false":
+                    continue
+                try:
+                    interval_min = int((row.get("interval_min") or "").strip())
+                    place_number = int((row.get("place_number") or "").strip())
+                except ValueError as exc:
+                    raise ShowDataConfigError(
+                        f"invalid interval or place number at metadata row {row_number}"
+                    ) from exc
+                if interval_min == 60:
+                    active_place_numbers.add(place_number)
+    except OSError as exc:
+        raise ShowDataConfigError(f"failed to read metadata: {metadata_path}") from exc
+
+    dynamic_attrs = tuple(
+        f"peopleCount_flow_{place_number}"
+        for place_number in sorted(active_place_numbers)
+    )
+    return (*PRODUCT_B_STABLE_WRITE_ATTRS, *dynamic_attrs)
 
 
 def _split_attrs(attrs: str | None) -> list[str]:
@@ -629,14 +839,6 @@ def _status_code(exc: requests.HTTPError) -> int | None:
     """Return an HTTP status code from a ``requests.HTTPError`` if available."""
     response = getattr(exc, "response", None)
     return getattr(response, "status_code", None)
-
-
-def _metadata_path_from_env() -> Path:
-    """Return the runtime metadata path from the environment."""
-    value = os.environ.get("SENSOR_METADATA_PATH")
-    if value is None or value == "":
-        return DEFAULT_METADATA_PATH
-    return Path(value)
 
 
 if __name__ == "__main__":

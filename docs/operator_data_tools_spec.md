@@ -54,10 +54,12 @@ summary.
 
 ### Goal
 
-Re-publish source-windows in a specified date range, optionally
-narrowed to a specific place or set of places, by replaying the
-runner-internal `_process_send_window` code path for windows with
-source rows.
+Re-publish source-windows in a specified date range — for flow,
+optionally narrowed to a specific place or set of places — by replaying
+the runner-internal per-product send path (`_process_send_window`) for
+windows with source rows. Direction takes no target selector: each
+window rewrites the whole Product B aggregate entity with one
+`PUT /attrs`.
 
 ### Note
 
@@ -67,6 +69,15 @@ Pass the same value to `--from` and `--to` to resend exactly one window:
 ```sh
 uv run python scripts/resend.py flow \
     --interval-min 60 \
+    --from 20260524_1000 --to 20260524_1000 \
+    --reason "payload fix" --send
+```
+
+For direction, omit the interval (it is always `60`) and pass no target
+selector; each window rewrites the whole aggregate entity:
+
+```sh
+uv run python scripts/resend.py direction \
     --from 20260524_1000 --to 20260524_1000 \
     --reason "payload fix" --send
 ```
@@ -88,21 +99,29 @@ uv run python scripts/resend.py {flow|direction}
 | Flag | Required | Purpose |
 |---|---|---|
 | `flow` / `direction` | yes | Which product. |
-| `--interval-min` | conditional | `5` or `60`. Required for `--place` or unfiltered runs. Optional with canonical `--entity-id`, where all ids must infer the same interval. A single invocation publishes one interval. |
+| `--interval-min` | conditional | `5` or `60`. **Flow:** required for `--place` or unfiltered runs; optional with canonical `--entity-id`, where all ids must infer the same interval. **Direction:** publishes interval `60` only — omit it (it defaults to `60`), and `--interval-min 5` is rejected. A single invocation publishes one interval. |
 | `--from`, `--to` | yes | Source-window keys, JST, inclusive. |
-| `--place` | no | Place number filter. Repeatable. Resolved via metadata. |
-| `--entity-id` | no | Explicit entity id. Repeatable. Mutually exclusive with `--place`. |
+| `--place` | no | **Flow only.** Place number filter. Repeatable. Resolved via metadata. Rejected for `direction`, whose single aggregate entity is always rewritten whole. |
+| `--entity-id` | no | **Flow only.** Explicit entity id. Repeatable. Mutually exclusive with `--place`. Rejected for `direction` (a filtered write to the aggregate entity would drop the other places). |
 | `--reason` | yes | Audit string; written to every log record this run emits. |
-| `--force` | no | Bypass the per-target skip. Default: skip any target already `ok` in state (whether its payload matches or has drifted); see the `--force` Safety note for why a uniform backfill needs it. |
+| `--force` | no | Bypass the per-target skip. Default: skip a prior-`ok` target only when its payload hash is unchanged — a drifted payload (source revised after delivery) is re-sent automatically. See the `--force` Safety note for why a uniform re-publish of unchanged data needs it. |
 | `--send` | no | Live writes. Default: dry-run. |
+
+For `direction`, the target selectors above (`--place`, `--entity-id`,
+`--interval-min 5`) are rejected before the run takes the product lock or
+sends anything: Product B always rewrites the whole aggregate entity at
+interval `60`, so a partial selection has no meaning.
 
 ### Behavior
 
-1. Resolve the interval before window validation: explicit
+1. Resolve the interval before window validation. **Flow:** explicit
    `--interval-min` wins, canonical `--entity-id` can infer it, and
-   `--place`/unfiltered runs require the flag. Then validate args
-   (range is non-empty and aligned to interval; place/entity-id mutual
-   exclusion; `--reason` non-empty). There is no age cap on the range.
+   `--place`/unfiltered runs require the flag. **Direction:** the interval
+   is always `60` (omit `--interval-min`; `--interval-min 5` is rejected).
+   Then validate args (range is non-empty and aligned to interval; for
+   flow, place/entity-id mutual exclusion; for direction, the target
+   selectors are rejected outright; `--reason` non-empty). There is no age
+   cap on the range.
 2. Enumerate every source window between `--from` and `--to` at
    `--interval-min` step.
 3. In `--send` mode, prepare the run and then process each window:
@@ -122,63 +141,71 @@ uv run python scripts/resend.py {flow|direction}
      rows; if a window has no source rows, skip it before calling
      `_process_send_window`: no `begin_window_attempt`, no state entry, no
      save, and no cadence-counter advance. This matches the live runners,
-     which only process windows that have source rows. For direction this
-     prevents permanent `partial` growth from empty windows; for flow it
-     avoids re-touching an existing window that the live path would never
-     revisit.
+     which only process windows that have source rows; for either product
+     it avoids creating state for a window the live path would never touch.
    - **Dry-run is unchanged:** it runs no pre-flight, makes no MySQL query,
      cannot know which windows are empty, and keeps printing the planned
      range.
-4. For each window with source rows, call the same
-   `_process_send_window` the cron runners use, but with
-   **`interval_metadata` filtered to the
-   place/entity-id selection** so the transform step builds payloads
-   only for the requested targets. For Product A, completion state still
-   follows the normal observed-target rule (`stored ∪ observed`) and a
-   filtered resend never shrinks existing `expected_target_ids`. For
-   Product B, a new resend-created window uses the filtered fixed-target
-   set; an existing window keeps its stored first-attempt snapshot. (The
-   transforms iterate `interval_metadata`/the metadata index when
-   constructing payloads; filtering state bookkeeping alone would still
-   POST to every active target, which is the opposite of what `--place`
-   means to an operator.)
+4. For each window with source rows, call the same per-product send path
+   the cron runners use:
+   - **Flow (Product A).** Call `run_flow._process_send_window` with
+     **`interval_metadata` filtered to the place/entity-id selection** so
+     the transform builds payloads only for the requested targets.
+     Completion state still follows the normal observed-target rule
+     (`stored ∪ observed`), and a filtered resend never shrinks existing
+     `expected_target_ids`. (The transform iterates `interval_metadata`
+     when constructing payloads; filtering state bookkeeping alone would
+     still POST to every active target, the opposite of what `--place`
+     means to an operator.)
+   - **Direction (Product B).** Call `run_direction._process_send_window`
+     unfiltered. Product B accepts no target selector (see the CLI table),
+     so every window rebuilds the whole aggregate payload and replaces it
+     on the single configured aggregate entity with one `PUT /attrs`.
+     There is no per-target set and no first-attempt snapshot to preserve:
+     the one expected target id is always the aggregate entity.
 5. `--force` flips the per-target skip: pass a flag through
    `_process_send_window` that causes the hash-skip check to be
    bypassed for this run. (Implementation detail: add a
    `force_resend: bool = False` kwarg to `_process_send_window` in both
    `run_flow.py` and `run_direction.py`; default `False` preserves
    today's behavior.)
-6. Dry-run prints, per window, the planned `(window_key, target_count,
-   skipped_by_hash, would_post)` tuple and exits **before any MySQL
-   query, Orion auth token fetch, or Orion HTTP call** (no live side
-   effects, no credentials required in dry-run).
-7. **State persistence cadence (`--send`).** Resend does **not** persist
-   state after every target POST. The shared `_process_send_window`
-   rewrites the whole state file on each target by default. This gives
-   durability for the cron runners' small rolling lookback, where the
-   cost is negligible. Across a multi-day resend that same per-target save
-   rewrites a large (production: ~16 MB) state file once per target:
+6. Dry-run prints, per window, the planned tuple — `(window_key,
+   target_count, skipped_by_hash, would_post)` for flow, and
+   `(window_key, target_count=1, skipped_by_hash, would_put=1)` for
+   direction (one aggregate PUT) — and exits **before any MySQL query,
+   Orion auth token fetch, or Orion HTTP call** (no live side effects, no
+   credentials required in dry-run).
+7. **State persistence cadence for flow (`--send`).** For flow, resend
+   does **not** persist state after every target POST.
+   `run_flow._process_send_window` rewrites the whole state file on each
+   posted target by default. This gives durability for the cron runner's
+   small rolling lookback, where the cost is negligible. Across a
+   multi-day resend that same per-target save rewrites a large
+   (production: ~16 MB) state file once per target:
    O(windows × targets) full rewrites, which dominate runtime. Resend
    instead suppresses the per-target save and flushes on a coarse
    per-window cadence: it persists once every `_RESEND_SAVE_EVERY`
    processed windows (module constant, default `100`) and once more at
    the end of the run when any processed window or final GC removal
    remains unflushed. The cadence counter
-   advances once per processed window with source rows (including a
+   advances once per processed window with source rows (including a flow
    window whose source rows are filtered to zero POST targets, which is
    still processed and can still become `partial`), so any in-memory
    state change such a window makes is flushed by the cadence rather than
    left stranded until a later window's save. A no-source-row window is
    skipped before processing and does not advance the cadence counter.
-   (Implementation detail: add a `persist_each_target: bool = True` kwarg
-   to `_process_send_window` in both `run_flow.py` and `run_direction.py`,
-   guarding the in-loop `state_store.save()`; default `True` preserves
-   the cron runners' per-target durability. Resend passes `False` and
-   owns the cross-window flush cadence. Suppressing the per-target save
-   changes only *when* the store is written to disk, not *what* it
-   contains: the same `record_target` / `recompute_status` mutations the
-   per-target-save path performs still occur, so the final on-disk state
-   is identical to that path for a completed run.) `_RESEND_SAVE_EVERY` is an internal I/O-batching knob,
+   (Implementation detail: the flow path takes a `persist_each_target:
+   bool = True` kwarg on `run_flow._process_send_window`, guarding the
+   in-loop `state_store.save()`; default `True` preserves the cron
+   runner's per-target durability, and resend passes `False`. Suppressing
+   that per-target save changes only *when* the store is written to disk,
+   not *what* it contains: the same `record_target` / `recompute_status`
+   mutations still occur, so the final on-disk state matches the
+   per-target-save path for a completed run. The direction path has no
+   such kwarg: `run_direction._process_send_window` calls `state_store.save()`
+   after each window's aggregate `PUT`, so direction is already persisted
+   per window and does not depend on the coarse cadence for durability.)
+   `_RESEND_SAVE_EVERY` is an internal I/O-batching knob,
    not deployment-tuned configuration, so it is a module constant rather
    than an env var.
 8. **State GC (`--send`).** Resend reclaims complete windows older than
@@ -265,19 +292,21 @@ uv run python scripts/resend.py {flow|direction}
   explicit; without it, targets whose stored payload hash matches the
   new payload are skipped.
 - **`--force` is required for a *uniform* backfill.** Without it, the
-  per-target skip is applied by each target's stored status: a target that
-  is already `ok` is skipped (whether its payload matches or has drifted),
-  while a target with no stored record (for example one whose window was
-  already reclaimed by GC) is posted. Across a range wider than the live
-  GC horizon this is **non-uniform**: recent in-state windows are skipped
-  (no new Comet row) while older reclaimed windows are re-posted (a new
-  Comet row), yet the run still exits 0 and looks uniform. Pass `--force`
+  per-target skip is applied by each target's stored hash: a prior-`ok`
+  target whose payload is unchanged is skipped, while a target with no
+  stored record (for example one whose window was already reclaimed by GC)
+  is posted. (A prior-`ok` target whose payload has since drifted is
+  re-sent regardless, so this concerns re-publishing *unchanged* data.)
+  Across a range wider than the live GC horizon this is **non-uniform**:
+  recent unchanged in-state windows are skipped (no new Comet row) while
+  older reclaimed windows are re-posted (a new Comet row), yet the run
+  still exits 0 and looks uniform. Pass `--force`
   whenever the intent is a uniform re-publish of the whole range.
-- **Exit 0 does not imply every window is `complete`.** The run exits 1
-  only when a POST fails. Two no-failed-POST cases still leave a window
-  short of `complete`, and neither is a delivery failure (both signal a
-  configuration or source-data gap a bare re-run will not fix), so neither
-  changes the exit code:
+- **Exit 0 does not imply every flow window is `complete`.** For flow the
+  run exits 1 only when a POST fails. Two no-failed-POST cases still leave
+  a window short of `complete`, and neither is a delivery failure (both
+  signal a configuration or source-data gap a bare re-run will not fix),
+  so neither changes the exit code:
   - An expected target with source rows but **no payload** (its rows were
     filtered out, or it had no data this window): the window finishes
     `partial`, emits a per-window `window_partial` WARNING, and is counted
@@ -288,6 +317,13 @@ uv run python scripts/resend.py {flow|direction}
     `windows_complete`. Watch for it via the per-window
     `resend_window_processed` records (zero posts) rather than the
     aggregate counts.
+- **Direction exit code.** For direction the run exits 1 when any
+  aggregate `PUT` fails (`puts_failed > 0`) **or** any window is
+  source-invalid (`windows_source_invalid > 0` — a candidate place is
+  missing its `from.all` / `to.all` total, so the whole window is rejected
+  without a write). A window with no payload (`windows_no_payload`, no
+  candidate places this window) is not a failure and does not change the
+  exit code.
 - **A dead-letter window in range aborts the run (exit 2).** The dead-letter
   pre-flight (Behavior step 3) refuses the run up front, before any POST,
   and lists every offending key. Clear them with `state_repair.py` or
@@ -301,22 +337,25 @@ uv run python scripts/resend.py {flow|direction}
 - Empty source-row windows are skipped before state mutation. This
   prevents permanent `partial` accumulation for windows the live runners
   would never create.
-- **Durability tradeoff of the coarse save cadence.** Because state is
-  flushed every `_RESEND_SAVE_EVERY` processed windows rather than after
-  each target (see Behavior step 7), a true crash or hard kill
-  (SIGKILL, power loss) can lose at most `_RESEND_SAVE_EVERY` windows of
-  *recorded* delivery progress. A handled abort, such as exhausted DB
+- **Durability tradeoff of the coarse save cadence (flow).** For flow,
+  because state is flushed every `_RESEND_SAVE_EVERY` processed windows
+  rather than after each target (see Behavior step 7), a true crash or hard
+  kill (SIGKILL, power loss) can lose at most `_RESEND_SAVE_EVERY` windows
+  of *recorded* delivery progress. A handled abort, such as exhausted DB
   reconnects, best-effort flushes completed windows before exit; if that
   flush fails, the original error still decides the exit code. A re-run
   re-POSTs only progress that did not reach disk, creating extra STH-Comet
   rows. This is already the expected cost of a resend (see the STH-Comet
-  caveat above), and is bounded by the cadence and by chunked operation. Because
-  resend suppresses the per-target save, every cadence flush follows a
-  full `recompute_status`, so a hard kill cannot leave a flushed window
-  with recorded targets but a stale aggregate status on disk; it only drops
-  the unflushed in-memory windows, which the re-run reprocesses. (This
-  applies to resend; the live runners keep per-target saves and are
-  unaffected by this reasoning.)
+  caveat above), and is bounded by the cadence and by chunked operation.
+  Because flow resend suppresses the per-target save, every cadence flush
+  follows a full `recompute_status`, so a hard kill cannot leave a flushed
+  window with recorded targets but a stale aggregate status on disk; it
+  only drops the unflushed in-memory windows, which the re-run reprocesses.
+  **Direction** persists after each window's aggregate `PUT`
+  (`run_direction._process_send_window` saves unconditionally), so it does
+  not use this coarse cadence: a hard kill loses at most the current
+  window. (Both apply to resend; the live runners keep per-target saves and
+  are unaffected by this reasoning.)
 - **A hard kill can orphan a `.tmp` file.** `save()` writes a uniquely
   named temporary file and renames it over the state file atomically
   (`os.replace`), so after any normal process failure the on-disk state is
@@ -349,12 +388,16 @@ uv run python scripts/resend.py {flow|direction}
   bounded reconnect attempts are exhausted, just before the run aborts;
   carries product, interval, reason, the window key, and attempt count so
   the operator knows which chunk to re-run).
-- `resend_summary` (run end; includes `windows_empty` for skipped
+- `resend_summary` (run end. Flow includes `windows_empty` for skipped
   no-source-row windows, `windows_gc` for complete windows reclaimed by
   resend GC, and `windows_partial` / `windows_complete` for the windows
-  whose aggregate status was recomputed. A new flow window with an empty
-  effective target set returns before recomputation and is in neither count;
-  see the exit-code note under Safety).
+  whose aggregate status was recomputed; a new flow window with an empty
+  effective target set returns before recomputation and is in neither
+  count. Direction reports those same `windows_empty` / `windows_gc` /
+  `windows_partial` / `windows_complete` counts and, in place of the
+  `posts_*` fields, additionally reports `puts_ok` / `puts_failed`,
+  `windows_no_payload`, and `windows_source_invalid`. See the exit-code
+  notes under Safety).
 
 ### Tests
 
@@ -392,10 +435,11 @@ uv run python scripts/resend.py {flow|direction}
 - `test_resend_preflight_aborts_on_dead_letter_with_no_source_rows`
 - `test_resend_preflight_allows_range_with_no_dead_letter`
 
-The shared kwarg also carries its own contract in the runner test
-modules: `_process_send_window` saves once per posted target by default
-and skips the in-loop save when `persist_each_target=False`, for both
-`run_flow` and `run_direction`.
+The flow save-cadence kwarg carries its own contract in the runner test
+modules: `run_flow._process_send_window` saves once per posted target by
+default and skips the in-loop save when `persist_each_target=False`. The
+direction path has no such kwarg — it issues one aggregate `PUT` per
+window — so this contract is `run_flow`-only.
 
 ---
 
@@ -415,7 +459,7 @@ table.
 uv run python scripts/show_data.py
     --source {orion|comet}
     [--type TYPE]
-    [--attrs LIST | --flow-attrs | --direction-attrs]
+    [--attrs LIST | --flow-attrs]
     [--place N [--place N ...]]
     [--entity-id ID [--entity-id ID ...]]
     [--from ISO_OR_WINDOW] [--to ISO_OR_WINDOW]
@@ -428,9 +472,9 @@ uv run python scripts/show_data.py
 |---|---|
 | `--source orion` | One GET per entity to `/orion/v2.0/entities/<id>`. Current values only. `--from/--to/--last-n` rejected. |
 | `--source comet` | One GET per (entity, attr) to STH-Comet. Historical values. `--from/--to/--last-n` honored. |
-| `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. |
-| `--attrs LIST` | Comma-separated attribute selector. |
-| `--flow-attrs` / `--direction-attrs` | Shortcut for the Product A / Product B attribute sets. Mutually exclusive with `--attrs`. |
+| `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. For the configured Product B aggregate id, the type is resolved from the environment when omitted. |
+| `--attrs LIST` | Comma-separated attribute selector. On `--source comet`, omitting it for the configured Product B aggregate id auto-enumerates the contract scalars plus `peopleCount_flow_<place_number>` for every active interval-60 metadata row. |
+| `--flow-attrs` | Shortcut for the Product A attribute set. Mutually exclusive with `--attrs`. |
 | `--place N` | Place number (repeatable). With `--interval-min`, selects that interval; without it, resolves every active interval for the place. Mutually exclusive with `--entity-id`. |
 | `--entity-id ID` | Explicit entity id (repeatable). Canonical ids infer entity type. Mutually exclusive with `--place`. |
 | `--from`, `--to` | ISO-8601 or `YYYYMMDD_HHMM`. Comet-only. |
@@ -541,7 +585,7 @@ live-platform check that DELETE itself is reachable.)
 ```
 uv run python scripts/delete_history.py
     [--type TYPE]
-    [--attrs LIST | --flow-attrs | --direction-attrs]
+    [--attrs LIST | --flow-attrs]
     --reason "..."
     [--send]
     [--i-know-this-is-production]
@@ -555,7 +599,7 @@ Where `ENTITY_SPEC` is `ENTITY_ID[:ENTITY_TYPE]`.
 | `ENTITY_SPEC` | One or more entities to operate on. |
 | `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. |
 | `--attrs LIST` | Comma-separated attribute names. If present, the tool deletes per-attribute (one DELETE per (entity, attr)). |
-| `--flow-attrs` / `--direction-attrs` | Shortcuts. Mutually exclusive with `--attrs`. |
+| `--flow-attrs` | Shortcut for the Product A attribute set. Mutually exclusive with `--attrs`. To purge the Product B aggregate entity's history, name its attributes with `--attrs` or delete the whole entity's history with no `--attrs`. |
 | (no `--attrs`) | Per-entity delete (one DELETE per entity). |
 | `--reason` | Required. Audit string written to every log record. |
 | `--send` | Live deletes. Default: dry-run. |
@@ -616,7 +660,7 @@ with an optional chained Comet purge for that entity's history.
 ```
 uv run python scripts/delete_entities.py
     [--purge-history]
-    [--attrs LIST | --flow-attrs | --direction-attrs]
+    [--attrs LIST | --flow-attrs]
     --reason "..."
     [--send]
     ENTITY_ID[:ENTITY_TYPE] [...]
@@ -626,7 +670,7 @@ uv run python scripts/delete_entities.py
 |---|---|
 | `ENTITY_ID[:ENTITY_TYPE]` | One or more entities. Canonical Sendai ids infer the type; custom ids require inline `:ENTITY_TYPE`. |
 | `--purge-history` | After each successful Orion DELETE, also delete the entity's Comet history. |
-| `--attrs` / `--flow-attrs` / `--direction-attrs` | With `--purge-history`, scope the Comet purge to specific attributes (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed**; silently ignored attrs flags are a footgun. |
+| `--attrs` / `--flow-attrs` | With `--purge-history`, scope the Comet purge to specific attributes (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed**; silently ignored attrs flags are a footgun. |
 | `--reason` | Required. |
 | `--send` | Live deletes. Default: dry-run. |
 | `--i-know-this-is-production` | Required for `--send` when `FIWARE_SERVICE=""` or `FIWARE_SERVICE_PATH="/"`. Same guard `delete_history.py` uses; applies to the chained Comet purge as well. |

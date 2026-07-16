@@ -20,11 +20,6 @@ FLOW_ATTRS = [
     "peopleOccupancy_immedate",
     "peopleOccupancy_near",
 ]
-DIRECTION_ATTRS = [
-    "dateObservedFrom",
-    "dateObservedTo",
-    "peopleCount_flow",
-]
 
 
 class FakeAuth:
@@ -124,31 +119,14 @@ def test_delete_history_rejects_attrs_and_flow_attrs_together(
     assert runtime.comet.calls == []
 
 
-def test_delete_history_rejects_attrs_and_direction_attrs_together(
+def test_delete_history_rejects_removed_direction_attrs_flag(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
-    result = _invoke(
-        _base_args(ENTITY_10) + ["--attrs", "dateObservedFrom", "--direction-attrs"],
-        capsys,
-        runtime,
-    )
+    result = _invoke(_base_args(ENTITY_10) + ["--direction-attrs"], capsys, runtime)
 
-    assert result != 0
-    assert runtime.comet.calls == []
-
-
-def test_delete_history_rejects_flow_attrs_and_direction_attrs_together(
-    capsys: pytest.CaptureFixture[str],
-    runtime: RuntimePatch,
-) -> None:
-    result = _invoke(
-        _base_args(ENTITY_10) + ["--flow-attrs", "--direction-attrs"],
-        capsys,
-        runtime,
-    )
-
-    assert result != 0
+    assert result == 2
+    assert "unrecognized arguments: --direction-attrs" in capsys.readouterr().err
     assert runtime.comet.calls == []
 
 
@@ -489,20 +467,6 @@ def test_delete_history_flow_attrs_expands_to_seven_product_a_attributes(
 
     assert result == 0
     assert [call["attr"] for call in runtime.comet.calls] == FLOW_ATTRS
-
-
-def test_delete_history_direction_attrs_expands_to_product_b_attributes(
-    capsys: pytest.CaptureFixture[str],
-    runtime: RuntimePatch,
-) -> None:
-    result = _invoke(
-        _base_args(ENTITY_10, send=True) + ["--direction-attrs"],
-        capsys,
-        runtime,
-    )
-
-    assert result == 0
-    assert [call["attr"] for call in runtime.comet.calls] == DIRECTION_ATTRS
 
 
 def test_delete_history_204_counted_as_ok_exit_zero(

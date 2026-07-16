@@ -72,10 +72,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     configure_logging(logging_settings, product="create_sth_subscriptions")
 
     args = _parse_args(argv)
-    settings = replace(StHSubscriptionSettings.from_env(), dry_run=not args.send)
+    products = _selected_products(args.product)
+    # Validate PRODUCT_B_AGGREGATE_* only when creating the Product B
+    # subscription, so a malformed value never fails a Product A run.
+    settings = replace(
+        StHSubscriptionSettings.from_env(require_product_b="b" in products),
+        dry_run=not args.send,
+    )
     auth = AuthClient(AuthSettings.from_env()) if not settings.dry_run else None
 
-    products = _selected_products(args.product)
     results: list[StHSubscriptionResult] = []
     for product in products:
         if product == "a":

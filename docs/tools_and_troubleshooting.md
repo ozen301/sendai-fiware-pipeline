@@ -178,7 +178,7 @@ use Comet when you need historical rows.
 uv run python scripts/show_data.py
     --source {orion|comet}
     [--type TYPE]
-    [--attrs LIST | --flow-attrs | --direction-attrs]
+    [--attrs LIST | --flow-attrs]
     [--place N [--place N ...]]
     [--entity-id ID [--entity-id ID ...]]
     [--from ISO_OR_WINDOW] [--to ISO_OR_WINDOW]
@@ -193,11 +193,10 @@ uv run python scripts/show_data.py
 | Flag / arg | Purpose |
 |---|---|
 | `--source orion` / `comet` | Read current Orion entity JSON or STH-Comet history. |
-| `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Canonical `jp.sendai.Blesensor.per300/per3600.<N>` ids infer the type; append `:ENTITY_TYPE` per id or supply `--type` for custom ids or overrides. |
+| `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Canonical `jp.sendai.Blesensor.per300/per3600.<N>` ids infer the type; append `:ENTITY_TYPE` per id or supply `--type` for custom ids or overrides. The `:ENTITY_TYPE` suffix splits on the *last* colon. So a colon-bearing entity id (e.g. a URN-style id) must be given *with* a colon-free inline type, like `urn:ngsi-ld:Foo:Bar:SomeType`; it cannot be passed bare, and `--type` alone will not fix it (the trailing segment is taken as the type first). The configured Product B aggregate id is exempt: it is matched as a whole before any split and works bare. A colon-bearing type cannot be given inline; pass it with `--type`, which works only for a colon-free id or the aggregate id. |
 | `--place N` | Resolve place numbers through metadata. With `--interval-min`, selects that interval; without it, selects every active interval for the place. Mutually exclusive with explicit entity ids. |
-| `--attrs LIST` | Comma-separated attributes. Required for Comet unless a shortcut is used. |
+| `--attrs LIST` | Comma-separated attributes. Required for non-aggregate Comet reads. On `--source comet`, for the configured Product B aggregate id, omitting it enumerates the contract scalars plus `peopleCount_flow_<place_number>` for every active interval-60 metadata row. Use an explicit list to inspect inactive or historical dynamic attributes. |
 | `--flow-attrs` | Shortcut for the seven Product A attributes. |
-| `--direction-attrs` | Shortcut for Product B attributes (`dateObservedFrom`, `dateObservedTo`, `peopleCount_flow`). |
 | `--from` / `--to` / `--last-n` | Comet-only history bounds. `--last-n` defaults to `10` when no bounds are provided. |
 | `--h-limit` / `--h-offset` | STH-Comet pagination passthrough. |
 | `--aggr-method` / `--aggr-period` | STH-Comet aggregation passthrough. |
@@ -208,6 +207,13 @@ printed once per entity or entity/attribute pair. A 404 prints a
 not-found record and exits 0; other HTTP errors are failures. Pretty
 mode renders null values as `null`.
 
+When an explicit id equals `PRODUCT_B_AGGREGATE_ENTITY_ID`, the tool
+uses `PRODUCT_B_AGGREGATE_ENTITY_TYPE` if no inline type or `--type` is
+given. Orion current state for this aggregate is the last window
+written, which may be an older window after a resend; use
+`dateObservedFrom` and `dateObservedTo` to identify the represented
+source window.
+
 Examples:
 
 ```sh
@@ -217,6 +223,9 @@ uv run python scripts/show_data.py --source orion --flow-attrs \
 uv run python scripts/show_data.py --source comet \
   --attrs peopleCount_immedate --last-n 20 \
   jp.sendai.Blesensor.per300.101 jp.sendai.Blesensor.per300.102
+
+uv run python scripts/show_data.py --source comet \
+  --entity-id "$PRODUCT_B_AGGREGATE_ENTITY_ID" --pretty
 
 uv run python scripts/show_data.py --source orion --place 101 --pretty
 ```
@@ -230,7 +239,7 @@ entity's Comet history after Orion returns deleted or already absent.
 ```
 uv run python scripts/delete_entities.py
     [--purge-history]
-    [--attrs LIST | --flow-attrs | --direction-attrs]
+    [--attrs LIST | --flow-attrs]
     --reason "..."
     [--send]
     [--i-know-this-is-production]
@@ -243,6 +252,11 @@ valid with `--purge-history`. Canonical Sendai entity ids infer the
 entity type; append `:ENTITY_TYPE` for custom ids or when overriding
 the inferred type.
 
+For the dedicated Product B aggregate entity, omit the attribute
+selector to purge the whole Comet entity history. `--attrs` remains
+available for an explicitly reviewed partial purge; deleting a contract
+scalar can make historical rows harder to interpret.
+
 ### `delete_history.py`
 
 Delete STH-Comet history for selected entities or attributes. Dry-run
@@ -251,7 +265,7 @@ prints the DELETE URLs and performs no auth or network calls.
 ```
 uv run python scripts/delete_history.py
     [--type TYPE]
-    [--attrs LIST | --flow-attrs | --direction-attrs]
+    [--attrs LIST | --flow-attrs]
     --reason "..."
     [--send]
     [--i-know-this-is-production]
@@ -264,6 +278,10 @@ per entity. Live deletion uses the same catch-all scope guard as
 `delete_entities.py`. Canonical Sendai entity ids infer the entity
 type; append `:ENTITY_TYPE` or pass `--type` for custom ids or
 overrides.
+
+For the dedicated Product B aggregate entity, whole-entity deletion is
+the normal operation. An explicit `--attrs` list is still accepted when
+the intended scope is narrower.
 
 ### `delete_subscriptions.py`
 
@@ -303,10 +321,10 @@ curl -sS -H "Authorization: Bearer ${TOKEN}" \
 ## State inspection and repair
 
 The runners persist a per-window state file under `state/` so they
-know which targets have already received an `ok` POST. When a window
-sticks in `pending` or `partial` and the normal retry isn't clearing
-it, use these tools, in order, to inspect, repair, and (only as a
-last resort) replay.
+know which targets have already received a successful Orion write.
+When a window sticks in `pending` or `partial` and the normal retry
+isn't clearing it, use these tools, in order, to inspect, repair, and
+(only as a last resort) replay.
 
 ### Revision sweep cursor
 
@@ -314,17 +332,24 @@ Each product state file also has a top-level `last_aggregated_at`
 cursor. This is the revision-sweep watermark: source rows with
 `aggregated_at` before that value have already been scanned for that
 product. The cursor is separate for `state/flow.json` and
-`state/direction.json`; a failed POST does not hold it back because the
-per-window state keeps the failed window for retry.
+`state/direction.json`; a failed write (Product A POST or Product B
+PUT) does not hold it back because the per-window state keeps the
+failed window for retry.
 
-On first deployment the cursor seeds from the runner's code-level
-`REVISION_CURSOR_SEED` and drains forward automatically. The drain is
-paced by two controls: `REVISION_SWEEP_DISCOVERY_SPAN` bounds each
-MySQL discovery scan, and `REVISION_SWEEP_MAX_WINDOWS` sets a soft cap on
-how many discovered or old-open windows are processed in one run; a run
-may exceed it to keep one `aggregated_at` second together. Once the
-cursor catches up, each cron tick scans only revisions since the prior
-run.
+Product A (flow) seeds a missing cursor from `run_flow.py`'s code-level
+`REVISION_CURSOR_SEED` and drains forward automatically. Product B
+(direction) instead initializes a missing cursor, in send mode only, to that
+run's start time, truncated to whole seconds, and begins scanning forward from
+there on later runs. (A dry-run neither initializes nor persists the cursor.)
+For an existing cursor, both runners keep it forward-only.
+
+Revision discovery is paced by two controls:
+`REVISION_SWEEP_DISCOVERY_SPAN` bounds each MySQL discovery scan, and
+`REVISION_SWEEP_MAX_WINDOWS` sets a soft cap on how many discovered or
+old-open windows are processed in one run; a run may exceed it to keep one
+`aggregated_at` second together. These controls drain Product A's initial
+backlog and bound later scans for both products. Once a cursor is current,
+each cron tick scans only revisions since the prior run.
 
 Because `aggregated_at` is a MySQL `timestamp`, the sweep cursor must be
 compared in a JST (`+09:00`) MySQL session. Check the runtime connection
@@ -355,7 +380,7 @@ jq '.last_aggregated_at' state/direction.json
 To re-sweep from an earlier point, stop that product's runner, back up
 the state file, set the top-level `last_aggregated_at` to the desired
 JST ISO timestamp, and restart the runner. Resetting earlier can
-re-POST matching windows and append duplicate STH-Comet history rows.
+repeat matching Orion writes and append duplicate STH-Comet history rows.
 
 ### `state_doctor.py`
 
@@ -399,6 +424,9 @@ current sensor metadata from `SENSOR_METADATA_PATH` (default
 interval. Missing or stale metadata does not fail the command; the
 output falls back to entity IDs. Large tables are truncated by default
 and print a hint to rerun with `--all` when rows are hidden.
+Direction reports instead label the section `Aggregate target failures`
+and omit per-place columns because each Product B window has one
+configured aggregate target.
 
 The doctor never mutates state and emits a warning to stderr if the
 state file changes during the read (race with a concurrent runner).
@@ -499,9 +527,11 @@ re-run.
 ### `resend.py`
 
 Re-run one or more source windows end-to-end: fetch source rows from
-MySQL, build payloads, and POST them to Orion. Use **only** when the
-source data is still available in MySQL and a payload/data bug has
-been fixed, i.e. when re-POSTing is correct and meaningful.
+MySQL, build payloads, and write them to Orion. Product A POSTs its
+per-place entities; Product B replaces all attributes on its one
+aggregate entity with `PUT /attrs`. Use **only** when the source data is
+still available in MySQL and replaying the write is correct and
+meaningful.
 
 ```
 uv run python scripts/resend.py {flow|direction}
@@ -513,51 +543,58 @@ uv run python scripts/resend.py {flow|direction}
     --reason "..."
     [--force]
     [--send]
+    [--max-imputation-tier N]  # flow only
 ```
 
 | Flag | Purpose |
 |---|---|
 | `flow` / `direction` (positional) | Which product to resend. |
-| `--interval-min 5` / `60` | Source aggregation interval of the windows. Required for `--place` or unfiltered runs; optional with canonical `--entity-id`, where the interval is inferred from `per300` / `per3600`. |
+| `--interval-min 5` / `60` | Product A source interval. Required for Product A `--place` or unfiltered runs; optional with canonical `--entity-id`, where it is inferred. Product B supports only `60` and defaults to it when omitted. |
 | `--from YYYYMMDD_HHMM` | First source window start, JST. Inclusive. |
 | `--to YYYYMMDD_HHMM` | Last source window start, JST. Inclusive. Equal to `--from` replays exactly one window. |
-| `--place N` | Place number filter; repeatable. Resolved through metadata. Mutually exclusive with `--entity-id`. |
-| `--entity-id ID` | Explicit entity id; repeatable. Mutually exclusive with `--place`. If `--interval-min` is omitted, all ids must be canonical and resolve to the same interval. |
+| `--place N` | Product A place filter; repeatable and resolved through metadata. Mutually exclusive with `--entity-id`. Product B rejects this selector before taking the product lock or sending. |
+| `--entity-id ID` | Product A entity filter; repeatable and mutually exclusive with `--place`. Product B rejects this selector because a filtered aggregate PUT would remove other places. |
 | `--reason "..."` | Required. Recorded as audit context in the run log. |
-| `--force` | Bypass the unchanged-payload skip. By default, a prior-`ok` target is skipped only when the computed payload hash is unchanged; a drifted prior-`ok` target is re-POSTed. `--force` additionally re-POSTs unchanged prior-`ok` targets. |
+| `--force` | Bypass the unchanged-payload skip. By default, a prior-`ok` target is skipped only when its payload hash is unchanged; drift is written again. `--force` also rewrites unchanged prior-`ok` targets. |
 | `--send` | Perform live Orion writes. Omit for dry-run: prints the planned per-window plan and exits before any MySQL query, Orion token fetch, or Orion HTTP call. |
+| `--max-imputation-tier N` | Override the Product A source imputation ceiling. Product B rejects this flag. |
 
 Resend writes to the same `window_key` as the original publication
 because it's a retry of the original business window, not a synthetic
 replacement. By default, unchanged prior-`ok` targets are skipped, while
-drifted prior-`ok` targets are re-POSTed through the same shared
+drifted prior-`ok` targets are written through the same shared
 `_process_send_window` path used by the live runners; `scripts/resend.py`
 does not carry separate drift logic. Pass `--force` when the intent is to
 redeliver unchanged targets too. For a wide range this matters: without
 `--force`, unchanged recent in-state windows are skipped while drifted
-or GC-reclaimed windows are re-posted, so the result can be non-uniform
+or GC-reclaimed windows are written, so the result can be non-uniform
 even though the run exits 0 (see ["I need to resend a large range without
 dropping live data"](#i-need-to-resend-a-large-range-without-dropping-live-data)).
 
+Product B uses the same shared direction path, but each non-empty
+60-minute source window produces either one aggregate PUT, a no-payload
+skip, or a source-invalid result. Empty and no-payload windows create no
+window state. Source-invalid windows also create no state and make the
+resend exit `1`; the `resend_summary` record reports `puts_ok`,
+`puts_failed`, `windows_no_payload`, and `windows_source_invalid`.
+
 For Product A, `--place` / `--entity-id` limits which flow payloads are
 built and POSTed, but it does not shrink a retained window's
-`expected_target_ids`; completion remains `stored ∪ observed`. For
-Product B, filtered resends create a filtered fixed-target set only when
-the window has no stored snapshot yet.
+`expected_target_ids`; completion remains `stored ∪ observed`. Product B
+does not accept target filters; every attempted write uses the
+configured aggregate id and type.
 
 Examples:
 
 ```sh
 # Single window, dry-run.
 uv run python scripts/resend.py direction \
-  --from 20260525_0640 --to 20260525_0640 \
-  --entity-id jp.sendai.Blesensor.per300.105 \
+  --from 20260525_0600 --to 20260525_0600 \
   --reason "payload shape fix"
 
 # Same single window, live.
 uv run python scripts/resend.py direction \
-  --interval-min 5 \
-  --from 20260525_0640 --to 20260525_0640 \
+  --from 20260525_0600 --to 20260525_0600 \
   --reason "payload shape fix" \
   --send
 
@@ -570,12 +607,12 @@ uv run python scripts/resend.py flow \
   --force --send
 ```
 
-> **STH-Comet caveat.** Once subscriptions are active, re-POSTing a
+> **STH-Comet caveat.** Once subscriptions are active, repeating an Orion
 > value creates a new Comet history row even when the Orion value is
 > unchanged (the subscription fires on metadata changes, including the
 > `TimeInstant` re-emission). Use resend judiciously and prefer
 > `state_repair.py recompute_complete` whenever the failure was a
-> bookkeeping bug rather than a missed POST.
+> bookkeeping bug rather than a missed Orion write.
 
 > **Lock / live-cron caveat.** `--send` holds the per-product lock for
 > the whole run, no-opping every live tick meanwhile, which is the same
@@ -615,7 +652,7 @@ are escalations only if the earlier one rules out the simpler cause.
    `recompute_complete --apply`.
 4. If `retry_reachable=false` and the failure is genuinely
    unrecoverable: `state_repair.py … --action dead_letter --reason "…" --apply`.
-5. If the source row is still available in MySQL and re-POSTing makes
+5. If the source row is still available in MySQL and repeating the write makes
    sense: `resend.py … --from W --to W --send`.
 
 ### "Cron fired but `logs/{product}.log` looks empty"
@@ -688,19 +725,19 @@ gotchas:
    target or a target with no stored record is posted, so a wide range can
    come out non-uniform even though the run reports success. See the
    `--force` row in the `resend.py` reference above.
-2. **Two interval passes**: one invocation publishes one interval. To
-   cover everything, run it twice: once `--interval-min 5` (per300) and
-   once `--interval-min 60` (per3600), each with `--force`.
+2. **Intervals differ by product**: Product A needs separate 5-minute and
+   60-minute invocations to cover both series. Product B has only the
+   60-minute aggregate path and rejects 5-minute requests.
 3. **Clear dead-letter windows first.** If the range contains a window an
    operator previously dead-lettered, the run aborts up front (exit 2),
    listing the offending keys, before posting anything. GC never reclaims
    dead-letters, so an *old* range can still hold them. Resolve with
    `state_repair.py` (see its reference above) or narrow the range, then
    re-run.
-4. **Don't trust exit 0 alone.** The run exits 1 only when a POST fails, so
-   a window left `partial` because an expected target had no data still
-   exits 0. Check `windows_partial` in the `resend_summary` log line (or
-   grep `window_partial` WARNINGs in `logs/resend.log`).
+4. **Read the product-specific summary.** Product A reports POST and
+   partial-window counters. Product B reports PUT, no-payload, and
+   source-invalid counters; a failed PUT or source-invalid window exits
+   `1`.
 
 Then keep the live cron from starving: pick one of two approaches:
 

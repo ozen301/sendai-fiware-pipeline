@@ -13,6 +13,7 @@ from sendai_pipeline.state_tools import StateDoctorReport
 ENTITY_1 = "jp.sendai.Blesensor.per300.101"
 ENTITY_2 = "jp.sendai.Blesensor.per300.102"
 ENTITY_3 = "jp.sendai.Blesensor.per300.103"
+AGGREGATE_ENTITY_ID = "custom.aggregate.entity"
 
 
 def _target(status: str) -> dict[str, object]:
@@ -78,6 +79,44 @@ def test_state_doctor_cli_reports_empty_state(
     assert output["product"] == "flow"
     assert output["total_windows"] == 0
     assert output["open_windows"] == []
+
+
+def test_state_doctor_cli_reports_one_aggregate_target_for_direction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "state" / "direction.json"
+    key = "per3600/20260525_0840"
+    store = WindowStateStore(path)
+    store.begin_window_attempt(key, expected_target_ids=[AGGREGATE_ENTITY_ID])
+    store.record_target(
+        key,
+        AGGREGATE_ENTITY_ID,
+        status="failed",
+        http_status=502,
+        payload_sha256="a" * 64,
+    )
+    store.recompute_status(key, [AGGREGATE_ENTITY_ID])
+    store.save()
+
+    result = state_doctor.main(["direction"])
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["product"] == "direction"
+    assert output["open_windows"][0]["window"] == key
+    assert output["open_windows"][0]["target_count"] == 1
+    assert output["open_windows"][0]["failed_target_ids"] == [AGGREGATE_ENTITY_ID]
+    assert output["failed_targets"] == [
+        {
+            "count": 1,
+            "entity_id": AGGREGATE_ENTITY_ID,
+            "newest_window": key,
+            "oldest_window": key,
+        }
+    ]
 
 
 def test_state_doctor_cli_warns_when_state_changes_during_read(
@@ -237,6 +276,54 @@ def test_state_repair_cli_reports_clean_error(
 
     assert result == 2
     assert "ERROR:" in capsys.readouterr().err
+
+
+def test_state_repair_cli_reports_direction_single_target_recompute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "state" / "direction.json"
+    key = "per3600/20260525_0840"
+    store = WindowStateStore(path)
+    store.begin_window_attempt(key, expected_target_ids=[AGGREGATE_ENTITY_ID])
+    store.record_target(
+        key,
+        AGGREGATE_ENTITY_ID,
+        status="ok",
+        http_status=204,
+        payload_sha256="a" * 64,
+    )
+    store.save()
+
+    result = state_repair.main(
+        [
+            "direction",
+            "--window",
+            key,
+            "--action",
+            "recompute_complete",
+        ]
+    )
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "backup_path": None,
+        "changes": [
+            {
+                "action": "recompute_complete",
+                "after_status": "complete",
+                "before_status": "pending",
+                "reason": None,
+                "window": key,
+            }
+        ],
+        "dry_run": True,
+        "product": "direction",
+    }
+    assert WindowStateStore.load(path).expected_target_ids(key) == [AGGREGATE_ENTITY_ID]
 
 
 def test_state_doctor_cli_reports_clean_config_error(

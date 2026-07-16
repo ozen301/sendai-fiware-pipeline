@@ -16,6 +16,8 @@ ENTITY_11 = "jp.sendai.Blesensor.per3600.11"
 ENTITY_12 = "jp.sendai.Blesensor.per3600.12"
 ENTITY_13_INACTIVE = "jp.sendai.Blesensor.per3600.13"
 ENTITY_99_PER300 = "jp.sendai.Blesensor.per300.99"
+AGGREGATE_ENTITY_ID = "test.aggregate.direction"
+AGGREGATE_ENTITY_TYPE = "TestAggregateDirection"
 
 
 class FakeDbCursor:
@@ -70,8 +72,11 @@ class FakeDbConnection:
 
 
 class FakeOrionClient:
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
+    def __init__(self, results: Iterable[Mapping[str, Any]] = ()) -> None:
+        self._results = [dict(result) for result in results]
+        self.update_calls: list[dict[str, Any]] = []
+        self.replace_calls: list[dict[str, Any]] = []
+        self.calls = self.update_calls
 
     def update_attrs(
         self,
@@ -81,7 +86,7 @@ class FakeOrionClient:
         *,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        self.calls.append(
+        self.update_calls.append(
             {
                 "entity_id": entity_id,
                 "entity_type": entity_type,
@@ -90,6 +95,25 @@ class FakeOrionClient:
             }
         )
         return {"status": 204, "ok": True}
+
+    def replace_attrs(
+        self,
+        entity_id: str,
+        entity_type: str | None,
+        attrs: Mapping[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        self.replace_calls.append(
+            {
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "attrs": dict(attrs),
+                "dry_run": dry_run,
+            }
+        )
+        result = self._results.pop(0) if self._results else {"status": 204, "ok": True}
+        return {"status": result.get("status", 204), "ok": result.get("ok", True)}
 
 
 class FakeResendLogger:
@@ -132,11 +156,15 @@ class ProcessCall:
     interval_min: int
     startdate: str
     interval_entity_ids: list[str]
-    expected_target_ids: list[str]
+    expected_target_ids: list[str] | None
+    expected_target_ids_was_passed: bool
     force_resend: bool | None
     force_resend_was_passed: bool
     persist_each_target: bool | None
     persist_each_target_was_passed: bool
+    aggregate_entity_id: str | None
+    aggregate_entity_type: str | None
+    transformed_at: datetime | None
 
 
 @pytest.fixture
@@ -204,6 +232,115 @@ def test_resend_rejects_place_and_entity_id_together(
     )
 
     assert result != 0
+
+
+@pytest.mark.parametrize(
+    ("interval_min", "selector"),
+    [
+        pytest.param(60, ["--place", "10"], id="place"),
+        pytest.param(60, ["--entity-id", ENTITY_10], id="entity-id"),
+        pytest.param(5, [], id="five-minute"),
+    ],
+)
+def test_resend_direction_rejects_unsafe_request_before_lock_or_send(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interval_min: int,
+    selector: list[str],
+) -> None:
+    resend = _resend_module()
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    lock_calls: list[str] = []
+    send_calls: list[Any] = []
+    config_errors: list[BaseException] = []
+
+    class RecordingLock:
+        def __init__(self, product: str) -> None:
+            self.product = product
+
+        def __enter__(self) -> None:
+            lock_calls.append(self.product)
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(resend, "_product_lock", RecordingLock)
+
+    real_build_plan = resend._build_plan
+
+    def build_plan(args: Any) -> Any:
+        try:
+            return real_build_plan(args)
+        except resend.ResendConfigError as exc:
+            config_errors.append(exc)
+            raise
+
+    monkeypatch.setattr(resend, "_build_plan", build_plan)
+
+    def record_send(plan: Any) -> int:
+        send_calls.append(plan)
+        return 0
+
+    monkeypatch.setattr(resend, "_send_resend", record_send)
+
+    result = _call_main(
+        resend,
+        _base_args(product="direction", interval_min=interval_min, send=True)
+        + selector,
+    )
+
+    assert result == 2
+    assert len(config_errors) == 1
+    assert lock_calls == []
+    assert send_calls == []
+
+
+def test_resend_direction_omitted_interval_defaults_to_60(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+
+    args = resend._parse_args(
+        _base_args(product="direction", interval_min=None),
+    )
+    plan = resend._build_plan(args)
+
+    assert plan.interval_min == 60
+
+
+@pytest.mark.parametrize(
+    ("interval_min", "selector", "expected_entity_ids"),
+    [
+        pytest.param(60, ["--place", "10"], [ENTITY_10], id="place"),
+        pytest.param(
+            60,
+            ["--entity-id", ENTITY_11],
+            [ENTITY_11],
+            id="entity-id",
+        ),
+        pytest.param(5, [], [ENTITY_99_PER300], id="five-minute"),
+    ],
+)
+def test_resend_flow_accepts_direction_rejected_request(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interval_min: int,
+    selector: list[str],
+    expected_entity_ids: list[str],
+) -> None:
+    calls = _run_send(
+        tmp_path,
+        metadata_path,
+        monkeypatch,
+        _base_args(interval_min=interval_min, send=True) + selector,
+    )
+
+    assert calls[0].interval_entity_ids == expected_entity_ids
 
 
 def test_resend_rejects_empty_range(
@@ -635,7 +772,7 @@ def test_resend_forwards_persist_each_target_false_flow(
     assert calls[0].persist_each_target is False
 
 
-def test_resend_forwards_persist_each_target_false_direction(
+def test_resend_direction_omits_legacy_per_target_arguments(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -647,8 +784,11 @@ def test_resend_forwards_persist_each_target_false_direction(
         _base_args(product="direction", send=True),
     )
 
-    assert calls[0].persist_each_target_was_passed is True
-    assert calls[0].persist_each_target is False
+    assert calls[0].expected_target_ids_was_passed is False
+    assert calls[0].persist_each_target_was_passed is False
+    assert calls[0].aggregate_entity_id == AGGREGATE_ENTITY_ID
+    assert calls[0].aggregate_entity_type == AGGREGATE_ENTITY_TYPE
+    assert calls[0].transformed_at is not None
 
 
 def test_resend_cadence_flush_count(
@@ -799,7 +939,7 @@ def test_resend_skips_window_with_no_source_rows(
         assert "per3600/20260524_1000" not in _read_windows(state_path)
 
 
-def test_resend_empty_window_not_persisted_as_partial(
+def test_resend_direction_empty_source_window_creates_no_state(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -816,7 +956,7 @@ def test_resend_empty_window_not_persisted_as_partial(
         resend,
         {
             "20260620_1000": [],
-            "20260620_1100": [_direction_row("20260620_1100")],
+            "20260620_1100": _sendable_direction_rows("20260620_1100"),
         },
     )
 
@@ -836,7 +976,7 @@ def test_resend_empty_window_not_persisted_as_partial(
     assert sorted(windows) == ["per3600/20260620_1100"]
 
 
-def test_resend_summary_reports_empty_window_count(
+def test_resend_direction_summary_reports_empty_source_window_count(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -850,7 +990,7 @@ def test_resend_summary_reports_empty_window_count(
         resend,
         {
             "20260524_1000": [],
-            "20260524_1100": [_direction_row("20260524_1100")],
+            "20260524_1100": _sendable_direction_rows("20260524_1100"),
             "20260524_1200": [],
         },
     )
@@ -870,7 +1010,7 @@ def test_resend_summary_reports_empty_window_count(
     assert _summary_record(logger)["windows_empty"] == 2
 
 
-def test_resend_filtered_to_empty_window_still_creates_partial(
+def test_resend_direction_no_payload_window_creates_no_state(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -890,35 +1030,60 @@ def test_resend_filtered_to_empty_window_still_creates_partial(
             "count": 12,
         }
     ]
-    save_count = 0
-    real_save = resend.WindowStateStore.save
-
-    def save_spy(store: Any) -> None:
-        nonlocal save_count
-        save_count += 1
-        real_save(store)
-
-    monkeypatch.setattr(resend, "_RESEND_SAVE_EVERY", 1)
-    monkeypatch.setattr(resend.WindowStateStore, "save", save_spy)
-
     result = _call_main(
         resend,
         _base_args(product="direction", send=True) + ["--force"],
     )
 
     assert result == 0
-    assert orion.calls == []
-    assert save_count == 1
-    window = _read_windows(tmp_path / "state" / "direction.json")[
-        "per3600/20260524_1000"
-    ]
-    assert window["status"] == "partial"
-    assert window["expected_target_ids"] == [ENTITY_10, ENTITY_11, ENTITY_12]
-    assert window["targets"] == {}
+    assert orion.update_calls == []
+    assert orion.replace_calls == []
+    state_path = tmp_path / "state" / "direction.json"
+    if state_path.exists():
+        assert "per3600/20260524_1000" not in _read_windows(state_path)
     assert _summary_record(logger)["windows_empty"] == 0
+    assert _summary_record(logger)["windows_no_payload"] == 1
 
 
-def test_resend_zero_post_window_advances_cadence(
+def test_resend_direction_source_invalid_window_creates_no_state_and_exits_one(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    logger = _patch_resend_logger(monkeypatch, resend)
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = [
+        {
+            **_direction_row("20260524_1000"),
+            "from_group_place_id": "ALL",
+            "to_group_place_id": "sendai202603.10",
+            "count": 8,
+        },
+        {
+            **_direction_row("20260524_1000"),
+            "from_group_place_id": "sendai202603.11",
+            "to_group_place_id": "ALL",
+            "count": 7,
+        },
+    ]
+
+    result = _call_main(
+        resend,
+        _base_args(product="direction", send=True) + ["--force"],
+    )
+
+    assert result == 1
+    assert orion.update_calls == []
+    assert orion.replace_calls == []
+    state_path = tmp_path / "state" / "direction.json"
+    if state_path.exists():
+        assert "per3600/20260524_1000" not in _read_windows(state_path)
+    assert _summary_record(logger)["windows_source_invalid"] == 1
+
+
+def test_resend_direction_no_payload_window_advances_save_cadence(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -954,14 +1119,10 @@ def test_resend_zero_post_window_advances_cadence(
     )
 
     assert result == 0
-    assert orion.calls == []
+    assert orion.update_calls == []
+    assert orion.replace_calls == []
     assert save_count == 1
-    window = json.loads(
-        (tmp_path / "state" / "direction.json").read_text(encoding="utf-8")
-    )["windows"]["per3600/20260524_1000"]
-    assert window["status"] == "partial"
-    assert window["expected_target_ids"] == [ENTITY_10, ENTITY_11, ENTITY_12]
-    assert window["targets"] == {}
+    assert _read_windows(tmp_path / "state" / "direction.json") == {}
 
 
 def test_resend_gc_removes_complete_windows_older_than_horizon(
@@ -1260,7 +1421,7 @@ def test_resend_reconnect_retries_are_bounded_then_aborts(
     assert exhausted_records[0]["attempts"] == attempts
 
 
-def test_resend_reconnect_exhaustion_flushes_completed_window_progress(
+def test_resend_direction_reconnect_exhaustion_flushes_aggregate_progress(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1272,7 +1433,7 @@ def test_resend_reconnect_exhaustion_flushes_completed_window_progress(
     lost = pymysql.err.OperationalError(2013, "lost")
     attempts = resend._RESEND_DB_RECONNECT_ATTEMPTS
     first_connection = FakeDbConnection(
-        rows=[_direction_row("20260524_1000")],
+        rows=_sendable_direction_rows("20260524_1000"),
         select_errors_by_attempt={2: lost},
     )
     exhausted_connections = [
@@ -1299,7 +1460,10 @@ def test_resend_reconnect_exhaustion_flushes_completed_window_progress(
     assert result == 2
     assert sleep_calls == [1] * attempts
     windows = _read_windows(tmp_path / "state" / "direction.json")
-    assert "per3600/20260524_1000" in windows
+    completed = windows["per3600/20260524_1000"]
+    assert completed["status"] == "complete"
+    assert completed["expected_target_ids"] == [AGGREGATE_ENTITY_ID]
+    assert sorted(completed["targets"]) == [AGGREGATE_ENTITY_ID]
     assert "per3600/20260524_1100" not in windows
 
 
@@ -1568,19 +1732,45 @@ def test_resend_flow_send_max_imputation_tier_flag_overrides_env(
     assert db_connection.queries == [(60, "20260524_1000", "20260524_1000", 4)]
 
 
-def test_resend_direction_calls_direction_process_send_window(
+def test_resend_direction_uses_full_window_aggregate_replace_path(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls = _run_send(
-        tmp_path,
-        metadata_path,
+    resend = _resend_module()
+    _freeze_resend_now(
         monkeypatch,
-        _base_args(product="direction", send=True),
+        resend,
+        datetime(2026, 5, 24, 12, 0, tzinfo=run_direction.JST),
+    )
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = _sendable_direction_rows("20260524_1000")
+
+    result = _call_main(
+        resend,
+        _base_args(product="direction", send=True) + ["--force"],
     )
 
-    assert [call.product for call in calls] == ["direction"]
+    assert result == 0
+    assert orion.update_calls == []
+    assert len(orion.replace_calls) == 1
+    replace = orion.replace_calls[0]
+    assert replace["entity_id"] == AGGREGATE_ENTITY_ID
+    assert replace["entity_type"] == AGGREGATE_ENTITY_TYPE
+    assert set(replace["attrs"]) == {
+        "dateObservedFrom",
+        "dateObservedTo",
+        "dateRetrieved",
+        "identifcation",
+        "peopleCount_flow_10",
+    }
+    window = _read_windows(tmp_path / "state" / "direction.json")[
+        "per3600/20260524_1000"
+    ]
+    assert window["status"] == "complete"
+    assert window["expected_target_ids"] == [AGGREGATE_ENTITY_ID]
+    assert sorted(window["targets"]) == [AGGREGATE_ENTITY_ID]
 
 
 def test_resend_flow_ignores_invalid_direction_target_batches(
@@ -1611,7 +1801,7 @@ def test_resend_direction_ignores_invalid_flow_target_batches(
     assert result == 0
 
 
-def test_resend_selects_target_batches_for_requested_product(
+def test_resend_selects_source_batches_and_aggregate_target_for_requested_product(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1643,10 +1833,13 @@ def test_resend_selects_target_batches_for_requested_product(
 
     assert flow_result == 0
     assert direction_result == 0
-    assert [call.expected_target_ids for call in calls] == [
-        [flow_2023_entity],
-        [direction_2026_entity],
-    ]
+    flow_call, direction_call = calls
+    assert flow_call.expected_target_ids == [flow_2023_entity]
+    assert flow_call.interval_entity_ids == [flow_2023_entity]
+    assert direction_call.interval_entity_ids == [direction_2026_entity]
+    assert direction_call.expected_target_ids_was_passed is False
+    assert direction_call.aggregate_entity_id == AGGREGATE_ENTITY_ID
+    assert direction_call.aggregate_entity_type == AGGREGATE_ENTITY_TYPE
 
 
 def test_resend_direction_rejects_max_imputation_tier_flag(
@@ -1665,7 +1858,7 @@ def test_resend_direction_rejects_max_imputation_tier_flag(
     assert result == 2
 
 
-def test_resend_summary_reports_partial_and_complete_window_counts(
+def test_resend_direction_summary_reports_aggregate_put_and_window_counts(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1673,23 +1866,20 @@ def test_resend_summary_reports_partial_and_complete_window_counts(
     resend = _resend_module()
     logger = _patch_resend_logger(monkeypatch, resend)
     _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
-    _patch_real_send_dependencies(monkeypatch, resend)
+    _patch_real_send_dependencies(
+        monkeypatch,
+        resend,
+        orion_results=[
+            {"status": 204, "ok": True},
+            {"status": 503, "ok": False},
+        ],
+    )
     _patch_direction_select_rows_by_startdate(
         monkeypatch,
         resend,
         {
-            "20260524_1000": [_direction_row("20260524_1000")],
-            "20260524_1100": [
-                {
-                    "startdate": "20260524_1100",
-                    "from_group_place_id": "quick.10",
-                    "to_group_place_id": "sendai202603.11",
-                    "from_device_type": "M5Stack",
-                    "to_device_type": "M5Stack",
-                    "interval_min": 60,
-                    "count": 12,
-                }
-            ],
+            "20260524_1000": _sendable_direction_rows("20260524_1000"),
+            "20260524_1100": _sendable_direction_rows("20260524_1100"),
         },
     )
 
@@ -1704,13 +1894,15 @@ def test_resend_summary_reports_partial_and_complete_window_counts(
         + ["--force"],
     )
 
-    assert result == 0
+    assert result == 1
     summary = _summary_record(logger)
+    assert summary["puts_ok"] == 1
+    assert summary["puts_failed"] == 1
     assert summary["windows_complete"] == 1
     assert summary["windows_partial"] == 1
 
 
-def test_resend_partial_window_keeps_exit_code_zero(
+def test_resend_direction_failed_put_returns_exit_one_and_put_counters(
     tmp_path: Path,
     metadata_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1718,28 +1910,24 @@ def test_resend_partial_window_keeps_exit_code_zero(
     resend = _resend_module()
     logger = _patch_resend_logger(monkeypatch, resend)
     _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
-    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
-    db_connection.rows = [
-        {
-            "startdate": "20260524_1000",
-            "from_group_place_id": "quick.10",
-            "to_group_place_id": "sendai202603.11",
-            "from_device_type": "M5Stack",
-            "to_device_type": "M5Stack",
-            "interval_min": 60,
-            "count": 12,
-        }
-    ]
+    db_connection, orion = _patch_real_send_dependencies(
+        monkeypatch,
+        resend,
+        orion_results=[{"status": 503, "ok": False}],
+    )
+    db_connection.rows = _sendable_direction_rows("20260524_1000")
 
     result = _call_main(
         resend,
         _base_args(product="direction", send=True) + ["--force"],
     )
 
-    assert result == 0
-    assert orion.calls == []
+    assert result == 1
+    assert orion.update_calls == []
+    assert len(orion.replace_calls) == 1
     summary = _summary_record(logger)
-    assert summary["posts_failed"] == 0
+    assert summary["puts_ok"] == 0
+    assert summary["puts_failed"] == 1
     assert summary["windows_partial"] == 1
 
 
@@ -1756,6 +1944,8 @@ def test_resend_dry_run_summary_reports_zero_partial_complete(
 
     assert result == 0
     summary = _summary_record(logger)
+    assert summary["posts_ok"] == 0
+    assert summary["posts_failed"] == 0
     assert summary["windows_partial"] == 0
     assert summary["windows_complete"] == 0
 
@@ -1775,7 +1965,7 @@ def test_resend_aborts_before_posting_when_range_contains_dead_letter(
             "per3600/20260524_1000": _window_record(
                 status="dead_letter",
                 source_start=datetime(2026, 5, 24, 10, 0, tzinfo=run_direction.JST),
-                expected_target_ids=[ENTITY_10, ENTITY_11, ENTITY_12],
+                expected_target_ids=[AGGREGATE_ENTITY_ID],
             )
         },
     )
@@ -1786,7 +1976,8 @@ def test_resend_aborts_before_posting_when_range_contains_dead_letter(
     )
 
     assert result == 2
-    assert orion.calls == []
+    assert orion.update_calls == []
+    assert orion.replace_calls == []
     assert db_connection.queries == []
 
 
@@ -1814,10 +2005,12 @@ def test_resend_preflight_lists_all_dead_letter_windows(
             "per3600/20260524_1000": _window_record(
                 status="dead_letter",
                 source_start=datetime(2026, 5, 24, 10, 0, tzinfo=run_direction.JST),
+                expected_target_ids=[AGGREGATE_ENTITY_ID],
             ),
             "per3600/20260524_1100": _window_record(
                 status="dead_letter",
                 source_start=datetime(2026, 5, 24, 11, 0, tzinfo=run_direction.JST),
+                expected_target_ids=[AGGREGATE_ENTITY_ID],
             ),
         },
     )
@@ -1854,6 +2047,7 @@ def test_resend_preflight_aborts_on_dead_letter_with_no_source_rows(
             "per3600/20260524_1000": _window_record(
                 status="dead_letter",
                 source_start=datetime(2026, 5, 24, 10, 0, tzinfo=run_direction.JST),
+                expected_target_ids=[AGGREGATE_ENTITY_ID],
             )
         },
     )
@@ -1864,7 +2058,8 @@ def test_resend_preflight_aborts_on_dead_letter_with_no_source_rows(
     )
 
     assert result == 2
-    assert orion.calls == []
+    assert orion.update_calls == []
+    assert orion.replace_calls == []
     assert db_connection.queries == []
 
 
@@ -1992,6 +2187,8 @@ def _patch_basic_environment(
     monkeypatch.setenv("SENSOR_METADATA_PATH", str(metadata_path))
     monkeypatch.setenv("TARGET_FLOW_BATCHES", "2026")
     monkeypatch.setenv("TARGET_DIRECTION_BATCHES", "2026")
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_ID", AGGREGATE_ENTITY_ID)
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", AGGREGATE_ENTITY_TYPE)
 
 
 def _patch_send_dependencies(
@@ -2041,9 +2238,11 @@ def _patch_send_dependencies(
 def _patch_real_send_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     resend: Any,
+    *,
+    orion_results: Iterable[Mapping[str, Any]] = (),
 ) -> tuple[FakeDbConnection, FakeOrionClient]:
     db_connection = FakeDbConnection()
-    orion = FakeOrionClient()
+    orion = FakeOrionClient(orion_results)
 
     _patch_module_attr(
         monkeypatch, resend, "db", db, "connect", lambda _settings: db_connection
@@ -2143,6 +2342,7 @@ def _patch_process_windows(
 ) -> None:
     def fake_process(product: str) -> Any:
         def capture(window_key: str, **kwargs: Any) -> None:
+            settings = kwargs.get("settings")
             calls.append(
                 ProcessCall(
                     product=product,
@@ -2150,11 +2350,27 @@ def _patch_process_windows(
                     interval_min=kwargs["interval_min"],
                     startdate=kwargs["startdate"],
                     interval_entity_ids=_entity_ids(kwargs["interval_metadata"]),
-                    expected_target_ids=list(kwargs["expected_target_ids"]),
+                    expected_target_ids=(
+                        list(kwargs["expected_target_ids"])
+                        if "expected_target_ids" in kwargs
+                        else None
+                    ),
+                    expected_target_ids_was_passed="expected_target_ids" in kwargs,
                     force_resend=kwargs.get("force_resend"),
                     force_resend_was_passed="force_resend" in kwargs,
                     persist_each_target=kwargs.get("persist_each_target"),
                     persist_each_target_was_passed="persist_each_target" in kwargs,
+                    aggregate_entity_id=(
+                        settings.product_b_aggregate_entity_id
+                        if settings is not None
+                        else None
+                    ),
+                    aggregate_entity_type=(
+                        settings.product_b_aggregate_entity_type
+                        if settings is not None
+                        else None
+                    ),
+                    transformed_at=kwargs.get("transformed_at"),
                 )
             )
 
@@ -2360,6 +2576,23 @@ def _direction_row(startdate: str) -> dict[str, Any]:
         "interval_min": 60,
         "count": 12,
     }
+
+
+def _sendable_direction_rows(startdate: str) -> list[dict[str, Any]]:
+    return [
+        {
+            **_direction_row(startdate),
+            "from_group_place_id": "ALL",
+            "to_group_place_id": "sendai202603.10",
+            "count": 8,
+        },
+        {
+            **_direction_row(startdate),
+            "from_group_place_id": "sendai202603.10",
+            "to_group_place_id": "ALL",
+            "count": 6,
+        },
+    ]
 
 
 def _patch_db_forbidden(monkeypatch: pytest.MonkeyPatch, resend: Any) -> None:

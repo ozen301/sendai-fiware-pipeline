@@ -24,6 +24,7 @@ NOW = datetime(2026, 5, 25, 16, 40, 0, tzinfo=JST)
 ENTITY_1 = "jp.sendai.Blesensor.per300.101"
 ENTITY_2 = "jp.sendai.Blesensor.per300.102"
 ENTITY_3 = "jp.sendai.Blesensor.per300.103"
+AGGREGATE_ENTITY_ID = "custom.aggregate.entity"
 
 
 def _target(status: str, http_status: int = 204) -> dict[str, object]:
@@ -71,7 +72,7 @@ def _write_state(path: Path, windows: dict[str, dict[str, object]]) -> None:
 def test_diagnose_state_categorizes_open_windows_deterministically(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "state" / "direction.json"
+    path = tmp_path / "state" / "flow.json"
     all_failed = "per300/20260525_0640"
     all_ok = "per300/20260525_0645"
     missing = "per300/20260525_0650"
@@ -106,7 +107,7 @@ def test_diagnose_state_categorizes_open_windows_deterministically(
     )
     store = WindowStateStore.load(path)
 
-    diagnoses = diagnose_state(store, product="direction", now=NOW)
+    diagnoses = diagnose_state(store, product="flow", now=NOW)
 
     assert [item.window_key for item in diagnoses] == [
         all_failed,
@@ -137,7 +138,7 @@ def test_diagnose_state_categorizes_open_windows_deterministically(
 def test_diagnose_state_marks_legacy_expected_targets_as_derived(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "state" / "direction.json"
+    path = tmp_path / "state" / "flow.json"
     key = "per300/20260525_0640"
     legacy_window = _window(
         key=key,
@@ -148,7 +149,7 @@ def test_diagnose_state_marks_legacy_expected_targets_as_derived(
     _write_state(path, {key: legacy_window})
     store = WindowStateStore.load(path)
 
-    diagnosis = diagnose_state(store, product="direction", now=NOW)[0]
+    diagnosis = diagnose_state(store, product="flow", now=NOW)[0]
 
     assert diagnosis.expected_target_source == "derived"
     assert diagnosis.target_status_category == "all_ok"
@@ -168,8 +169,8 @@ def test_diagnose_state_retry_reachable_uses_source_window_and_config(
         {
             key: _window(
                 key=key,
-                expected=[ENTITY_1],
-                targets={ENTITY_1: _target("failed", 502)},
+                expected=[AGGREGATE_ENTITY_ID],
+                targets={AGGREGATE_ENTITY_ID: _target("failed", 502)},
             )
         },
     )
@@ -189,7 +190,7 @@ def test_diagnose_state_retry_reachable_uses_source_window_and_config(
 def test_build_state_report_counts_retained_windows_and_ranks_target_issues(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "state" / "direction.json"
+    path = tmp_path / "state" / "flow.json"
     partial_old = "per300/20260525_0640"
     pending_new = "per300/20260525_0650"
     complete = "per300/20260525_0700"
@@ -226,7 +227,7 @@ def test_build_state_report_counts_retained_windows_and_ranks_target_issues(
     )
     store = WindowStateStore.load(path)
 
-    report = build_state_report(store, product="direction", now=NOW)
+    report = build_state_report(store, product="flow", now=NOW)
 
     assert report.status_counts == {
         "complete": 1,
@@ -291,6 +292,46 @@ def test_pretty_report_enriches_targets_with_metadata_and_can_use_ascii_bars(
     entity_2_line = next(line for line in output.splitlines() if ENTITY_2 in line)
     entity_2_cells = entity_2_line.split()
     assert entity_2_cells[:4] == [ENTITY_2, "102", "2026", "5"]
+
+
+def test_pretty_report_direction_labels_single_aggregate_target_without_place_columns(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "direction.json"
+    key = "per3600/20260525_0840"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[AGGREGATE_ENTITY_ID],
+                targets={AGGREGATE_ENTITY_ID: _target("failed", 502)},
+            )
+        },
+    )
+    store = WindowStateStore.load(path)
+    report = build_state_report(store, product="direction", now=NOW)
+
+    output = state_report_to_pretty(
+        report,
+        state_path=path,
+        state_size_bytes=path.stat().st_size,
+        sensor_labels={},
+        top=10,
+        window_limit=10,
+        ascii_only=True,
+    )
+
+    assert "State doctor: direction" in output
+    assert "Aggregate target failures" in output
+    aggregate_line = next(
+        line for line in output.splitlines() if AGGREGATE_ENTITY_ID in line
+    )
+    assert aggregate_line.split() == [AGGREGATE_ENTITY_ID, "1", key, key]
+    assert not any(
+        line.split()[:4] == ["target", "place", "batch", "int"]
+        for line in output.splitlines()
+    )
 
 
 def test_pretty_report_hints_when_table_rows_are_hidden(tmp_path: Path) -> None:
@@ -527,14 +568,14 @@ def test_repair_state_dead_letter_requires_reason_and_records_it(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "state" / "direction.json"
-    key = "per300/20260525_0640"
+    key = "per3600/20260525_0840"
     _write_state(
         path,
         {
             key: _window(
                 key=key,
-                expected=[ENTITY_1],
-                targets={ENTITY_1: _target("failed", 400)},
+                expected=[AGGREGATE_ENTITY_ID],
+                targets={AGGREGATE_ENTITY_ID: _target("failed", 400)},
             )
         },
     )
@@ -562,6 +603,37 @@ def test_repair_state_dead_letter_requires_reason_and_records_it(
     window = WindowStateStore.load(path).as_dict()["windows"][key]
     assert window["status"] == "dead_letter"
     assert window["dead_letter_reason"] == "source row no longer retained"
+
+
+def test_repair_state_direction_recomputes_single_aggregate_target(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state" / "direction.json"
+    key = "per3600/20260525_0840"
+    _write_state(
+        path,
+        {
+            key: _window(
+                key=key,
+                expected=[AGGREGATE_ENTITY_ID],
+                targets={AGGREGATE_ENTITY_ID: _target("ok")},
+            )
+        },
+    )
+
+    result = repair_state(
+        product="direction",
+        window_keys=[key],
+        action="recompute_complete",
+        apply=False,
+        state_path=path,
+        lock_path=tmp_path / "state" / "direction.lock",
+    )
+
+    assert result.product == "direction"
+    assert result.dry_run is True
+    assert result.changes[0].after_status == "complete"
+    assert WindowStateStore.load(path).expected_target_ids(key) == [AGGREGATE_ENTITY_ID]
 
 
 def test_repair_state_refuses_apply_without_explicit_windows(tmp_path: Path) -> None:

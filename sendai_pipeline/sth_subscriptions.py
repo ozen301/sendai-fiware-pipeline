@@ -3,12 +3,14 @@
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol, Self
 
 import requests
+
+from sendai_pipeline.settings_validation import parse_exact_env_value
 
 logger = logging.getLogger(__name__)
 
@@ -26,16 +28,14 @@ PRODUCT_A_HISTORY_ATTRS: tuple[str, ...] = (
 )
 PRODUCT_A_TRIGGER_ATTRS: tuple[str, ...] = ("peopleCount_immedate",)
 
-PRODUCT_B_ENTITY_TYPES: tuple[str, ...] = PRODUCT_A_ENTITY_TYPES
-PRODUCT_B_HISTORY_ATTRS: tuple[str, ...] = (
+_PRODUCT_A_DESCRIPTION_PREFIX = "Product A STH-Comet history"
+_PRODUCT_B_DESCRIPTION_PREFIX = "Product B aggregate STH-Comet history"
+PRODUCT_B_STABLE_WRITE_ATTRS: tuple[str, ...] = (
     "dateObservedFrom",
     "dateObservedTo",
-    "peopleCount_flow",
+    "dateRetrieved",
+    "identifcation",
 )
-PRODUCT_B_TRIGGER_ATTRS: tuple[str, ...] = ("peopleCount_flow",)
-
-_PRODUCT_A_DESCRIPTION_PREFIX = "Product A STH-Comet history"
-_PRODUCT_B_DESCRIPTION_PREFIX = "Product B STH-Comet history"
 
 
 @dataclass(frozen=True)
@@ -56,14 +56,6 @@ _PRODUCT_A_SPEC = _ProductSpec(
     history_attrs=PRODUCT_A_HISTORY_ATTRS,
     trigger_attrs=PRODUCT_A_TRIGGER_ATTRS,
 )
-_PRODUCT_B_SPEC = _ProductSpec(
-    label="Product B",
-    description_prefix=_PRODUCT_B_DESCRIPTION_PREFIX,
-    entity_types=PRODUCT_B_ENTITY_TYPES,
-    history_attrs=PRODUCT_B_HISTORY_ATTRS,
-    trigger_attrs=PRODUCT_B_TRIGGER_ATTRS,
-)
-_ALL_SPECS: tuple[_ProductSpec, ...] = (_PRODUCT_A_SPEC, _PRODUCT_B_SPEC)
 
 
 class StHSubscriptionError(RuntimeError):
@@ -80,7 +72,7 @@ class TokenProvider(Protocol):
 
 @dataclass(frozen=True)
 class StHSubscriptionSettings:
-    """Settings for Product A STH-Comet subscription creation."""
+    """Settings for Product A and Product B STH-Comet subscriptions."""
 
     base_url: str
     comet_notify_url: str
@@ -90,30 +82,60 @@ class StHSubscriptionSettings:
     timeout: float = 10
     dry_run: bool = True
     expires: str = ""
-    throttling_seconds: int = 0
     skip_initial_notification: bool = True
+    product_b_aggregate_entity_id: str = "jp.sendai.Blesensor.flow"
+    product_b_aggregate_entity_type: str = "Blesensor.flow"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
-        if self.throttling_seconds < 0:
-            raise StHSubscriptionError("throttling_seconds must be non-negative")
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> Self:
-        """Build settings from environment variables."""
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        require_product_b: bool = True,
+    ) -> Self:
+        """Build settings from environment variables.
+
+        Args:
+            env: Environment mapping to read; defaults to ``os.environ``.
+            require_product_b: When ``True`` (the default), read and validate
+                the ``PRODUCT_B_AGGREGATE_*`` variables, raising on a malformed
+                value. When ``False``, skip them entirely and leave the field
+                defaults in place. A Product-A-only run passes ``False`` so a
+                malformed Product B value never fails it; only a run that
+                creates the Product B subscription needs those variables.
+        """
         values = os.environ if env is None else env
+        # Omit the Product B kwargs when not required so the dataclass field
+        # defaults apply and no PRODUCT_B_AGGREGATE_* value is read or validated.
+        product_b_kwargs: dict[str, str] = {}
+        if require_product_b:
+            product_b_kwargs = {
+                "product_b_aggregate_entity_id": parse_exact_env_value(
+                    values,
+                    "PRODUCT_B_AGGREGATE_ENTITY_ID",
+                    "jp.sendai.Blesensor.flow",
+                    StHSubscriptionError,
+                ),
+                "product_b_aggregate_entity_type": parse_exact_env_value(
+                    values,
+                    "PRODUCT_B_AGGREGATE_ENTITY_TYPE",
+                    "Blesensor.flow",
+                    StHSubscriptionError,
+                ),
+            }
         return cls(
             base_url=_required_env(values, "FIWARE_BASE_URL"),
             comet_notify_url=_required_env(values, "COMET_NOTIFY_URL"),
+            **product_b_kwargs,
             service=_optional_env(values, "FIWARE_SERVICE", ""),
             service_path=_optional_env(values, "FIWARE_SERVICE_PATH", "/"),
             verify_tls=_parse_bool(_optional_env(values, "FIWARE_VERIFY_TLS", "true")),
             timeout=_parse_float(values, "FIWARE_TIMEOUT_SECONDS", 10.0),
             dry_run=True,
             expires=_optional_env(values, "STH_SUBSCRIPTION_EXPIRES", ""),
-            throttling_seconds=_parse_int(
-                values, "STH_SUBSCRIPTION_THROTTLING_SECONDS", 0
-            ),
             skip_initial_notification=_parse_bool(
                 _optional_env(values, "STH_SUBSCRIPTION_SKIP_INITIAL", "true")
             ),
@@ -136,7 +158,7 @@ class StHSubscriptionResult:
         return 1 if self.failed > 0 else 0
 
 
-def _build_subscription_body(
+def _build_product_a_subscription_body(
     spec: _ProductSpec,
     settings: StHSubscriptionSettings,
     *,
@@ -170,8 +192,6 @@ def _build_subscription_body(
     }
     if settings.expires:
         body["expires"] = settings.expires
-    if settings.throttling_seconds > 0:
-        body["throttling"] = settings.throttling_seconds
     return body
 
 
@@ -182,7 +202,7 @@ def build_product_a_subscription_body(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build the Orion subscription body for Product A STH-Comet history."""
-    return _build_subscription_body(
+    return _build_product_a_subscription_body(
         _PRODUCT_A_SPEC, settings, redact_url=redact_url, now=now
     )
 
@@ -194,21 +214,90 @@ def build_product_b_subscription_body(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Build the Orion subscription body for Product B STH-Comet history."""
-    return _build_subscription_body(
-        _PRODUCT_B_SPEC, settings, redact_url=redact_url, now=now
-    )
+    description_time = now or datetime.now(tz=JST)
+    body: dict[str, Any] = {
+        "description": (
+            f"{_PRODUCT_B_DESCRIPTION_PREFIX} set at "
+            f"{description_time.isoformat(timespec='seconds')}"
+        ),
+        "subject": {
+            "entities": [
+                {
+                    "id": settings.product_b_aggregate_entity_id,
+                    "type": settings.product_b_aggregate_entity_type,
+                }
+            ],
+            "condition": {
+                "attrs": ["dateRetrieved"],
+                "notifyOnMetadataChange": True,
+            },
+        },
+        "notification": {
+            "http": {
+                "url": "<COMET_NOTIFY_URL>" if redact_url else settings.comet_notify_url
+            },
+            "attrsFormat": "legacy",
+            "metadata": ["TimeInstant"],
+        },
+    }
+    if settings.expires:
+        body["expires"] = settings.expires
+    return body
 
 
 def _create_sth_subscription(
-    spec: _ProductSpec,
     *,
+    label: str,
+    own_history_attrs: tuple[str, ...],
+    peer_label: str,
+    peer_description_prefixes: tuple[str, ...],
+    body_builder: Callable[[StHSubscriptionSettings], dict[str, Any]],
+    subscription_matcher: Callable[[StHSubscriptionSettings, Any], tuple[str, ...]],
     settings: StHSubscriptionSettings,
     auth: TokenProvider | None,
     session: Any = None,
 ) -> StHSubscriptionResult:
+    """Create one product's STH-Comet subscription, idempotently and safely.
+
+    Runs the shared create flow used by both products:
+
+    1. In dry-run mode, log the intent and return without any HTTP call.
+    2. GET the existing subscriptions (the preflight read); return ``failed``
+       when the response is not 200 after the authentication retry.
+    3. Abort if a *peer* product's subscription would cross-fire on this
+       product's writes (see ``_find_stale_peer_subscription``). Creating this
+       subscription alongside such a peer would append duplicate history rows,
+       so the run fails instead of creating it.
+    4. Skip if this product's subscription already exists, per
+       ``subscription_matcher`` (the idempotent no-op on re-runs).
+    5. Otherwise POST the built body. Return ``created`` and report its id for
+       a 201 response; return ``failed`` for any other response after the
+       authentication retry.
+
+    Args:
+        label: Product name used in log messages, e.g. ``"Product A"``.
+        own_history_attrs: The product's stable written attribute names to
+            compare with peer triggers. The stale-peer check aborts when a peer
+            subscription triggers on any of these (or triggers on everything),
+            since that peer would then fire on this product's own updates.
+        peer_label: The other product's name, used in log messages.
+        peer_description_prefixes: Description prefixes that identify the peer
+            product's subscriptions during the stale-peer check.
+        body_builder: Builds the subscription body to POST for this product.
+        subscription_matcher: Returns the ids of existing subscriptions that
+            already match this product's contract; drives the step-4 skip.
+        settings: Subscription settings (base URL, TLS, dry-run, entity ids).
+        auth: Token provider; required unless ``settings.dry_run`` is set.
+        session: Optional injected HTTP session for tests.
+
+    Returns:
+        A result counting exactly one of ``would_create`` / ``created`` /
+        ``skipped`` / ``failed``, carrying the matched or created subscription
+        id when there is one.
+    """
     if settings.dry_run:
         logger.info(
-            f"dry-run: would create {spec.label} STH subscription",
+            f"dry-run: would create {label} STH subscription",
             extra={
                 "event": "sth_subscription_would_create",
                 "dry_run": True,
@@ -240,7 +329,7 @@ def _create_sth_subscription(
         )
     if existing_response.status_code != 200:
         logger.error(
-            f"{spec.label} STH subscription preflight failed",
+            f"{label} STH subscription preflight failed",
             extra={
                 "event": "sth_subscription_failed",
                 "dry_run": False,
@@ -253,12 +342,17 @@ def _create_sth_subscription(
 
     existing_subscriptions = existing_response.json()
 
-    stale_peer = _find_stale_peer_subscription(spec, existing_subscriptions)
+    stale_peer = _find_stale_peer_subscription(
+        existing_subscriptions,
+        own_history_attrs=own_history_attrs,
+        peer_label=peer_label,
+        peer_description_prefixes=peer_description_prefixes,
+    )
     if stale_peer is not None:
         peer_label, peer_id, peer_trigger = stale_peer
         logger.error(
             (
-                f"{spec.label} STH subscription aborted: peer "
+                f"{label} STH subscription aborted: peer "
                 f"{peer_label} subscription has a non-exclusive trigger that "
                 "would be fired by this product's updates"
             ),
@@ -273,10 +367,10 @@ def _create_sth_subscription(
         )
         return StHSubscriptionResult(would_create=0, created=0, skipped=0, failed=1)
 
-    existing_ids = _matching_subscription_ids(spec, existing_subscriptions)
+    existing_ids = subscription_matcher(settings, existing_subscriptions)
     if existing_ids:
         logger.info(
-            f"{spec.label} STH subscription already exists",
+            f"{label} STH subscription already exists",
             extra={
                 "event": "sth_subscription_exists",
                 "dry_run": False,
@@ -292,7 +386,7 @@ def _create_sth_subscription(
             subscription_ids=existing_ids,
         )
 
-    body = _build_subscription_body(spec, settings)
+    body = body_builder(settings)
     body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
     response = http.post(
         f"{settings.base_url}/orion/v2.0/subscriptions",
@@ -315,7 +409,7 @@ def _create_sth_subscription(
     if response.status_code == 201:
         subscription_id = response.headers.get("Location", "").rsplit("/", 1)[-1]
         logger.info(
-            f"{spec.label} STH subscription created",
+            f"{label} STH subscription created",
             extra={
                 "event": "sth_subscription_created",
                 "dry_run": False,
@@ -333,7 +427,7 @@ def _create_sth_subscription(
         )
 
     logger.error(
-        f"{spec.label} STH subscription creation failed",
+        f"{label} STH subscription creation failed",
         extra={
             "event": "sth_subscription_failed",
             "dry_run": False,
@@ -353,7 +447,15 @@ def create_product_a_sth_subscription(
 ) -> StHSubscriptionResult:
     """Create the Product A Orion subscription, or report it in dry-run mode."""
     return _create_sth_subscription(
-        _PRODUCT_A_SPEC, settings=settings, auth=auth, session=session
+        label="Product A",
+        own_history_attrs=PRODUCT_A_HISTORY_ATTRS,
+        peer_label="Product B",
+        peer_description_prefixes=(_PRODUCT_B_DESCRIPTION_PREFIX,),
+        body_builder=build_product_a_subscription_body,
+        subscription_matcher=_matching_product_a_subscription_ids,
+        settings=settings,
+        auth=auth,
+        session=session,
     )
 
 
@@ -365,7 +467,20 @@ def create_product_b_sth_subscription(
 ) -> StHSubscriptionResult:
     """Create the Product B Orion subscription, or report it in dry-run mode."""
     return _create_sth_subscription(
-        _PRODUCT_B_SPEC, settings=settings, auth=auth, session=session
+        label="Product B",
+        # Product B always writes these stable scalar attrs. A Product A
+        # subscription triggering on any of them would fire on Product B's
+        # writes. Dynamic peopleCount_flow_<N> attrs are absent because their
+        # names are not enumerable; the current Product A trigger names only
+        # peopleCount_immedate, so it cannot overlap them.
+        own_history_attrs=PRODUCT_B_STABLE_WRITE_ATTRS,
+        peer_label="Product A",
+        peer_description_prefixes=(_PRODUCT_A_DESCRIPTION_PREFIX,),
+        body_builder=build_product_b_subscription_body,
+        subscription_matcher=_matching_product_b_subscription_ids,
+        settings=settings,
+        auth=auth,
+        session=session,
     )
 
 
@@ -478,17 +593,21 @@ def redacted_subscription_json(settings: StHSubscriptionSettings) -> str:
 
 def redacted_product_a_subscription_json(settings: StHSubscriptionSettings) -> str:
     """Return pretty Product A JSON for operator review with the URL redacted."""
-    return _redact(_PRODUCT_A_SPEC, settings)
+    return _render_subscription_json(
+        build_product_a_subscription_body(settings, redact_url=True)
+    )
 
 
 def redacted_product_b_subscription_json(settings: StHSubscriptionSettings) -> str:
     """Return pretty Product B JSON for operator review with the URL redacted."""
-    return _redact(_PRODUCT_B_SPEC, settings)
+    return _render_subscription_json(
+        build_product_b_subscription_body(settings, redact_url=True)
+    )
 
 
-def _redact(spec: _ProductSpec, settings: StHSubscriptionSettings) -> str:
+def _render_subscription_json(body: Mapping[str, Any]) -> str:
     return json.dumps(
-        _build_subscription_body(spec, settings, redact_url=True),
+        body,
         ensure_ascii=False,
         indent=2,
         sort_keys=True,
@@ -522,23 +641,31 @@ def _headers(
 
 
 def _find_stale_peer_subscription(
-    spec: _ProductSpec, subscriptions: Any
+    subscriptions: Any,
+    *,
+    own_history_attrs: tuple[str, ...],
+    peer_label: str,
+    peer_description_prefixes: tuple[str, ...],
 ) -> tuple[str, str, list[str]] | None:
-    """Return a peer subscription whose trigger is not exclusive to its product.
+    """Return a peer subscription whose trigger could fire on this product's writes.
 
-    Returns ``(peer_label, peer_id, peer_trigger_attrs)`` when any other
-    product's subscription is found whose trigger would be fired by this
-    product's normal updates — either because it overlaps this product's
-    history attrs, or because it is missing/empty/broad (an Orion
-    subscription with no ``condition.attrs`` fires for every attribute
-    update on the subject entities). Returns ``None`` only when all peer
-    subscriptions explicitly trigger on attributes this product never
-    writes.
+    Returns ``(peer_label, peer_id, peer_trigger_attrs)`` when a subscription
+    with one of the supplied current peer prefixes has a trigger this product's
+    normal updates could fire — either because it overlaps the supplied written
+    attrs, or because its trigger is absent, empty, or unparseable and is
+    treated as broad (an Orion subscription with no effective ``condition.attrs``
+    fires for every attribute update on its subject entities). Returns ``None``
+    when no recognized current peer subscription has such a trigger.
+
+    The comparison is on trigger attributes only; it deliberately ignores which
+    entities the peer targets. Hence "could" rather than "would": a disjoint
+    entity set means no real cross-fire, but the check still returns the peer.
+    This is a conservative fail-safe — it can abort creation on a
+    trigger-attribute overlap alone, rather than risk missing a real cross-fire.
     """
     if not isinstance(subscriptions, list):
         return None
-    own_history = set(spec.history_attrs)
-    peers = [other for other in _ALL_SPECS if other is not spec]
+    own_history = set(own_history_attrs)
     for subscription in subscriptions:
         if not isinstance(subscription, dict):
             continue
@@ -546,11 +673,7 @@ def _find_stale_peer_subscription(
         description = subscription.get("description")
         if not isinstance(subscription_id, str) or not isinstance(description, str):
             continue
-        peer = next(
-            (peer for peer in peers if description.startswith(peer.description_prefix)),
-            None,
-        )
-        if peer is None:
+        if not description.startswith(peer_description_prefixes):
             continue
         subject = subscription.get("subject")
         condition_attrs: list[str] = []
@@ -561,8 +684,90 @@ def _find_stale_peer_subscription(
                 if isinstance(raw, list):
                     condition_attrs = [item for item in raw if isinstance(item, str)]
         if not condition_attrs or set(condition_attrs) & own_history:
-            return peer.label, subscription_id, condition_attrs
+            return peer_label, subscription_id, condition_attrs
     return None
+
+
+def _matching_product_a_subscription_ids(
+    _settings: StHSubscriptionSettings, subscriptions: Any
+) -> tuple[str, ...]:
+    """Return ids for subscriptions matching Product A's existing shape."""
+    return _matching_subscription_ids(_PRODUCT_A_SPEC, subscriptions)
+
+
+def _matching_product_b_subscription_ids(
+    settings: StHSubscriptionSettings, subscriptions: Any
+) -> tuple[str, ...]:
+    """Return ids for subscriptions matching the aggregate Product B shape."""
+    if not isinstance(subscriptions, list):
+        return ()
+
+    matches: list[str] = []
+    for subscription in subscriptions:
+        if not isinstance(subscription, dict):
+            continue
+        subscription_id = subscription.get("id")
+        if (
+            isinstance(subscription_id, str)
+            and subscription_id
+            and _has_product_b_aggregate_shape(settings, subscription)
+        ):
+            matches.append(subscription_id)
+    return tuple(matches)
+
+
+def _has_product_b_aggregate_shape(
+    settings: StHSubscriptionSettings, subscription: Mapping[str, Any]
+) -> bool:
+    """Return whether a live subscription is Product B's aggregate subscription.
+
+    Matches only the exact redesigned shape: the Product B aggregate
+    description prefix, the configured aggregate entity id/type, a
+    ``dateRetrieved`` metadata-change trigger, legacy format, ``TimeInstant``
+    metadata, and the configured notify URL. Two checks are subtle:
+
+    - ``notification.attrs``: the builder omits it so Orion notifies the full
+      replaced entity. Orion echoes an omitted ``attrs`` as ``[]`` on read, so
+      an omitted key and an empty list both match here; any non-empty ``attrs``
+      is a different subscription and does not match. This keeps a re-run from
+      creating a duplicate of the subscription it just wrote.
+    - The notify URL must equal the configured URL exactly; a different URL is a
+      different subscription, not this one.
+    """
+    description = subscription.get("description")
+    subject = subscription.get("subject")
+    notification = subscription.get("notification")
+    if (
+        not isinstance(description, str)
+        or not description.startswith(_PRODUCT_B_DESCRIPTION_PREFIX)
+        or not isinstance(subject, dict)
+        or not isinstance(notification, dict)
+    ):
+        return False
+
+    condition = subject.get("condition")
+    http = notification.get("http")
+    if not isinstance(condition, dict) or not isinstance(http, dict):
+        return False
+
+    notification_attrs_match = (
+        "attrs" not in notification or notification.get("attrs") == []
+    )
+    return (
+        subject.get("entities")
+        == [
+            {
+                "id": settings.product_b_aggregate_entity_id,
+                "type": settings.product_b_aggregate_entity_type,
+            }
+        ]
+        and condition.get("attrs") == ["dateRetrieved"]
+        and condition.get("notifyOnMetadataChange") is True
+        and http.get("url") == settings.comet_notify_url
+        and notification.get("attrsFormat") == "legacy"
+        and notification.get("metadata") == ["TimeInstant"]
+        and notification_attrs_match
+    )
 
 
 def _matching_subscription_ids(
@@ -665,19 +870,3 @@ def _parse_float(env: Mapping[str, str], key: str, default: float) -> float:
         raise StHSubscriptionError(
             f"environment variable must be a number: {key}"
         ) from exc
-
-
-def _parse_int(env: Mapping[str, str], key: str, default: int) -> int:
-    """Parse an optional integer environment variable."""
-    raw = _optional_env(env, key, "")
-    if raw == "":
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise StHSubscriptionError(
-            f"environment variable must be an integer: {key}"
-        ) from exc
-    if value < 0:
-        raise StHSubscriptionError(f"environment variable must be non-negative: {key}")
-    return value

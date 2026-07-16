@@ -10,9 +10,21 @@ import requests
 ENTITY_10 = "jp.sendai.Blesensor.per3600.10"
 ENTITY_10_PER300 = "jp.sendai.Blesensor.per300.10"
 ENTITY_11 = "jp.sendai.Blesensor.per3600.11"
+ENTITY_14_OUTSIDE_DIRECTION_BATCH = "jp.sendai.Blesensor.per3600.14"
 ENTITY_99 = "jp.sendai.Blesensor.per300.99"
 TYPE_3600 = "Blesensor.per3600"
 TYPE_300 = "Blesensor.per300"
+AGGREGATE_ENTITY_ID = "custom.aggregate.entity"
+AGGREGATE_ENTITY_TYPE = "Custom.aggregate.type"
+AGGREGATE_ATTRS = [
+    "dateObservedFrom",
+    "dateObservedTo",
+    "dateRetrieved",
+    "identifcation",
+    "peopleCount_flow_10",
+    "peopleCount_flow_11",
+    "peopleCount_flow_14",
+]
 
 
 class FakeAuth:
@@ -103,6 +115,26 @@ def metadata_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def aggregate_metadata_path(tmp_path: Path, metadata_path: Path) -> Path:
+    path = tmp_path / "aggregate-sensors.csv"
+    base_rows = metadata_path.read_text(encoding="utf-8").splitlines()
+    path.write_text(
+        "\n".join(
+            [
+                *base_rows,
+                "14,2025,M5Stack,60,Blesensor.per3600,"
+                f"{ENTITY_14_OUTSIDE_DIRECTION_BATCH},14,true",
+                "12,2026,M5Stack,60,Blesensor.per3600,"
+                "jp.sendai.Blesensor.per3600.12,12,false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
 def runtime(
     monkeypatch: pytest.MonkeyPatch,
     metadata_path: Path,
@@ -117,9 +149,22 @@ def runtime(
     monkeypatch.setenv("FIWARE_SERVICE", "sendai")
     monkeypatch.setenv("FIWARE_SERVICE_PATH", "/")
     monkeypatch.setenv("SENSOR_METADATA_PATH", str(metadata_path))
+    monkeypatch.setenv("TARGET_DIRECTION_BATCHES", "2026")
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_ID", AGGREGATE_ENTITY_ID)
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", AGGREGATE_ENTITY_TYPE)
     _ACTIVE_RUNTIME = patch
 
     return patch
+
+
+@pytest.fixture
+def aggregate_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    aggregate_metadata_path: Path,
+    runtime: RuntimePatch,
+) -> RuntimePatch:
+    monkeypatch.setenv("SENSOR_METADATA_PATH", str(aggregate_metadata_path))
+    return runtime
 
 
 def test_show_data_rejects_attrs_and_flow_attrs_together(
@@ -512,7 +557,75 @@ def test_show_data_comet_404_emits_not_found_record_exit_zero(
     ]
 
 
-def test_show_data_comet_source_requires_attrs_selection(
+def test_show_data_comet_aggregate_enumerates_contract_and_active_interval_60_attrs(
+    capsys: pytest.CaptureFixture[str],
+    aggregate_runtime: RuntimePatch,
+) -> None:
+    aggregate_runtime.comet.outcomes = [
+        _history(AGGREGATE_ENTITY_ID, attr) for attr in AGGREGATE_ATTRS
+    ]
+
+    result = _invoke(_aggregate_comet_args(), capsys)
+
+    assert result == 0
+    assert [call["attr"] for call in aggregate_runtime.comet.calls] == AGGREGATE_ATTRS
+
+
+def test_show_data_comet_aggregate_reports_missing_attr_and_continues(
+    capsys: pytest.CaptureFixture[str],
+    aggregate_runtime: RuntimePatch,
+) -> None:
+    aggregate_runtime.comet.outcomes = [
+        _history(AGGREGATE_ENTITY_ID, "dateObservedFrom"),
+        _http_error(404, "missing"),
+        *[_history(AGGREGATE_ENTITY_ID, attr) for attr in AGGREGATE_ATTRS[2:]],
+    ]
+
+    result = _invoke(_aggregate_comet_args(), capsys)
+
+    assert result == 0
+    assert [call["attr"] for call in aggregate_runtime.comet.calls] == AGGREGATE_ATTRS
+    assert _json_objects(capsys.readouterr().out)[1] == {
+        "attr": "dateObservedTo",
+        "entity_id": AGGREGATE_ENTITY_ID,
+        "error": "not_found",
+    }
+
+
+def test_show_data_comet_aggregate_id_auto_resolves_type_from_env(
+    capsys: pytest.CaptureFixture[str],
+    aggregate_runtime: RuntimePatch,
+) -> None:
+    aggregate_runtime.comet.outcomes = [
+        _history(AGGREGATE_ENTITY_ID, attr) for attr in AGGREGATE_ATTRS
+    ]
+
+    result = _invoke(
+        ["--source", "comet", "--entity-id", AGGREGATE_ENTITY_ID],
+        capsys,
+    )
+
+    assert result == 0
+    assert [call["attr"] for call in aggregate_runtime.comet.calls] == AGGREGATE_ATTRS
+    assert [call["entity_type"] for call in aggregate_runtime.comet.calls] == [
+        AGGREGATE_ENTITY_TYPE
+    ] * len(AGGREGATE_ATTRS)
+
+
+def test_show_data_comet_aggregate_enumeration_requires_explicit_id(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    result = _invoke(
+        ["--source", "comet", "--type", AGGREGATE_ENTITY_TYPE],
+        capsys,
+    )
+
+    assert result == 2
+    assert runtime.comet.calls == []
+
+
+def test_show_data_comet_non_aggregate_requires_attrs_selection(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
@@ -520,6 +633,134 @@ def test_show_data_comet_source_requires_attrs_selection(
 
     assert result != 0
     assert runtime.comet.calls == []
+
+
+def test_show_data_comet_explicit_attrs_reads_inactive_historical_place(
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    attr = "peopleCount_flow_99"
+    runtime.comet.outcomes = [_history(AGGREGATE_ENTITY_ID, attr)]
+
+    result = _invoke(_aggregate_comet_args() + ["--attrs", attr], capsys)
+
+    assert result == 0
+    assert [call["attr"] for call in runtime.comet.calls] == [attr]
+
+
+def test_show_data_product_a_read_ignores_malformed_product_b_config(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    # A malformed Product B aggregate config must not fail a Product A read.
+    # Reading a canonical Product A id (no --type) infers the type from the id
+    # and never resolves PRODUCT_B_AGGREGATE_*, so the bad values are ignored.
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_ID", " malformed")
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", "")
+    runtime.comet.outcomes = [_history(ENTITY_10, "peopleCount_immedate")]
+
+    result = _invoke(
+        [
+            "--source",
+            "comet",
+            "--entity-id",
+            ENTITY_10,
+            "--attrs",
+            "peopleCount_immedate",
+        ],
+        capsys,
+    )
+
+    assert result == 0
+    assert runtime.comet.calls[0]["entity_id"] == ENTITY_10
+    assert runtime.comet.calls[0]["entity_type"] == TYPE_3600
+
+
+def test_show_data_aggregate_read_still_rejects_malformed_product_b_config(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    # Reading the aggregate entity (non-canonical) still resolves and validates
+    # the Product B config, so a malformed type is a config error (exit 2), not
+    # a silent pass.
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", " malformed")
+
+    result = _invoke(["--source", "comet", "--entity-id", AGGREGATE_ENTITY_ID], capsys)
+
+    assert result == 2
+    assert runtime.comet.calls == []
+
+
+def test_show_data_comet_canonical_shaped_aggregate_override_uses_configured_type(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    aggregate_runtime: RuntimePatch,
+) -> None:
+    # The aggregate id may be overridden to a canonical-shaped value. Such an
+    # id must still get the CONFIGURED Product B type and aggregate attribute
+    # enumeration, not the type embedded in the id (here "Blesensor.aggregate").
+    canonical_shaped_id = "jp.sendai.Blesensor.aggregate.999"
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_ID", canonical_shaped_id)
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", "Blesensor.flow")
+    aggregate_runtime.comet.outcomes = [
+        _history(canonical_shaped_id, attr) for attr in AGGREGATE_ATTRS
+    ]
+
+    result = _invoke(["--source", "comet", "--entity-id", canonical_shaped_id], capsys)
+
+    assert result == 0
+    assert [call["attr"] for call in aggregate_runtime.comet.calls] == AGGREGATE_ATTRS
+    assert [call["entity_type"] for call in aggregate_runtime.comet.calls] == [
+        "Blesensor.flow"
+    ] * len(AGGREGATE_ATTRS)
+
+
+def test_show_data_comet_urn_shaped_aggregate_override_is_not_colon_split(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    aggregate_runtime: RuntimePatch,
+) -> None:
+    # A URN aggregate id contains colons. Passing it as a bare id must match the
+    # configured id (and enumerate aggregate attrs with the configured type),
+    # not be mis-split into id "urn:ngsi-ld:Blesensor.flow" + inline type
+    # "Sendai".
+    urn_id = "urn:ngsi-ld:Blesensor.flow:Sendai"
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_ID", urn_id)
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", "Blesensor.flow")
+    aggregate_runtime.comet.outcomes = [
+        _history(urn_id, attr) for attr in AGGREGATE_ATTRS
+    ]
+
+    result = _invoke(["--source", "comet", "--entity-id", urn_id], capsys)
+
+    assert result == 0
+    assert [call["entity_id"] for call in aggregate_runtime.comet.calls] == [
+        urn_id
+    ] * len(AGGREGATE_ATTRS)
+    assert [call["attr"] for call in aggregate_runtime.comet.calls] == AGGREGATE_ATTRS
+    assert [call["entity_type"] for call in aggregate_runtime.comet.calls] == [
+        "Blesensor.flow"
+    ] * len(AGGREGATE_ATTRS)
+
+
+def test_show_data_orion_product_a_read_ignores_malformed_product_b_config(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    runtime: RuntimePatch,
+) -> None:
+    # The Orion path must also tolerate malformed Product B config for a
+    # Product A read: a canonical id resolves its type without consulting it.
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_ID", " malformed")
+    monkeypatch.setenv("PRODUCT_B_AGGREGATE_ENTITY_TYPE", "")
+    runtime.orion.outcomes = [_orion_entity(ENTITY_10)]
+
+    result = _invoke(["--source", "orion", "--entity-id", ENTITY_10], capsys)
+
+    assert result == 0
+    assert runtime.orion.calls[0]["entity_id"] == ENTITY_10
+    assert runtime.orion.calls[0]["entity_type"] == TYPE_3600
 
 
 def test_show_data_place_resolves_to_entity_id_via_metadata(
@@ -644,21 +885,20 @@ def test_show_data_flow_attrs_expands_to_seven_product_a_attributes(
     )
 
 
-def test_show_data_direction_attrs_expands_to_product_b_attributes(
+def test_show_data_rejects_removed_direction_attrs_flag(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
-    expected_attrs = [
-        "dateObservedFrom",
-        "dateObservedTo",
-        "peopleCount_flow",
+    runtime.comet.outcomes = [
+        _history(ENTITY_10, attr)
+        for attr in ("dateObservedFrom", "dateObservedTo", "peopleCount_flow")
     ]
-    runtime.comet.outcomes = [_history(ENTITY_10, attr) for attr in expected_attrs]
 
     result = _invoke(_comet_args(ENTITY_10) + ["--direction-attrs"], capsys)
 
-    assert result == 0
-    assert [call["attr"] for call in runtime.comet.calls] == expected_attrs
+    assert result == 2
+    assert "unrecognized arguments: --direction-attrs" in capsys.readouterr().err
+    assert runtime.comet.calls == []
 
 
 def test_show_data_pretty_renders_orion_table_with_columns(
@@ -900,6 +1140,17 @@ def _comet_args(*entity_ids: str) -> list[str]:
     for entity_id in entity_ids:
         args.extend(["--entity-id", entity_id])
     return args
+
+
+def _aggregate_comet_args() -> list[str]:
+    return [
+        "--source",
+        "comet",
+        "--type",
+        AGGREGATE_ENTITY_TYPE,
+        "--entity-id",
+        AGGREGATE_ENTITY_ID,
+    ]
 
 
 def _orion_entity(

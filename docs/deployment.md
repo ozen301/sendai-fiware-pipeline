@@ -85,10 +85,14 @@ to atomically merge them into `metadata/sensors.csv`.
 
 ## 5. Bootstrap Orion entities
 
-Create each target entity once on the platform. NGSI
-`POST .../attrs` updates attributes on existing entities; it does not
-create them, so this step must run before any live publication for a
-new batch.
+Create each target entity once on the platform. NGSI `POST .../attrs`
+(Product A) and `PUT .../attrs` (Product B) both update attributes on
+existing entities; neither creates them, so this step must run before
+any live publication for a new batch. Product A targets one entity per
+place and interval; Product B targets a single aggregate entity
+(`jp.sendai.Blesensor.flow`, type `Blesensor.flow` by default — see
+`PRODUCT_B_AGGREGATE_ENTITY_ID` / `_TYPE` in
+[configuration.md](configuration.md)).
 
 `scripts/create_entities.py` takes one or more positional arguments,
 each in `entity_id:entity_type` form. You can pass every entity you need to
@@ -99,7 +103,8 @@ uv run python scripts/create_entities.py \
   jp.sendai.Blesensor.per3600.101:Blesensor.per3600 \
   jp.sendai.Blesensor.per300.101:Blesensor.per300 \
   jp.sendai.Blesensor.per3600.102:Blesensor.per3600 \
-  jp.sendai.Blesensor.per300.102:Blesensor.per300
+  jp.sendai.Blesensor.per300.102:Blesensor.per300 \
+  jp.sendai.Blesensor.flow:Blesensor.flow
 ```
 
 Without `--send` this runs in dry-run (no FIWARE credentials needed).
@@ -119,7 +124,7 @@ operation is safe to re-run.
 
 ## 6. Create STH-Comet subscriptions
 
-Do this **before** any live POST. Subscriptions ship with
+Do this **before** any live write. Subscriptions ship with
 `options=skipInitialNotification`, which means Orion will not replay
 any *existing* attribute value into Comet when the subscription is
 created. Only attribute updates that happen *after* the subscription
@@ -157,7 +162,7 @@ safe.
       (§5 complete). The entity-map validation step logs a warning for
       any missing entity.
 - [ ] STH-Comet subscriptions are live (§6 complete with `--send`).
-      Creating subscriptions **before** the first live POST is required;
+      Creating subscriptions **before** the first live write is required;
       `skipInitialNotification` means earlier updates are never replayed.
 - [ ] `.env` credentials (`FIWARE_*`, `MYSQL_*`) are correct and
       dry-run completes without `token_refresh_failed` or
@@ -179,8 +184,10 @@ uv run python -m sendai_pipeline.run_flow
 uv run python -m sendai_pipeline.run_direction
 ```
 
-Inspect `logs/{product}.log` for `post_succeeded` events and the
-`run_summary` record. Then proceed to §8 (scheduling). If you
+Inspect `logs/{product}.log` for successful-write events — `post_succeeded`
+for Product A (`run_flow`) and `put_succeeded` for Product B
+(`run_direction`) — and the `run_summary` record. Then proceed to §8
+(scheduling). If you
 intentionally narrow either target-batch variable for validation, widen
 it only after logs, state, and Comet history look correct.
 

@@ -10,71 +10,62 @@ This document is the narrative walk-through; the spec is the rulebook.
 ## What the pipeline does
 
 A scheduled Python job reads aggregated BLE sensor metrics from a private
-MySQL database and republishes them as NGSI v2 attribute updates on the
-Sendai FIWARE Orion broker. Two independent jobs share the same target
-entities:
+MySQL database and publishes them as NGSI v2 attributes to the Sendai FIWARE
+Orion broker. Two independent jobs use different target models:
 
 - **Product A (`run_flow`)** publishes per-place pedestrian counts and stay
   times (the `peopleCount_immedate/near/far` and
   `peopleOccupancy_immedate/near` attributes).
-- **Product B (`run_direction`)** publishes inter-place flow ("回遊性") as a
-  single `peopleCount_flow` structured attribute carrying each place's
-  in/out movement counts.
+- **Product B (`run_direction`)** bundles one 60-minute inter-place flow
+  ("回遊性") window into dynamic `peopleCount_flow_<N>` attributes and
+  replaces one aggregate entity's full attribute set.
 
-Both products write to the same per-place entities
-(`Blesensor.per3600.<N>` for 60-minute windows, `Blesensor.per300.<N>` for
-5-minute windows). They coexist safely because their measurement
-attributes are disjoint: Product A writes `peopleCount_immedate/near/far` and
-`peopleOccupancy_immedate/near`, Product B writes `peopleCount_flow` (and
-also `identifcation` and `dateRetrieved`), and the few shared envelope
-attributes (`dateObservedFrom`, `dateObservedTo`) are computed identically
-from the same source window, so when both products write them for the
-same window, the value is the same either way.
+Product A writes per-place `Blesensor.per3600.<N>` and
+`Blesensor.per300.<N>` entities with update-only `POST /attrs`. Product B
+writes the exclusively owned aggregate entity `jp.sendai.Blesensor.flow` of
+type `Blesensor.flow` by default with replace-all `PUT /attrs`. The Product B
+target is configurable, but it remains one entity and must not contain
+unrelated attributes or receive writes from another owner.
 
 Downstream, Sendai's STH-Comet history service subscribes to Orion and
 stores every published value as a time series. The pipeline tags each
 attribute with a `TimeInstant` NGSI metadata field carrying the source
 window's start time; Comet uses that tag as the history timestamp instead
-of the wall-clock time the POST arrived. That way the history record
-reflects "this measurement is for 10:00-11:00 JST" even if the POST
+of the wall-clock time the write arrived. That way the history record
+reflects "this measurement is for 10:00-11:00 JST" even if the write
 actually landed at, for instance, 13:25.
 
 ---
 
 ## Architecture at a glance
 
-Two independent pipelines, **Product A** (the flow runner) and
-**Product B** (the direction runner), read different tables in the
-same MySQL database and write to the same per-place FIWARE Orion
-entities every 5 minutes. They own disjoint measurement attributes on
-those entities (Product A the `peopleCount_*` / `peopleOccupancy_*`
-counts, Product B `peopleCount_flow`); both also stamp the shared
-`dateObservedFrom` / `dateObservedTo` timestamps, which they compute
-identically from the same source window, so those writes agree. As there is no
-other overlap, the two products coexist without coordination beyond
-their separate state files.
+Two independent pipelines read different tables in the same MySQL database.
+Product A updates individual sensor entities. Product B replaces one aggregate
+direction entity for each sendable 60-minute window. Both run on the five-minute
+schedule, but Product B never sends 5-minute direction rows.
 
 ```
 MySQL (bleData2025d)
   ├── flow_metrics2_per_place2_agg_imputed ──► Product A (run_flow.py)
-  │                                              writes peopleCount_immedate/near/far
+  │                                              publishes peopleCount_immedate/near/far
   │                                              and peopleOccupancy_immedate/near
   │
   └── direction_metrics2_per_place2_agg    ──► Product B (run_direction.py)
-                                                 writes peopleCount_flow
+                                                 publishes one 60-min aggregate
+                                                 peopleCount_flow_<N> package
 
-Both products ──► same Orion entities (jp.sendai.Blesensor.per{300,3600}.<N>)
-                  ──► STH-Comet history (via Orion subscription)
+Product A ──► per-place Orion entities (jp.sendai.Blesensor.per{300,3600}.<N>)
+Product B ──► one aggregate Orion entity (jp.sendai.Blesensor.flow by default)
+Both      ──► STH-Comet history (via separate Orion subscriptions)
 ```
 
 Each product is coordinated across cron runs by its own JSON state
-file (`state/flow.json` / `state/direction.json`). The state file
-records which `(window, entity)` targets have already received a
-successful POST; without it every run would re-POST the same windows
-and create duplicate STH-Comet history rows.
+file (`state/flow.json` / `state/direction.json`). Product A records the
+per-place targets for each window. Product B records the single aggregate
+target for each sendable 60-minute window.
 
-Both runners publish two aggregation intervals (5-minute and
-60-minute) and are staggered by 2 minutes in cron to spread load:
+Both runners are staggered in cron to spread load. Product A publishes both
+intervals; Product B publishes only 60-minute windows:
 
 ```
 :00  :02  :04  :05  :06  :07  :09  :10  :12  :14  :15 ...
@@ -90,7 +81,7 @@ Timeline for one window (example: 60-min window covering 10:00-11:00 JST)
    10:00 ──── source window starts
    11:00 ──── source window closes (start + 60 min)
    13:00 ──── earliest eligible publish (window start + SOURCE_STABILITY_DELAY_HOURS (defaults to 3h))
-   13:02 ──── cron fires → pipeline reads MySQL, POSTs to Orion, writes state
+   13:02 ──── cron fires → pipeline reads MySQL, publishes to Orion, records state
    (retry) ── partial/failed targets retried every 5 min
    10:00+72h ─ retry horizon (MAX_LOOKBACK_HOURS_PER3600 = 72h): last chance
                 for the normal run to pick up this window
@@ -109,13 +100,15 @@ down once up front:
 
 **NGSI v2.** The REST API spec FIWARE Orion exposes. Entities have an
 `id`, a `type`, and named attributes shaped as
-`{"type": …, "value": …, "metadata": …}`. The pipeline talks to Orion
-exclusively through `POST /orion/v2.0/entities/<id>/attrs`, which appends or
-updates attributes on an existing entity without touching the others.
+`{"type": …, "value": …, "metadata": …}`. Product A uses
+`POST /orion/v2.0/entities/<id>/attrs` to update selected attributes. Product B
+uses `PUT` on the same `/attrs` resource to replace the aggregate entity's
+complete attribute set.
 
-**Entity.** A single addressable thing in Orion. For us, one per
-(place, interval). For example, `jp.sendai.Blesensor.per3600.105` is "place
-105, 60-minute aggregates."
+**Entity.** A single addressable thing in Orion. Product A uses one per
+(place, interval); for example, `jp.sendai.Blesensor.per3600.105` is place 105's
+60-minute aggregate. Product B uses one aggregate entity for all emitted places
+in a source window.
 
 **Attribute.** A named field on an entity (e.g. `peopleCount_immedate`).
 Each attribute carries an NGSI type, a value, and optional metadata.
@@ -124,18 +117,16 @@ Each attribute carries an NGSI type, a value, and optional metadata.
 represents one place (or place-pair) for one time window at one
 aggregation interval.
 
-**Aggregation interval.** How wide the source window is, in minutes.
-The pipeline only publishes `5` and `60`; the source also stores `1` for
-internal use, which we skip.
+**Aggregation interval.** How wide the source window is, in minutes. Product A
+publishes `5` and `60`; Product B publishes only `60`. The source also stores
+`1` for internal use, which both products skip.
 
 **Source aggregation window (or just "window").** A specific time slice
 identified by its start time and interval. For example,
-`per3600/20260524_1000` is the 60-minute window starting at
-2026-05-24 10:00 JST and ending at 11:00 JST. A window can produce up
-to one POST per active target entity in the matching interval; Product
-B always emits one payload per active target (using a sentinel `null`
-`peopleCount_flow` when there are no observations), while Product A
-only emits payloads for targets whose source row survived filtering.
+`per3600/20260524_1000` is the 60-minute window starting at 2026-05-24
+10:00 JST and ending at 11:00 JST. Product A can produce one update per
+observed place. Product B produces one aggregate replacement when at least one
+candidate place survives and every candidate has both required source totals.
 
 **`TimeInstant`.** An NGSI metadata field attached to every attribute we
 write. In this pipeline, we set its value to the window's start time. STH-Comet, when configured
@@ -144,9 +135,9 @@ history timestamp instead of the wall-clock arrival time. Result: Comet's
 history is indexed by *when the measurement is for* rather than *when we
 happened to send it*.
 
-**Target.** A single `(entity_id, window)` pair, i.e. "what we're going
-to POST." Each window has many targets, one per active entity in the
-matching interval.
+**Target.** A single `(entity_id, window)` delivery. Product A can have many
+per-place targets in one window. A sendable Product B window has exactly one:
+the configured aggregate entity.
 
 **Window status.** The aggregate state of one window across all its
 targets:
@@ -156,62 +147,52 @@ targets:
 - `partial`: the run finished with at least one expected target not yet
   `ok` (still missing, `pending`, or `failed`). The window is still
   eligible for the next run's retry.
-- `complete`: every entity id in `expected_target_ids` has a recorded
-  `ok`. What goes *into* `expected_target_ids` differs by product
-  (observed-union for Product A, fixed roster for Product B); see "Record
-  outcome" below.
+- `complete`: every entity id in `expected_target_ids` has a recorded `ok`.
+  Product A uses its observed-target union; Product B uses the single aggregate
+  id. A Product B no-payload or source-invalid attempt creates no state record.
 - `dead_letter`: operator-marked unrecoverable. Never retried.
 
-**Target status.** Per-target outcome: `ok` / `failed` / `pending`. Once
-`ok`, that target is terminal for that window. Normal retries never
-re-POST it, even if the source aggregate later drifts. This is what
-makes the pipeline history-idempotent under STH-Comet subscriptions
-(re-POSTing a value would create a duplicate Comet row).
+**Target status.** Per-target outcome: `ok` / `failed` / `pending`. An unchanged
+prior-`ok` payload is skipped. A revised payload is written again and appends a
+corrective STH-Comet row under the original window `TimeInstant`.
 
 **Send mode.** Per-product gate (`FLOW_SEND_MODE`, `DIRECTION_SEND_MODE`).
-`dry-run` (default) builds the full payload and writes it to the log
-but does not POST attribute updates to Orion; `send` performs the live
-attribute-update POSTs. Either way, the runner still makes read-only
+`dry-run` (default) builds the full payload and writes it to the log but does
+not mutate Orion; `send` performs Product A updates or Product B replacements.
+Either way, the runner still makes read-only
 `GET` calls to Orion for entity-map validation (so OAuth credentials
 must be valid in dry-run too). Flipping to `send` is an explicit
 operator action.
 
 **Batch.** Sensor install cohort: In our case, `2023` (`Pixel3aUT`
 devices) or `2026` (`M5Stack` devices). Used
-for filtering, because the source table stores parallel rows under both
-device types and we have to pick the right one. `TARGET_FLOW_BATCHES`
-and `TARGET_DIRECTION_BATCHES` select which batches each product
-publishes for.
+for filtering, because the source table stores parallel rows under both device
+types and we have to pick the right one. `TARGET_FLOW_BATCHES` selects Product A
+publish targets. `TARGET_DIRECTION_BATCHES` gates Product B source inclusion
+and oldest-device-type selection; it does not select the aggregate Orion target.
 
-**`identifcation` (misspelled).** A metadata column and NGSI attribute
-name. The misspelling matches what the live Sendai broker expects, so do
-not "fix" it. Its value is the place number as a string: `"1"`, `"2"`,
-… for the 2023 batch and `"101"`, `"102"`, … for the 2026 batch (i.e.
-the final dot-separated component of the entity id). The metadata CSV is
-authoritative; the pipeline reads the value verbatim from the
-`identifcation` column rather than reconstructing it.
+**`identifcation` (misspelled).** An NGSI attribute name preserved for platform
+compatibility. In every Product B aggregate package its value is exactly the
+configured aggregate entity id. Product A does not write it.
 
 **State file.** A per-product JSON file under `state/`
-(`state/flow.json`, `state/direction.json`) recording every window's
-status and every target's last POST outcome. In `send` mode the file is
-rewritten atomically after each target's POST and once more near the
+(`state/flow.json`, `state/direction.json`) recording every window's status and
+every target's last write outcome. In `send` mode the file is rewritten
+atomically after each target's write and once more near the
 end of the run (for retention GC); in `dry-run` mode it is not
 touched.
 
-The state file is the pipeline's memory between cron invocations and
-the mechanism that makes it history-idempotent: because STH-Comet
-records a new time-series row every time a value is re-POSTed, any
-target that has already received an `ok` is permanently skipped on
-subsequent runs, even if the source aggregate changes later. Without
-the state file, every run would re-POST every window in its rolling
-lookback range and fill Comet history with duplicates.
+The state file is the pipeline's memory between cron invocations. It skips
+unchanged successful deliveries while allowing changed source windows to append
+corrective history rows.
 
 **`null` vs `0`.** For all numeric attributes, `null` means "no
 observation was recorded," and `0` means "observed zero." The two are
 semantically different and the pipeline preserves both: 
 nullable source values are sent as JSON `null`, never coerced to `0`.
-This matters most for `peopleCount_flow` (Product B), where a missing
-value and a confirmed empty movement are distinct cases.
+For Product B, dense matrix `0` means observed zero between two emitted places.
+No observation is represented by absence from the emitted-place roster, not by
+a sentinel matrix attribute.
 
 **Source stability delay.** `SOURCE_STABILITY_DELAY_HOURS` (default 3h).
 A window is eligible to publish only if its source `startdate` is at or
@@ -272,9 +253,9 @@ written at stage 5 to record what just happened:
                  │
                  ▼
    ┌──────────────────────────────┐
-   │ 4. POST to Orion             │ ──► FIWARE Orion (NGSI v2)
-   │    - auth.py                 │     POST /orion/v2.0/entities/<id>/attrs
-   │    - orion_client.py         │
+   │ 4. Write Orion attributes    │ ──► FIWARE Orion (NGSI v2)
+   │    - auth.py                 │     Product A: update per-place attrs
+   │    - orion_client.py         │     Product B: replace aggregate attrs
    └─────────────┬────────────────┘
                  │
                  ▼
@@ -301,8 +282,7 @@ The five stages in plain words:
    Otherwise the source aggregator may still be revising it. The SQL
    query fetches rows for every eligible window in the lookback range,
    not just the open ones; per-target skipping happens later in stage 4,
-   right before the POST (any target already recorded `ok` for that
-   window in the state file is not re-POSTed). `pending` and `partial`
+   right before the write. `pending` and `partial`
    windows remain in scope as long as they are still inside the retry
    horizon (`MAX_LOOKBACK_HOURS_PER300` / `MAX_LOOKBACK_HOURS_PER3600`,
    both 72h by default, since source rows can arrive at MySQL up to 3 days
@@ -333,43 +313,46 @@ The five stages in plain words:
 
    *Product B* (`transform_direction.py`), per row, against both
    `from_group_place_id` and `to_group_place_id`:
-   1. drop if `interval_min ∉ {5, 60}`;
+   1. drop unless `interval_min = 60`;
    2. drop if either side matches an `IGNORED_PLACE_PREFIXES` entry
       (the literal `ALL` is exempt; it's a real aggregation key);
    3. resolve each non-`ALL` side via metadata, with the source-side
       batch (derived from the `sendai2023.` / `sendai202603.` prefix)
-      required to match the metadata batch, dropping if either side fails
-      to resolve;
-   4. drop self-loops (`from == to`), while keeping cross-batch pairs
-      when both sides resolve;
-   5. choose the Product B device type from the oldest active batch for
+      required to be selected by `TARGET_DIRECTION_BATCHES` and to match the
+      metadata batch, dropping if either side fails to resolve;
+   4. choose the Product B device type from the oldest targeted active batch for
       the interval, then drop if either device-type field disagrees with
       that selected type. With active 2023 and 2026 targets, the
       selected type is `Pixel3aUT`; with only 2026 active targets, it is
       `M5Stack`.
 
-   Survivors are paired with their metadata row, which provides the
-   destination entity id, entity type, and `identifcation` text (the
-   misspelled place identifier, just the place number as a string,
-   e.g. `"105"`). Product B additionally aggregates surviving rows by
-   destination place to build the nested `peopleCount_flow` structure,
-   and emits a sentinel `{"from": {"all": null}, "to": {"all": null}}`
-   payload for any active target that received no observations.
+   Product B keeps self-loops and cross-batch pairs that pass those filters. It
+   derives a candidate place from any surviving non-`ALL` endpoint and requires
+   both `ALL → N` and `N → ALL` source totals for every candidate. The emitted
+   roster is the candidates with both totals. Each emitted place gets a dynamic
+   `peopleCount_flow_<N>` attribute whose `from` and `to` dictionaries are
+   dense over that roster, including the place's own key. A missing pairwise
+   row between emitted places becomes `0`; a self-loop populates both sides.
+   Missing totals reject the whole window, while zero candidates produce no
+   payload.
 
-4. **POST to Orion.** One POST per `(entity, window)` to
-   `/orion/v2.0/entities/<entity_id>/attrs?type=<entity_type>` with
-   OAuth2 client-credentials auth. Retries use exponential backoff on
+4. **Write Orion attributes.** Product A sends one update-only `POST /attrs`
+   per `(entity, window)`. Product B sends one replace-all `PUT /attrs` to the
+   configured aggregate entity per sendable 60-minute window. Retries use
+   exponential backoff on
    `5xx`, `429`, and network errors: the client sleeps 1s, then 2s, 4s,
    8s, 16s between successive attempts and then gives up. (`429`
    honors the server's `Retry-After` header if present, otherwise uses
    the standard backoff.) A single `401` triggers a forced token
-   refresh and one extra retry. Other `4xx` responses are fatal for
-   that POST (no retry, because it's a payload/config bug, not a transient
-   failure).
+   refresh and one extra retry within the retry budget (a `401` on the
+   final attempt is not retried further). Other `4xx` responses are fatal for that write
+   (no retry, because it is a payload/config bug, not a transient failure).
+   Product B dry-run shows the `PUT /attrs` target and full aggregate
+   payload without mutating Orion.
 
-5. **Record outcome.** Each POST result is written back to the
+5. **Record outcome.** Each write result is written back to the
    per-product state file with the entity id, HTTP status, and a SHA-256
-   of the payload bytes (used to detect "would this re-POST send the
+   of the payload bytes (used to detect "would this re-send the
    same value?" during retries). The window aggregate status (`pending`,
    `partial`, `complete`, `dead_letter`) is then recomputed against the
    window's `expected_target_ids`. The two products define that set
@@ -384,12 +367,12 @@ The five stages in plain words:
      was not seen yet is picked up by send-mode targeted supplemental
      discovery (re-query the retained complete windows by exact
      `startdate`) and expands the expected set on a later run.
-   - **Product B (inter-place flow):** every active target receives a
-     payload (a sentinel `null` when the place was silent), so expected
-     is the fixed roster snapshotted from active metadata on the window's
-     *first* attempt and is not expanded from current metadata on retry.
-     Snapshotting up front prevents a mid-flight metadata change from
-     silently redefining what "complete" means for an in-progress window.
+   - **Product B (inter-place flow):** a sendable window expects only the
+     configured aggregate entity. A 204 response marks that target `ok`. A
+     zero-candidate or source-invalid attempt creates no state record; the
+     former logs `direction_window_no_payload` at DEBUG, while the latter logs
+     `direction_window_source_invalid` at WARNING and makes the run exit
+     nonzero.
 
    In both cases the window goes to `complete` once every id in its
    expected set has a recorded `ok`; otherwise it stays `partial`.
@@ -419,9 +402,9 @@ After filter & map:
 - Metadata lookup `(place_number=105, interval_min=60)` returns
   `entity_id = jp.sendai.Blesensor.per3600.105`,
   `entity_type = Blesensor.per3600`, `batch = 2026`,
-  `expected_device_type = M5Stack`,
-  `identifcation = "105"` (the place number as a string, which Product B
-  posts and Product A does not).
+  `expected_device_type = M5Stack`. The metadata also contains a per-place
+  `identifcation` value, which Product A does not write; Product B aggregate
+  packages use the configured aggregate entity id instead.
 - Device type matches (`M5Stack == M5Stack`).
 
 POST body sent to Orion (the `TimeInstant` metadata on each attribute
@@ -480,21 +463,17 @@ without re-sending the targets that are already `ok`.
 
 ### Product B differences
 
-Product B reads `direction_metrics2_per_place2_agg` and aggregates many
-rows into per-place `peopleCount_flow` structures before posting. Key
-differences from Product A:
+Product B reads `direction_metrics2_per_place2_agg` and builds one aggregate
+package per sendable 60-minute source window. Key differences from Product A:
 
 - **Each row has two place keys** (`from_group_place_id`,
   `to_group_place_id`). A movement is from one place to another. Both
   sides must pass metadata resolution. Cross-batch pairs (a 2023 place
   paired with a 2026 place) are sent when both sides resolve.
-- **The literal string `ALL` is a real aggregation key**, not a noise
-  prefix. Rows with `from_group_place_id = 'ALL'` populate the
-  destination entity's `peopleCount_flow.from.all` (meaning "total
-  unique BLEIDs that came into this place from anywhere"), and vice
-  versa for `to.all`. The pipeline never sums pairwise rows to
-  approximate `all`. The source already provides the deduplicated
-  unique-BLEID total.
+- **The literal string `ALL` is a real aggregation key**, not a noise prefix.
+  `ALL → N` supplies `peopleCount_flow_<N>.value.from.all`, and `N → ALL`
+  supplies `peopleCount_flow_<N>.value.to.all`. The pipeline never sums
+  pairwise rows to approximate these deduplicated totals.
 - **The source table stores parallel rows** under both
   `(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every per-place
   target. Product B selects one device type per interval from the oldest
@@ -502,21 +481,29 @@ differences from Product A:
   the nested inter-place values and the deduplicated totals use the same
   source population. The device-type filter is therefore a required
   disambiguator; omitting it would double-count every movement.
-- **Targets with no observations still receive a payload** with sentinel
-  `peopleCount_flow = {"from": {"all": null}, "to": {"all": null}}`.
-  This keeps Comet history continuous even when a place was silent for
-  the window.
-- **Completion is fixed-target, not observed-union.** Because every
-  active target always gets a payload, Product B's `expected_target_ids`
-  is the full roster snapshotted from active metadata on the window's
-  first attempt and is never expanded from current metadata on retry (a
-  metadata change mid-flight logs `window_expected_targets_changed` and
-  keeps the original snapshot). This is the opposite of Product A, whose
-  expected set grows from the targets actually observed. Product B has no
-  supplemental discovery pass.
-- **`null` vs `0`** matters and is preserved end-to-end: `null` means
-  no observation, `0` means an observed zero. The two are semantically
-  different and the pipeline never collapses one into the other.
+- **Candidate places define integrity checks.** A non-`ALL` endpoint of any
+  surviving row is a candidate. Every candidate needs both source totals; one
+  missing total rejects the whole window. Zero candidates produce no write.
+- **The emitted roster defines a dense matrix.** Each emitted place has both
+  totals. Its `from` and `to` dictionaries include every emitted place number,
+  including its own. Missing pairwise routes become `0`. A surviving `N→N`
+  self-loop populates both `from.<N>` and `to.<N>`.
+- **The attributes are dynamic.** The aggregate body contains
+  `peopleCount_flow_<N>` for emitted places only. It has no fixed `1..28`
+  range and no sentinel attributes for absent places.
+- **Completion has one target.** A sendable Product B window records only the
+  configured aggregate entity in `expected_target_ids`. A source-invalid or
+  zero-candidate attempt records no state.
+- **Current state is last-written.** A revision write for an older window can
+  replace Orion current state. `dateObservedFrom` and `dateObservedTo`, not
+  arrival order, identify the current package's source window. STH-Comet keeps
+  the original `TimeInstant` and appends a corrective row with a newer
+  `dateRetrieved`.
+- **The history subscription follows dynamic attributes.** It selects the exact
+  aggregate id/type, triggers on `dateRetrieved`, requests `TimeInstant`, and
+  omits `notification.attrs` so the full replaced entity is notified. This is
+  safe because Product B exclusively owns the entity. Subscription throttling
+  is unsupported for both products because it can silently discard bursts.
 
 ## Repo map
 
@@ -529,8 +516,8 @@ sendai-fiware-pipeline-dev/
 │   ├── entity_map.py        # query Orion to validate metadata targets exist
 │   ├── filter_settings.py   # rollout/source-filter env parsing
 │   ├── transform_flow.py    # Product A: rows → per-entity attr payloads
-│   ├── transform_direction.py  # Product B: rows → per-entity flow payloads
-│   ├── orion_client.py      # NGSI v2 client with retry/backoff
+│   ├── transform_direction.py  # Product B source transform
+│   ├── orion_client.py      # NGSI v2 HTTP client with retry/backoff
 │   ├── comet_client.py      # STH-Comet read and delete helper
 │   ├── state.py             # per-window status store (JSON file)
 │   ├── state_tools.py       # state inspection/repair primitives
@@ -538,7 +525,7 @@ sendai-fiware-pipeline-dev/
 │   ├── create_entities.py   # Orion entity bootstrap logic (called by the CLI)
 │   ├── refresh.py           # metadata refresh helpers
 │   ├── run_flow.py          # cron entry: Product A, both intervals
-│   ├── run_direction.py     # cron entry: Product B, both intervals
+│   ├── run_direction.py     # cron entry: Product B direction
 │   └── logging_setup.py     # rotating JSON-line logger
 │
 ├── scripts/                 # thin operator-facing CLI shims over sendai_pipeline/

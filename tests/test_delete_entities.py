@@ -21,11 +21,6 @@ FLOW_ATTRS = [
     "peopleOccupancy_immedate",
     "peopleOccupancy_near",
 ]
-DIRECTION_ATTRS = [
-    "dateObservedFrom",
-    "dateObservedTo",
-    "peopleCount_flow",
-]
 
 
 class FakeAuth:
@@ -174,13 +169,14 @@ def test_delete_entities_rejects_flow_attrs_without_purge_history(
     assert runtime.comet.calls == []
 
 
-def test_delete_entities_rejects_direction_attrs_without_purge_history(
+def test_delete_entities_rejects_removed_direction_attrs_flag(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
     result = _invoke(_base_args(ENTITY_10) + ["--direction-attrs"], capsys, runtime)
 
-    assert result != 0
+    assert result == 2
+    assert "unrecognized arguments: --direction-attrs" in capsys.readouterr().err
     assert runtime.orion.calls == []
     assert runtime.comet.calls == []
 
@@ -192,38 +188,6 @@ def test_delete_entities_rejects_attrs_and_flow_attrs_together(
     result = _invoke(
         _base_args(ENTITY_10, purge_history=True)
         + ["--attrs", "dateObservedFrom", "--flow-attrs"],
-        capsys,
-        runtime,
-    )
-
-    assert result != 0
-    assert runtime.orion.calls == []
-    assert runtime.comet.calls == []
-
-
-def test_delete_entities_rejects_attrs_and_direction_attrs_together(
-    capsys: pytest.CaptureFixture[str],
-    runtime: RuntimePatch,
-) -> None:
-    result = _invoke(
-        _base_args(ENTITY_10, purge_history=True)
-        + ["--attrs", "dateObservedFrom", "--direction-attrs"],
-        capsys,
-        runtime,
-    )
-
-    assert result != 0
-    assert runtime.orion.calls == []
-    assert runtime.comet.calls == []
-
-
-def test_delete_entities_rejects_flow_attrs_and_direction_attrs_together(
-    capsys: pytest.CaptureFixture[str],
-    runtime: RuntimePatch,
-) -> None:
-    result = _invoke(
-        _base_args(ENTITY_10, purge_history=True)
-        + ["--flow-attrs", "--direction-attrs"],
         capsys,
         runtime,
     )
@@ -623,20 +587,6 @@ def test_delete_entities_purge_history_per_attribute_with_flow_attrs_flag(
 
     assert result == 0
     assert [call["attr"] for call in runtime.comet.calls] == FLOW_ATTRS
-
-
-def test_delete_entities_purge_history_per_attribute_with_direction_attrs_flag(
-    capsys: pytest.CaptureFixture[str],
-    runtime: RuntimePatch,
-) -> None:
-    result = _invoke(
-        _base_args(ENTITY_10, send=True, purge_history=True) + ["--direction-attrs"],
-        capsys,
-        runtime,
-    )
-
-    assert result == 0
-    assert [call["attr"] for call in runtime.comet.calls] == DIRECTION_ATTRS
 
 
 def test_delete_entities_purge_history_runs_after_orion_204(
