@@ -149,7 +149,7 @@ Product A selects the expected type from each place's metadata:
 | 101-112, 201-210 | 2026年3月設置 | `M5Stack` |
 
 Product B instead selects one city-wide device type from the oldest targeted
-active batch for interval 60 and applies it to both endpoints of every included
+active batch for interval 60 and applies it to both places in every included
 row (§4.2). Device-type filtering is a required disambiguator for both products;
 omitting it would double-count.
 
@@ -198,10 +198,17 @@ aligns Comet `recvTime` with the logical aggregate window start.
 
 For all numeric attributes: `null` means "no observation," `0` means
 "observed zero." The two are semantically different and the pipeline preserves
-both. Product A sends nullable source values as JSON `null`. Product B writes
-`0` only for a missing pairwise route between two emitted places whose source
-totals prove they were measuring; Product B represents no observation through
-roster absence, not a null matrix.
+both. Product A sends nullable source values as JSON `null`.
+
+For Product B, the representation depends on which places have both required
+hourly totals (§4.3). Between two places whose totals are complete, a missing
+pairwise source row is written as `0` because both places' totals show that they
+were measuring. If a place is missing one of its totals, Product B keeps a
+pairwise movement between it and a place whose totals are complete only when
+the source contains that exact row. A recorded count of `0` is kept as `0`; if
+the row is absent, the place-number key is absent. Product B never uses a null
+matrix or invents a `0` for an unrecorded movement involving a place whose
+totals are incomplete.
 
 ### 2.8 Time zone
 
@@ -426,7 +433,7 @@ Apply these rules before constructing the aggregate package:
    interval 60. Keep a row only when both device-type fields match it.
 
 Self-loop rows are retained. A surviving `N→N` row is a real movement route,
-not a duplicate to discard. Cross-batch pairs are also valid when both endpoints
+not a duplicate to discard. Cross-batch pairs are also valid when both places
 resolve and the row passes the selected device-type filter.
 
 Cross-batch direction pairs are valid Product B observations. The same
@@ -451,28 +458,44 @@ One replace-all write is built for each sendable source window. The body is:
 | `dateObservedTo` | `DateTime` | `dateObservedFrom + 60 minutes` |
 | `dateRetrieved` | `DateTime` | now in JST (truncated to whole seconds) |
 | `identifcation` | `Text` | exactly `PRODUCT_B_AGGREGATE_ENTITY_ID` |
-| `peopleCount_flow_<N>` | `StructuredValue` | dense movement matrix for emitted place `N` |
+| `sourceQuality` | `StructuredValue` | source-integrity status and excluded-place lists for this package |
+| `peopleCount_flow_<N>` | `StructuredValue` | totals and pairwise movements for emitted place `N`, as defined below |
 
 Each attribute has the metadata object defined in §2.6. There is exactly one
 `identifcation` attribute, its value always equals the configured aggregate
 entity id, and it is included in every package.
 
-#### Candidate and emitted places
+#### Which places receive a flow attribute
 
-After all §4.2 filters, a **candidate place** is a non-`ALL` endpoint of any
-surviving pairwise or total row. A candidate becomes an **emitted place** only
-when both required source totals exist:
+A place needs two source totals for its own `peopleCount_flow_<N>` attribute:
 
-- `ALL → N` supplies `peopleCount_flow_<N>.value.from.all`.
-- `N → ALL` supplies `peopleCount_flow_<N>.value.to.all`.
+- `ALL → N` is the number of people who arrived at place `N` from everywhere;
+  it supplies `peopleCount_flow_<N>.value.from.all`.
+- `N → ALL` is the number of people who left place `N` for everywhere; it
+  supplies `peopleCount_flow_<N>.value.to.all`.
 
-The pipeline does not derive either total by summing pairwise rows. If any
-candidate is missing either required total, the whole window is source-invalid
-and no partial package is written. A place with no surviving source row is not
-a candidate and is absent from the package; Product B does not create sentinel
-or null matrix attributes to fill a fixed roster.
+The pipeline uses the source totals verbatim. It does not reconstruct a missing
+total by summing pairwise movements.
 
-#### Dense movement matrix
+After the §4.2 filters, the spec calls every non-`ALL` place in a surviving row
+a **candidate place**. A candidate with both totals is an **emitted place**:
+Product B publishes its `peopleCount_flow_<N>` attribute. A candidate missing
+one or both totals is an **excluded place**: Product B drops that place's own
+attribute and records the reason in `sourceQuality`. The emitted-place roster is
+the sorted list of candidates with both totals.
+
+For example, suppose place 3 has both totals, while place 5 has `ALL → 5` but is
+missing `5 → ALL`. Product B publishes `peopleCount_flow_3`, does not publish
+`peopleCount_flow_5`, and reports place 5 in `excludedPlaceNumbers` and
+`missingToAllPlaceNumbers`. This is a **degraded package**: at least one place
+can be published, but at least one other candidate was excluded. A package with
+no excluded candidates is **clean**. If every candidate is excluded, the whole
+window is source-invalid and Product B writes nothing.
+
+A place with no surviving source row is not a candidate and is simply absent.
+Product B does not create sentinel or null attributes to fill a fixed roster.
+
+#### What the `from` and `to` dictionaries contain
 
 For every emitted place `N`, `peopleCount_flow_<N>.value` has this shape. For
 example, with an emitted roster of places 3, 5, and 10,
@@ -485,16 +508,94 @@ example, with an emitted roster of places 3, 5, and 10,
 }
 ```
 
-The keys under each `from` and `to` are dense over the same emitted-place
-roster: every emitted place number appears once under both sides, plus `"all"`.
-A route with no surviving pairwise row between two emitted places is written as `0`,
-meaning observed zero movement between places proven to be measuring by their
-source totals.
+Each `from` and `to` dictionary contains every emitted place number exactly
+once, plus `"all"`. If a pairwise row between two emitted places is missing,
+the corresponding value is `0`. Both places have complete totals, so this zero
+means that they were measuring and no movement was observed between them.
 
 For a surviving `M→N` row, the count populates `from.<M>` of place `N` and
 `to.<N>` of place `M`. A surviving self-loop `N→N` row populates both
-`from.<N>` and `to.<N>` of place `N`; dense fill includes every emitted
+`from.<N>` and `to.<N>` of place `N`. Each dictionary includes the emitted
 place's own key even when that self-loop count is `0`.
+
+Product B also keeps an actual recorded movement between an emitted place and
+an excluded place. In the place 3 / place 5 example above:
+
+- a surviving `5 → 3` row is stored as
+  `peopleCount_flow_3.value.from["5"]`;
+- a surviving `3 → 5` row is stored as
+  `peopleCount_flow_3.value.to["5"]`.
+
+The source count is copied exactly, including a recorded `0`. If the source has
+no `5 → 3` row, Product B does not create `from["5"]`; if it has no `3 → 5`
+row, Product B does not create `to["5"]`. These extra keys may therefore differ
+between emitted attributes and between one attribute's `from` and `to`
+dictionaries. Seeing a place 5 key inside `peopleCount_flow_3` does not mean
+that `peopleCount_flow_5` exists.
+
+Dropping place 5 still loses information from this package: its own
+`peopleCount_flow_5` attribute is absent, including its surviving `ALL → 5`
+total; a movement between two excluded places is absent; and an excluded
+place's self-loop is absent. If a later source correction supplies the missing
+total, a full-window rebuild publishes the place's attribute and restores these
+movements.
+
+An emitted place's `from.all` and `to.all` are the verbatim deduplicated source
+totals. They can include movement involving excluded places or other places
+outside the emitted roster, whether or not the matching pairwise source row
+survived. The pipeline does not reduce or recompute `all` to match the matrix,
+and consumers must not expect the published pairwise entries to sum to `all`.
+
+#### How consumers identify a clean or degraded package
+
+Every written package contains `sourceQuality`, so a consumer can see whether
+any candidate was excluded without reading pipeline logs or knowing the
+expected place roster. Its shape is exactly:
+
+```json
+"sourceQuality": {
+  "type": "StructuredValue",
+  "value": {
+    "status": "clean",
+    "evaluatedAt": "<dateRetrieved>",
+    "excludedPlaceNumbers": [],
+    "missingFromAllPlaceNumbers": [],
+    "missingToAllPlaceNumbers": []
+  },
+  "metadata": {
+    "TimeInstant": {
+      "type": "DateTime",
+      "value": "<dateObservedFrom>"
+    }
+  }
+}
+```
+
+For a degraded package, `status` is `"degraded"`,
+`missingFromAllPlaceNumbers` is the ascending list of candidates without
+`ALL → N`, `missingToAllPlaceNumbers` is the ascending list without `N → ALL`,
+and `excludedPlaceNumbers` is the ascending union of those lists. In the place
+3 / place 5 example, these lists are `[]`, `[5]`, and `[5]`, respectively.
+`excludedPlaceNumbers` includes every excluded candidate, even when no
+pairwise movement between it and an emitted place was recorded.
+
+`evaluatedAt` exactly equals the package's scalar `dateRetrieved.value`.
+`sourceQuality` is always present, including on clean revision writes. It is an
+additive attribute: a clean package preserves the names, NGSI types, value
+shapes, and semantics of all pre-existing attributes.
+
+The builder and aggregate-history enumeration place `sourceQuality` after
+`identifcation` and before dynamic flow attributes for deterministic output.
+NGSI consumers must not treat attribute ordering as part of the contract.
+
+All attributes use `TimeInstant = dateObservedFrom`, so degraded and corrected
+quality samples for one source window have the same Comet `recvTime`. When raw
+history contains more than one `sourceQuality` sample at that `recvTime`, a
+consumer selects the sample with the greatest parseable `evaluatedAt`; response
+order is not a correction-order signal. Because emitted timestamps have whole-
+second precision, two writes in the same second can also tie on `evaluatedAt`.
+Raw history cannot resolve that tie; Orion current state is the authoritative
+last-written package.
 
 The attribute roster is dynamic. Historical names
 `peopleCount_flow_1` through `peopleCount_flow_28` do not define a fixed range;
@@ -502,21 +603,54 @@ any valid emitted place number becomes an attribute suffix.
 
 #### No-write outcomes and state
 
-| Outcome | Write | State record for the attempt | Event and level | Counter | Run exit |
-|---|---|---|---|---|---|
-| Zero candidate places | none | none | `direction_window_no_payload`, `DEBUG` | `windows_no_payload` | unchanged by this outcome |
-| Any candidate missing `from.all` or `to.all` | none; reject the whole window | none | `direction_window_source_invalid`, `WARNING`, with the window key and both missing-place lists | `windows_source_invalid` | nonzero in send mode |
+| Candidates | Complete candidates | Write decision | Resulting state | Signal | Send-mode exit effect |
+|---|---:|---|---|---|---:|
+| none | none | no payload; no PUT | no record | `direction_window_no_payload` at `DEBUG`; `windows_no_payload += 1` | unchanged |
+| all complete | one or more | ordinary clean-payload PUT/skip rules | `complete` after success or unchanged prior `ok`; ordinary failure state otherwise | ordinary PUT/window counters | existing policy |
+| some complete and some excluded; PUT required | one or more | attempt one degraded PUT | `complete` after success; ordinary `partial`/`dead_letter` failure state otherwise | `direction_window_degraded` at `WARNING`; `windows_degraded += 1`; normal PUT counters also apply | 1 |
+| some complete and some excluded; prior-`ok` payload hash unchanged and not forced | one or more | skip PUT | `complete` | `direction_window_degraded_unchanged` at `DEBUG`; no degraded counter | unchanged |
+| all excluded | none | source-invalid; no PUT | no record | `direction_window_source_invalid` at `WARNING`; `windows_source_invalid += 1` | 1 |
 
 A sendable window has one expected target id, the configured aggregate entity
 id, and uses the state key `per3600/<startdate>`. Each attempt replaces any
 stored Product B expected-target snapshot with that one id. A 204 response to
 the aggregate `PUT /attrs` marks it `ok` without a follow-up GET.
 
+Both degraded events carry the window key and the sorted
+`excluded_place_numbers`, `missing_from_all_place_numbers`, and
+`missing_to_all_place_numbers`. `windows_degraded` counts degraded payloads
+whose PUT was attempted in send mode or previewed in dry-run. It does not count
+every degraded window transformed during rolling lookback. A successful
+degraded PUT increments `puts_ok` and `windows_complete`; a failed one increments
+`puts_failed` and the applicable `windows_partial` or `windows_dead_letter`
+counter. Either attempted send increments `windows_degraded` and makes send mode
+exit 1. A successful degraded write is delivery-complete and is not retried
+solely because it is degraded.
+
+An unchanged prior-`ok` degraded package is a DEBUG no-op: it does not increment
+`windows_degraded` or affect exit status. A forced resend is an attempted PUT
+and signals degradation again. Newly discovered revision-sweep work uses that
+forced path even when the semantic hash is unchanged; old sweep retry items use
+the ordinary retry and prior-status path. Dry-run remains non-mutating and exits
+0; it can preview `windows_degraded > 0` while `windows_complete == 0`.
+
+The semantic hash excludes top-level `dateRetrieved` and nested
+`sourceQuality.value.evaluatedAt`, but includes the quality status and lists and
+all other emitted attributes. Hash canonicalization does not mutate the outgoing
+payload. Replace-all writes remove an excluded place from Orion current state.
+If a later full-window rebuild finds repaired totals and `aggregated_at`
+advances, the clean package restores the place and its routes. Its changed
+quality status/lists remain inside the hash and trigger the ordinary prior-`ok`
+drift PUT. If a repair does not advance `aggregated_at`, an explicit forced
+direction resend is required.
+
 ### 4.4 Full body example
 
-This package represents 2024-07-20 10:00-11:00 JST with emitted places 3 and
-5. Every attribute carries the same `TimeInstant` metadata value; it is shown
-in full on the first attribute and elided as `{…}` on the rest for readability:
+This clean package represents 2024-07-20 10:00-11:00 JST. Places 3 and 5 both
+have the two required totals, so both receive a flow attribute and
+`sourceQuality` reports no excluded places. Every attribute carries the same
+`TimeInstant` metadata value; it is shown in full on the first attribute and
+elided as `{…}` on the rest for readability:
 
 ```json
 {
@@ -528,6 +662,17 @@ in full on the first attribute and elided as `{…}` on the rest for readability
   "dateObservedTo":   {"type": "DateTime", "value": "2024-07-20T11:00:00+09:00", "metadata": {…}},
   "dateRetrieved":    {"type": "DateTime", "value": "2024-07-22T13:25:43+09:00", "metadata": {…}},
   "identifcation":    {"type": "Text", "value": "jp.sendai.Blesensor.flow", "metadata": {…}},
+  "sourceQuality": {
+    "type": "StructuredValue",
+    "value": {
+      "status": "clean",
+      "evaluatedAt": "2024-07-22T13:25:43+09:00",
+      "excludedPlaceNumbers": [],
+      "missingFromAllPlaceNumbers": [],
+      "missingToAllPlaceNumbers": []
+    },
+    "metadata": {…}
+  },
   "peopleCount_flow_3": {
     "type": "StructuredValue",
     "value": {

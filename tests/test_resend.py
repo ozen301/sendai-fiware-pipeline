@@ -1763,6 +1763,7 @@ def test_resend_direction_uses_full_window_aggregate_replace_path(
         "dateObservedTo",
         "dateRetrieved",
         "identifcation",
+        "sourceQuality",
         "peopleCount_flow_10",
     }
     window = _read_windows(tmp_path / "state" / "direction.json")[
@@ -1771,6 +1772,159 @@ def test_resend_direction_uses_full_window_aggregate_replace_path(
     assert window["status"] == "complete"
     assert window["expected_target_ids"] == [AGGREGATE_ENTITY_ID]
     assert sorted(window["targets"]) == [AGGREGATE_ENTITY_ID]
+
+
+def test_resend_direction_degraded_put_completes_and_exits_one(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    logger = _patch_resend_logger(monkeypatch, resend)
+    _freeze_resend_now(
+        monkeypatch,
+        resend,
+        datetime(2026, 5, 24, 14, 0, tzinfo=run_direction.JST),
+    )
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = _degraded_direction_rows("20260524_1000")
+
+    result = _call_main(resend, _base_args(product="direction", send=True))
+
+    assert result == 1
+    assert len(orion.replace_calls) == 1
+    window = _read_windows(tmp_path / "state" / "direction.json")[
+        "per3600/20260524_1000"
+    ]
+    assert window["status"] == "complete"
+    summary = _summary_record(logger)
+    assert summary["puts_ok"] == 1
+    assert summary["puts_failed"] == 0
+    assert summary["windows_complete"] == 1
+    assert summary["windows_degraded"] == 1
+
+
+def test_resend_direction_unchanged_degraded_repeat_skips_and_exits_zero(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    logger = _patch_resend_logger(monkeypatch, resend)
+    _freeze_resend_now(
+        monkeypatch,
+        resend,
+        datetime(2026, 5, 24, 14, 0, tzinfo=run_direction.JST),
+    )
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = _degraded_direction_rows("20260524_1000")
+    first = _call_main(resend, _base_args(product="direction", send=True))
+    assert first == 1
+    logger.records.clear()
+
+    second = _call_main(resend, _base_args(product="direction", send=True))
+
+    assert second == 0
+    assert len(orion.replace_calls) == 1
+    summary = _summary_record(logger)
+    assert summary["puts_ok"] == 0
+    assert summary["puts_failed"] == 0
+    assert summary["windows_degraded"] == 0
+
+
+def test_resend_direction_failed_degraded_put_reports_both_failures(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    logger = _patch_resend_logger(monkeypatch, resend)
+    _freeze_resend_now(monkeypatch, resend)
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(
+        monkeypatch,
+        resend,
+        orion_results=[{"status": 503, "ok": False}],
+    )
+    db_connection.rows = _degraded_direction_rows("20260524_1000")
+
+    result = _call_main(
+        resend,
+        _base_args(product="direction", send=True) + ["--force"],
+    )
+
+    assert result == 1
+    assert len(orion.replace_calls) == 1
+    summary = _summary_record(logger)
+    assert summary["windows_degraded"] == 1
+    assert summary["puts_failed"] == 1
+    assert summary["windows_partial"] == 1
+    window = _read_windows(tmp_path / "state" / "direction.json")[
+        "per3600/20260524_1000"
+    ]
+    assert window["status"] == "partial"
+
+
+def test_resend_direction_all_excluded_is_source_invalid_no_write(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    logger = _patch_resend_logger(monkeypatch, resend)
+    _freeze_resend_now(monkeypatch, resend)
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = [_direction_row("20260524_1000")]
+
+    result = _call_main(resend, _base_args(product="direction", send=True))
+
+    assert result == 1
+    assert orion.replace_calls == []
+    summary = _summary_record(logger)
+    assert summary["windows_source_invalid"] == 1
+    assert summary["windows_degraded"] == 0
+    state_path = tmp_path / "state" / "direction.json"
+    if state_path.exists():
+        assert _read_windows(state_path) == {}
+
+
+def test_resend_direction_forced_clean_correction_replaces_degraded_history(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    logger = _patch_resend_logger(monkeypatch, resend)
+    _freeze_resend_now(monkeypatch, resend)
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    db_connection, orion = _patch_real_send_dependencies(monkeypatch, resend)
+    db_connection.rows = _degraded_direction_rows("20260524_1000")
+    first = _call_main(
+        resend,
+        _base_args(product="direction", send=True) + ["--force"],
+    )
+    assert first == 1
+    logger.records.clear()
+    db_connection.rows = [
+        *_degraded_direction_rows("20260524_1000"),
+        *_sendable_direction_rows_for_place("20260524_1000", 11, 12, 13),
+    ]
+
+    second = _call_main(
+        resend,
+        _base_args(product="direction", send=True) + ["--force"],
+    )
+
+    assert second == 0
+    assert len(orion.replace_calls) == 2
+    corrected = orion.replace_calls[1]["attrs"]
+    assert corrected["sourceQuality"]["value"]["status"] == "clean"
+    assert corrected["sourceQuality"]["value"]["excludedPlaceNumbers"] == []
+    assert "peopleCount_flow_11" in corrected
+    assert _summary_record(logger)["windows_degraded"] == 0
 
 
 def test_resend_flow_ignores_invalid_direction_target_batches(
@@ -1900,6 +2054,7 @@ def test_resend_direction_summary_reports_aggregate_put_and_window_counts(
     assert summary["puts_failed"] == 1
     assert summary["windows_complete"] == 1
     assert summary["windows_partial"] == 1
+    assert summary["windows_degraded"] == 0
 
 
 def test_resend_direction_failed_put_returns_exit_one_and_put_counters(
@@ -1948,6 +2103,7 @@ def test_resend_dry_run_summary_reports_zero_partial_complete(
     assert summary["posts_failed"] == 0
     assert summary["windows_partial"] == 0
     assert summary["windows_complete"] == 0
+    assert "windows_degraded" not in summary
 
 
 def test_resend_aborts_before_posting_when_range_contains_dead_letter(
@@ -2591,6 +2747,42 @@ def _sendable_direction_rows(startdate: str) -> list[dict[str, Any]]:
             "from_group_place_id": "sendai202603.10",
             "to_group_place_id": "ALL",
             "count": 6,
+        },
+    ]
+
+
+def _sendable_direction_rows_for_place(
+    startdate: str, place_number: int, from_all: int, to_all: int
+) -> list[dict[str, Any]]:
+    source_id = f"sendai202603.{place_number}"
+    return [
+        {
+            **_direction_row(startdate),
+            "from_group_place_id": "ALL",
+            "to_group_place_id": source_id,
+            "count": from_all,
+        },
+        {
+            **_direction_row(startdate),
+            "from_group_place_id": source_id,
+            "to_group_place_id": "ALL",
+            "count": to_all,
+        },
+    ]
+
+
+def _degraded_direction_rows(startdate: str) -> list[dict[str, Any]]:
+    return [
+        *_sendable_direction_rows(startdate),
+        {
+            **_direction_row(startdate),
+            "from_group_place_id": "ALL",
+            "to_group_place_id": "sendai202603.11",
+            "count": 12,
+        },
+        {
+            **_direction_row(startdate),
+            "count": 3,
         },
     ]
 

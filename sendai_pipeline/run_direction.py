@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -226,8 +227,11 @@ class RunDirectionResult:
         windows_dead_letter: Processed windows that ended dead-lettered.
         puts_ok: Full-replace attempts that succeeded.
         puts_failed: Full-replace attempts that failed.
+        windows_degraded: Degraded payloads attempted in send mode or
+            previewed in dry-run. Unchanged degraded payloads are not counted.
         windows_no_payload: Windows with no surviving candidate places.
-        windows_source_invalid: Windows missing required source totals.
+        windows_source_invalid: Windows whose every candidate is missing a
+            required source total.
         rows_dropped: Source rows omitted during transformation.
         oldest_non_complete: Oldest retained pending or partial window.
         lookback_hours_used: Effective lookback hours by interval.
@@ -245,6 +249,7 @@ class RunDirectionResult:
     windows_dead_letter: int
     puts_ok: int
     puts_failed: int
+    windows_degraded: int
     windows_no_payload: int
     windows_source_invalid: int
     rows_dropped: int
@@ -283,8 +288,9 @@ def run_direction(
 
     Returns:
         Run summary including ``exit_code``: ``1`` in send mode when any
-        source-invalid, partial, failed-PUT, or open window remains after the
-        run; ``0`` otherwise (including dry-run).
+        degraded payload is attempted, or any source-invalid, partial,
+        failed-PUT, or open window remains after the run; ``0`` otherwise
+        (including dry-run).
     """
     run_started_at = _coerce_jst_datetime(now())
     target_batches = sorted(filter_settings.target_direction_batches)
@@ -314,6 +320,7 @@ def run_direction(
             windows_dead_letter=0,
             puts_ok=0,
             puts_failed=0,
+            windows_degraded=0,
             windows_no_payload=0,
             windows_source_invalid=0,
             rows_dropped=0,
@@ -380,6 +387,7 @@ def run_direction(
         if settings.send_mode == "send"
         and (
             counts.windows_source_invalid > 0
+            or counts.windows_degraded > 0
             or counts.windows_partial > 0
             or counts.puts_failed > 0
             or has_open_windows
@@ -393,6 +401,7 @@ def run_direction(
         windows_dead_letter=counts.windows_dead_letter,
         puts_ok=counts.puts_ok,
         puts_failed=counts.puts_failed,
+        windows_degraded=counts.windows_degraded,
         windows_no_payload=counts.windows_no_payload,
         windows_source_invalid=counts.windows_source_invalid,
         rows_dropped=counts.rows_dropped,
@@ -463,6 +472,7 @@ class _RunCounts:
     windows_dead_letter: int = 0
     puts_ok: int = 0
     puts_failed: int = 0
+    windows_degraded: int = 0
     windows_no_payload: int = 0
     windows_source_invalid: int = 0
     rows_dropped: int = 0
@@ -619,11 +629,12 @@ def _process_send_window(
     transformed_at: datetime | None = None,
     force_resend: bool = False,
 ) -> bool:
-    """PUT one aggregate source window and update persistent target state.
+    """PUT one clean or degraded aggregate and update target state.
 
-    The transform runs before state creation. No-payload and source-invalid
-    outcomes are observable run results, but neither represents a delivery
-    attempt, so neither creates a window record.
+    The transform runs before state creation. A degraded payload is written
+    over its complete places and records a warning when a PUT is attempted.
+    An unchanged prior-OK degraded payload is a DEBUG no-op. No-payload and
+    all-excluded source-invalid outcomes create no window record.
 
     Args:
         window_key: State key for this source window.
@@ -678,20 +689,29 @@ def _process_send_window(
     payload_sha256 = _attrs_sha256(attrs)
     entity_id = str(payload["entity_id"])
     prior = state_store.target_record(window_key, entity_id)
+    degraded = bool(transformed.excluded_place_numbers)
     # Prior-ok unchanged payloads are true no-ops. A prior-ok hash drift means
     # the source was revised after delivery, so replace the aggregate again.
     if not force_resend and prior is not None and prior.get("status") == "ok":
         prior_payload_sha256 = prior.get("last_payload_sha256")
         if prior_payload_sha256 == payload_sha256:
-            logger.debug(
-                "aggregate payload unchanged",
-                extra={
-                    "event": "put_skipped_unchanged",
-                    "entity_id": entity_id,
-                    "window": window_key,
-                    "payload_sha256": payload_sha256,
-                },
-            )
+            if degraded:
+                _log_degraded_window(
+                    window_key,
+                    transformed,
+                    event="direction_window_degraded_unchanged",
+                    attempted=False,
+                )
+            else:
+                logger.debug(
+                    "aggregate payload unchanged",
+                    extra={
+                        "event": "put_skipped_unchanged",
+                        "entity_id": entity_id,
+                        "window": window_key,
+                        "payload_sha256": payload_sha256,
+                    },
+                )
         else:
             logger.debug(
                 "aggregate payload drift resent",
@@ -704,12 +724,21 @@ def _process_send_window(
                 },
             )
 
-    if (
+    should_send = (
         force_resend
         or prior is None
         or prior.get("status") != "ok"
         or (prior.get("last_payload_sha256") != payload_sha256)
-    ):
+    )
+    if should_send:
+        if degraded:
+            counts.windows_degraded += 1
+            _log_degraded_window(
+                window_key,
+                transformed,
+                event="direction_window_degraded",
+                attempted=True,
+            )
         result = orion.replace_attrs(
             entity_id,
             payload["entity_type"],
@@ -729,6 +758,8 @@ def _process_send_window(
         )
         state_store.save()
 
+    # The unchanged branch still recomputes the existing complete status after
+    # refreshing the expected-target snapshot above.
     status = state_store.recompute_status(window_key, aggregate_target_ids)
     if status == "complete":
         counts.windows_complete += 1
@@ -1133,7 +1164,11 @@ def _process_dry_run_window(
     window_key: str,
     transformed_at: datetime,
 ) -> None:
-    """Build and preview one source window without mutating delivery state."""
+    """Preview one clean or degraded payload without mutating delivery state.
+
+    A degraded preview increments ``windows_degraded`` and emits its warning,
+    but dry-run remains successful and does not compute a delivery status.
+    """
     transformed = _transform(
         rows_for_window,
         filter_settings,
@@ -1147,6 +1182,14 @@ def _process_dry_run_window(
     if not isinstance(transformed, DirectionPayloadOutcome):
         raise TypeError(f"unsupported direction transform outcome: {type(transformed)}")
 
+    if transformed.excluded_place_numbers:
+        counts.windows_degraded += 1
+        _log_degraded_window(
+            window_key,
+            transformed,
+            event="direction_window_degraded",
+            attempted=True,
+        )
     payload = transformed.payload
     result = orion.replace_attrs(
         str(payload["entity_id"]),
@@ -1158,6 +1201,29 @@ def _process_dry_run_window(
         counts.puts_ok += 1
     else:
         counts.puts_failed += 1
+
+
+def _log_degraded_window(
+    window_key: str,
+    transformed: DirectionPayloadOutcome,
+    *,
+    event: str,
+    attempted: bool,
+) -> None:
+    """Log one degraded payload decision with its sorted quality lists."""
+    extra = {
+        "event": event,
+        "window": window_key,
+        "excluded_place_numbers": list(transformed.excluded_place_numbers),
+        "missing_from_all_place_numbers": list(
+            transformed.missing_from_all_place_numbers
+        ),
+        "missing_to_all_place_numbers": list(transformed.missing_to_all_place_numbers),
+    }
+    if attempted:
+        logger.warning("direction window payload is degraded", extra=extra)
+    else:
+        logger.debug("unchanged degraded direction payload skipped", extra=extra)
 
 
 def _record_no_write_outcome(
@@ -1296,6 +1362,7 @@ def _log_run_summary(result: RunDirectionResult) -> None:
             "windows_dead_letter": result.windows_dead_letter,
             "puts_ok": result.puts_ok,
             "puts_failed": result.puts_failed,
+            "windows_degraded": result.windows_degraded,
             "windows_no_payload": result.windows_no_payload,
             "windows_source_invalid": result.windows_source_invalid,
             "rows_dropped": result.rows_dropped,
@@ -1367,10 +1434,18 @@ def _metadata_index_for_interval(
 def _attrs_sha256(attrs: Mapping[str, Any]) -> str:
     """Return the canonical payload hash used for unchanged-target skips.
 
-    ``dateRetrieved`` is excluded because it changes every run; including it
-    would mark every prior-OK target as drifted and defeat the skip path.
+    ``dateRetrieved`` and ``sourceQuality.value.evaluatedAt`` are excluded
+    because they change every run. Quality status and exclusion lists remain
+    semantic and therefore stay in the hash.
     """
-    hashable = {key: value for key, value in attrs.items() if key != "dateRetrieved"}
+    hashable = deepcopy(
+        {key: value for key, value in attrs.items() if key != "dateRetrieved"}
+    )
+    source_quality = hashable.get("sourceQuality")
+    if isinstance(source_quality, dict):
+        value = source_quality.get("value")
+        if isinstance(value, dict):
+            value.pop("evaluatedAt", None)
     body = json.dumps(hashable, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(body).hexdigest()
 

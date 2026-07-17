@@ -572,11 +572,15 @@ even though the run exits 0 (see ["I need to resend a large range without
 dropping live data"](#i-need-to-resend-a-large-range-without-dropping-live-data)).
 
 Product B uses the same shared direction path, but each non-empty
-60-minute source window produces either one aggregate PUT, a no-payload
-skip, or a source-invalid result. Empty and no-payload windows create no
-window state. Source-invalid windows also create no state and make the
-resend exit `1`; the `resend_summary` record reports `puts_ok`,
-`puts_failed`, `windows_no_payload`, and `windows_source_invalid`.
+60-minute source window produces either one clean or degraded aggregate PUT, a
+no-payload skip, or an all-excluded source-invalid result. Empty, no-payload,
+and all-excluded windows create no window state. An attempted degraded PUT or
+an all-excluded window makes a live resend exit `1`; a failed PUT also makes it
+exit `1`. The `resend_summary` record reports `puts_ok`, `puts_failed`,
+`windows_degraded`, `windows_no_payload`, and `windows_source_invalid`.
+An unchanged prior-`ok` degraded package that is not forced is a DEBUG no-op:
+it produces no warning, does not increment `windows_degraded`, and does not
+change the exit code.
 
 For Product A, `--place` / `--entity-id` limits which flow payloads are
 built and POSTed, but it does not shrink a retained window's
@@ -638,6 +642,45 @@ uv run python scripts/resend.py flow \
 
 For each symptom, the recommended first tool comes first; later tools
 are escalations only if the earlier one rules out the simpler cause.
+
+### "Product B reports degraded data, source-invalid data, or a failed PUT"
+
+These signals mean different things:
+
+1. `direction_window_degraded` is a WARNING and `windows_degraded` increases
+   when Product B attempts a PUT for a **degraded package**. At least one
+   **emitted place** had both totals and received its own
+   `peopleCount_flow_<N>` attribute, while at least one **excluded place** was
+   missing a required total and received no attribute of its own. A live run
+   exits `1` even if the PUT succeeded. Check `sourceQuality` for the excluded
+   places and missing totals, then ask the source-data administrator to repair
+   them. Publishing the emitted places limits how much data is suppressed; it
+   does not fix or accept the upstream defect.
+2. `direction_window_source_invalid` is a WARNING and
+   `windows_source_invalid` increases when every candidate is an excluded
+   place. There is no emitted place, so Product B writes nothing and a live run
+   exits `1`.
+3. `puts_failed` increases when Orion did not accept an attempted aggregate
+   PUT. This is a delivery failure. Check nearby Orion authentication, timeout,
+   and response-error records; do not treat it as evidence about source-data
+   quality.
+
+For a degraded package, each emitted place's `from` and `to` dictionaries
+contain all emitted places. If the source has no movement row between two
+emitted places, the value is `0`. An excluded place appears in an emitted
+place's dictionary only when the source recorded that movement; the recorded
+value is kept exactly, including `0`. With emitted place 3 and excluded place
+5, a recorded `5 → 3` count is kept as
+`peopleCount_flow_3.value.from["5"]`. If that row is absent, the `"5"` entry is
+absent too, and `peopleCount_flow_5` is not published.
+
+An old window can produce `direction_window_degraded` during the automatic
+revision sweep. A newly discovered revision is a forced resend, so it attempts
+the PUT and reports degradation again even when the package has not changed.
+An ordinary sweep retry uses the normal prior-status check. Outside the forced
+path, an unchanged prior-`ok` degraded package is skipped with
+`direction_window_degraded_unchanged` at DEBUG level: there is no warning,
+counter increase, or nonzero-exit effect.
 
 ### "A window is stuck `partial` and not clearing"
 
@@ -735,9 +778,9 @@ gotchas:
    `state_repair.py` (see its reference above) or narrow the range, then
    re-run.
 4. **Read the product-specific summary.** Product A reports POST and
-   partial-window counters. Product B reports PUT, no-payload, and
-   source-invalid counters; a failed PUT or source-invalid window exits
-   `1`.
+   partial-window counters. Product B reports PUT, degraded, no-payload, and
+   source-invalid counters. A failed PUT, an attempted degraded PUT, or an
+   all-excluded source-invalid window exits `1`.
 
 Then keep the live cron from starving: pick one of two approaches:
 

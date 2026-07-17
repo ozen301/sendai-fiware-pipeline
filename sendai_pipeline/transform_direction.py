@@ -21,7 +21,7 @@ _SOURCE_BATCH_PREFIXES = {
 
 @dataclass(frozen=True)
 class DirectionPayloadOutcome:
-    """A sendable aggregate direction payload.
+    """A clean or degraded aggregate direction payload.
 
     Attributes:
         payload: The Orion write for the aggregate entity, shaped as
@@ -32,8 +32,11 @@ class DirectionPayloadOutcome:
             ``from``/``to`` matrix), so ``payload`` is typed ``dict[str, Any]``.
             ``attrs`` always carries the four scalars ``dateObservedFrom``,
             ``dateObservedTo``, ``dateRetrieved``, and ``identifcation``, then
-            one ``peopleCount_flow_<N>`` per emitted place; each attribute is a
-            ``{"type", "value", "metadata"}`` dict. For example::
+            ``sourceQuality`` and one ``peopleCount_flow_<N>`` per emitted
+            place; each attribute is a ``{"type", "value", "metadata"}`` dict.
+            A degraded payload omits candidates that lack either required
+            total while retaining their observed routes on emitted places.
+            For example::
 
                 {
                     "entity_id": "jp.sendai.Blesensor.flow",
@@ -54,10 +57,17 @@ class DirectionPayloadOutcome:
                     },
                 }
 
+        excluded_place_numbers: Sorted candidate places omitted because one or
+            both required totals are missing.
+        missing_from_all_place_numbers: Sorted candidates without ``ALL -> N``.
+        missing_to_all_place_numbers: Sorted candidates without ``N -> ALL``.
         rows_dropped: Count of source rows rejected by the transform filters.
     """
 
     payload: dict[str, Any]
+    excluded_place_numbers: tuple[int, ...]
+    missing_from_all_place_numbers: tuple[int, ...]
+    missing_to_all_place_numbers: tuple[int, ...]
     rows_dropped: int
 
 
@@ -74,7 +84,7 @@ class DirectionNoPayloadOutcome:
 
 @dataclass(frozen=True)
 class DirectionSourceInvalidOutcome:
-    """A direction window whose candidate places lack required totals.
+    """A direction window whose every candidate lacks required totals.
 
     Attributes:
         missing_from_all_place_numbers: Candidate place numbers without a
@@ -133,8 +143,10 @@ def transform_direction_window(
     The transform accepts only 60-minute rows. It filters ignored source keys,
     unresolved or inactive metadata places, and rows whose device types do not
     match the oldest active source batch. Every place on a surviving row is a
-    candidate. A sendable candidate must have both source ``ALL`` totals; if
-    any candidate lacks either total, the whole window is source-invalid.
+    candidate. A candidate is emitted only when it has both source ``ALL``
+    totals. When complete and incomplete candidates coexist, the incomplete
+    candidates are excluded and the aggregate is degraded. The whole window
+    is source-invalid only when every candidate is excluded.
 
     Args:
         rows: Direction source rows from a dict-style database cursor.
@@ -147,9 +159,9 @@ def transform_direction_window(
             JST; aware values are converted to JST.
 
     Returns:
-        A payload outcome when the window is sendable, a no-payload outcome
-        when no candidate survives, or a source-invalid outcome listing
-        candidates that lack required totals.
+        A clean or degraded payload outcome when at least one candidate is
+        complete, a no-payload outcome when no candidate survives, or a
+        source-invalid outcome when every candidate lacks a required total.
 
     Raises:
         ValueError: If accepted 60-minute source rows span more than one
@@ -270,7 +282,13 @@ def transform_direction_window(
         for place_number in place_numbers
         if candidates[place_number].to_all is None
     )
-    if missing_from_all or missing_to_all:
+    excluded_place_numbers = tuple(sorted(set(missing_from_all) | set(missing_to_all)))
+    emitted_place_numbers = [
+        place_number
+        for place_number in place_numbers
+        if place_number not in excluded_place_numbers
+    ]
+    if not emitted_place_numbers:
         return DirectionSourceInvalidOutcome(
             missing_from_all_place_numbers=missing_from_all,
             missing_to_all_place_numbers=missing_to_all,
@@ -292,9 +310,15 @@ def transform_direction_window(
                 observed_from=observed_from,
                 retrieved_at=retrieved_at,
                 candidates=candidates,
-                place_numbers=place_numbers,
+                emitted_place_numbers=emitted_place_numbers,
+                excluded_place_numbers=excluded_place_numbers,
+                missing_from_all_place_numbers=missing_from_all,
+                missing_to_all_place_numbers=missing_to_all,
             ),
         },
+        excluded_place_numbers=excluded_place_numbers,
+        missing_from_all_place_numbers=missing_from_all,
+        missing_to_all_place_numbers=missing_to_all,
         rows_dropped=rows_dropped,
     )
 
@@ -429,9 +453,12 @@ def _aggregate_attrs(
     observed_from: datetime,
     retrieved_at: datetime,
     candidates: Mapping[int, _CandidateFlow],
-    place_numbers: list[int],
+    emitted_place_numbers: list[int],
+    excluded_place_numbers: tuple[int, ...],
+    missing_from_all_place_numbers: tuple[int, ...],
+    missing_to_all_place_numbers: tuple[int, ...],
 ) -> dict[str, Any]:
-    """Build the exact aggregate NGSI attribute mapping."""
+    """Build the aggregate attributes for the complete candidate places."""
     timeinstant_value = observed_from.isoformat()
     observed_to = observed_from + timedelta(minutes=_DIRECTION_INTERVAL_MIN)
     attrs: dict[str, Any] = {
@@ -446,24 +473,52 @@ def _aggregate_attrs(
         ),
         # The spelling matches the platform contract.
         "identifcation": _attribute("Text", aggregate_entity_id, timeinstant_value),
+        "sourceQuality": _attribute(
+            "StructuredValue",
+            {
+                "status": "degraded" if excluded_place_numbers else "clean",
+                "evaluatedAt": retrieved_at.isoformat(),
+                "excludedPlaceNumbers": list(excluded_place_numbers),
+                "missingFromAllPlaceNumbers": list(missing_from_all_place_numbers),
+                "missingToAllPlaceNumbers": list(missing_to_all_place_numbers),
+            },
+            timeinstant_value,
+        ),
     }
-    for place_number in place_numbers:
+    excluded_place_set = set(excluded_place_numbers)
+    for place_number in emitted_place_numbers:
         flow = candidates[place_number]
+        incoming = {
+            str(other_number): flow.incoming.get(other_number, 0)
+            for other_number in emitted_place_numbers
+        }
+        outgoing = {
+            str(other_number): flow.outgoing.get(other_number, 0)
+            for other_number in emitted_place_numbers
+        }
+        incoming.update(
+            {
+                str(other_number): count
+                for other_number, count in flow.incoming.items()
+                if other_number in excluded_place_set
+            }
+        )
+        outgoing.update(
+            {
+                str(other_number): count
+                for other_number, count in flow.outgoing.items()
+                if other_number in excluded_place_set
+            }
+        )
         attrs[f"peopleCount_flow_{place_number}"] = _attribute(
             "StructuredValue",
             {
                 "from": {
-                    **{
-                        str(other_number): flow.incoming.get(other_number, 0)
-                        for other_number in place_numbers
-                    },
+                    **incoming,
                     "all": flow.from_all,
                 },
                 "to": {
-                    **{
-                        str(other_number): flow.outgoing.get(other_number, 0)
-                        for other_number in place_numbers
-                    },
+                    **outgoing,
                     "all": flow.to_all,
                 },
             },

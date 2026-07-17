@@ -1155,8 +1155,13 @@ def test_product_b_subscription_api_keeps_trigger_disjoint_from_product_a_histor
 ):
     body = build_product_b_subscription_body(settings())
 
+    assert PRODUCT_B_STABLE_WRITE_ATTRS.count("sourceQuality") == 1
+    assert PRODUCT_B_STABLE_WRITE_ATTRS.index(
+        "sourceQuality"
+    ) > PRODUCT_B_STABLE_WRITE_ATTRS.index("identifcation")
     assert set(PRODUCT_A_TRIGGER_ATTRS).isdisjoint(PRODUCT_B_STABLE_WRITE_ATTRS)
     trigger_attrs = body["subject"]["condition"]["attrs"]
+    assert trigger_attrs == ["dateRetrieved"]
     assert set(trigger_attrs).isdisjoint(PRODUCT_A_HISTORY_ATTRS)
     assert "attrs" not in body["notification"]
 

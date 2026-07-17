@@ -35,6 +35,7 @@ PRODUCT_B_STABLE_WRITE_ATTRS: tuple[str, ...] = (
     "dateObservedTo",
     "dateRetrieved",
     "identifcation",
+    "sourceQuality",
 )
 
 

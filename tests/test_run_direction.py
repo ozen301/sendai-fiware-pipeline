@@ -264,6 +264,28 @@ def sendable_window(
     ]
 
 
+def degraded_window(
+    startdate: str = "20260715_0900",
+    *,
+    boundary_count: int = 3,
+) -> list[dict[str, Any]]:
+    return [
+        *sendable_window(startdate, place_number=10, from_all=20, to_all=21),
+        direction_row(
+            startdate=startdate,
+            from_group_place_id="ALL",
+            to_group_place_id="sendai202603.11",
+            count=12,
+        ),
+        direction_row(
+            startdate=startdate,
+            from_group_place_id="sendai202603.10",
+            to_group_place_id="sendai202603.11",
+            count=boundary_count,
+        ),
+    ]
+
+
 def settings(tmp_path: Path, **overrides: Any) -> RunDirectionSettings:
     values: dict[str, Any] = {
         "send_mode": "send",
@@ -325,9 +347,12 @@ def records(caplog: pytest.LogCaptureFixture, event: str) -> list[logging.LogRec
 
 
 def attrs_hash(attrs: Mapping[str, Any]) -> str:
-    stable_attrs = {
-        key: value for key, value in attrs.items() if key != "dateRetrieved"
-    }
+    stable_attrs = deepcopy(
+        {key: value for key, value in attrs.items() if key != "dateRetrieved"}
+    )
+    quality = stable_attrs.get("sourceQuality")
+    if isinstance(quality, dict) and isinstance(quality.get("value"), dict):
+        quality["value"].pop("evaluatedAt", None)
     encoded = json.dumps(stable_attrs, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
@@ -412,6 +437,7 @@ def test_run_direction_result_uses_put_counters_and_no_write_window_counters() -
         "windows_dead_letter",
         "puts_ok",
         "puts_failed",
+        "windows_degraded",
         "windows_no_payload",
         "windows_source_invalid",
         "rows_dropped",
@@ -481,6 +507,7 @@ def test_run_direction_target_batches_gate_source_metadata(
         "dateObservedTo",
         "dateRetrieved",
         "identifcation",
+        "sourceQuality",
         "peopleCount_flow_11",
     }
 
@@ -846,6 +873,7 @@ def test_run_direction_dry_run_previews_full_replace_without_state_mutation(
         "dateObservedTo",
         "dateRetrieved",
         "identifcation",
+        "sourceQuality",
         "peopleCount_flow_10",
     }
     assert call["attrs"]["peopleCount_flow_10"]["value"] == {
@@ -1289,12 +1317,416 @@ def test_run_direction_gc_preserves_revision_window_processed_in_same_run(
     assert unrelated_key not in windows
 
 
+def test_run_direction_degraded_put_completes_delivery_and_exits_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    state_store = store(tmp_path)
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: degraded_window()}),
+            orion=orion,
+            metadata=[place(10), place(11)],
+            state_store=state_store,
+        )
+
+    assert result.exit_code == 1
+    assert result.puts_ok == 1
+    assert result.puts_failed == 0
+    assert result.windows_complete == 1
+    assert result.windows_partial == 0
+    assert result.windows_degraded == 1
+    assert len(orion.replace_calls) == 1
+    assert state_store.window_status("per3600/20260715_0900") == "complete"
+    [event] = records(caplog, "direction_window_degraded")
+    assert event.levelno == logging.WARNING
+    assert getattr(event, "window") == "per3600/20260715_0900"
+    assert getattr(event, "excluded_place_numbers") == [11]
+    assert getattr(event, "missing_from_all_place_numbers") == []
+    assert getattr(event, "missing_to_all_place_numbers") == [11]
+    [summary] = records(caplog, "run_summary")
+    assert getattr(summary, "windows_degraded") == 1
+
+
+def test_run_direction_failed_degraded_put_stays_partial_and_exits_one(
+    tmp_path: Path,
+) -> None:
+    state_store = store(tmp_path)
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: degraded_window()}),
+        orion=FakeOrionClient([{"status": 502, "ok": False}]),
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+    )
+
+    assert result.exit_code == 1
+    assert result.puts_ok == 0
+    assert result.puts_failed == 1
+    assert result.windows_complete == 0
+    assert result.windows_partial == 1
+    assert result.windows_degraded == 1
+    assert state_store.window_status("per3600/20260715_0900") == "partial"
+
+
+def test_run_direction_unchanged_degraded_payload_skips_without_signal(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    state_store = store(tmp_path)
+    orion = FakeOrionClient()
+    first = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: degraded_window()}),
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+    )
+    assert first.windows_degraded == 1
+    caplog.clear()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        second = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: degraded_window()}),
+            orion=orion,
+            metadata=[place(10), place(11)],
+            state_store=state_store,
+            now=NOW + timedelta(minutes=1),
+        )
+
+    assert second.exit_code == 0
+    assert second.windows_degraded == 0
+    assert second.puts_ok == second.puts_failed == 0
+    assert len(orion.replace_calls) == 1
+    [event] = records(caplog, "direction_window_degraded_unchanged")
+    assert event.levelno == logging.DEBUG
+    assert getattr(event, "window") == "per3600/20260715_0900"
+    assert records(caplog, "direction_window_degraded") == []
+    assert records(caplog, "put_skipped_unchanged") == []
+
+
+def test_run_direction_degraded_hash_drift_puts_and_signals_again(
+    tmp_path: Path,
+) -> None:
+    state_store = store(tmp_path)
+    orion = FakeOrionClient()
+    first = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: degraded_window(boundary_count=3)}),
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+    )
+    second = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: degraded_window(boundary_count=4)}),
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert first.exit_code == second.exit_code == 1
+    assert first.windows_degraded == second.windows_degraded == 1
+    assert first.puts_ok == second.puts_ok == 1
+    assert len(orion.replace_calls) == 2
+
+
+def test_run_direction_forced_revision_of_unchanged_degraded_payload_signals_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    state_store = store(tmp_path)
+    orion = FakeOrionClient()
+    first = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: degraded_window()}),
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+        run_settings=settings(tmp_path, revision_sweep_enabled=True),
+    )
+    assert first.windows_degraded == 1
+    caplog.clear()
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: degraded_window()},
+        discovery_rows_by_interval={
+            60: [revision_row("20260715_0900", "2026-07-15 12:18:00")]
+        },
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        second = run_once(
+            tmp_path=tmp_path,
+            db_connection=db_connection,
+            orion=orion,
+            metadata=[place(10), place(11)],
+            state_store=state_store,
+            run_settings=settings(tmp_path, revision_sweep_enabled=True),
+            now=NOW + timedelta(minutes=1),
+        )
+
+    assert second.exit_code == 1
+    assert second.windows_degraded == 1
+    assert second.puts_ok == 1
+    assert len(orion.replace_calls) == 2
+    assert db_connection.startdate_queries == [(60, ("20260715_0900",))]
+    assert records(caplog, "direction_window_degraded")
+
+
+def test_run_direction_clean_payload_has_no_degraded_counter(
+    tmp_path: Path,
+) -> None:
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: sendable_window()}),
+        orion=FakeOrionClient(),
+    )
+
+    assert result.exit_code == 0
+    assert result.windows_degraded == 0
+    assert result.windows_complete == 1
+
+
+@pytest.mark.parametrize("change", ["add", "change", "remove"])
+def test_run_direction_boundary_route_change_is_semantic_drift(
+    tmp_path: Path, change: str
+) -> None:
+    state_store = store(tmp_path)
+    orion = FakeOrionClient()
+    with_route = degraded_window(boundary_count=3)
+    without_route = [
+        *sendable_window(place_number=10, from_all=20, to_all=21),
+        direction_row(
+            from_group_place_id="ALL",
+            to_group_place_id="sendai202603.11",
+            count=12,
+        ),
+    ]
+    first_rows, second_rows = {
+        "add": (without_route, with_route),
+        "change": (with_route, degraded_window(boundary_count=4)),
+        "remove": (with_route, without_route),
+    }[change]
+
+    run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: first_rows}),
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+    )
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: second_rows}),
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert result.puts_ok == 1
+    assert result.windows_degraded == 1
+    assert len(orion.replace_calls) == 2
+
+
+def test_run_direction_hash_ignores_quality_evaluation_time_but_keeps_quality() -> None:
+    attrs = {
+        "dateRetrieved": {"type": "DateTime", "value": "first"},
+        "sourceQuality": {
+            "type": "StructuredValue",
+            "value": {
+                "status": "degraded",
+                "evaluatedAt": "first",
+                "excludedPlaceNumbers": [11],
+                "missingFromAllPlaceNumbers": [11],
+                "missingToAllPlaceNumbers": [11],
+            },
+        },
+    }
+    volatile_changed = deepcopy(attrs)
+    volatile_changed["dateRetrieved"]["value"] = "second"
+    volatile_changed["sourceQuality"]["value"]["evaluatedAt"] = "second"
+    quality_changed = deepcopy(volatile_changed)
+    quality_changed["sourceQuality"]["value"]["status"] = "clean"
+    quality_changed["sourceQuality"]["value"]["excludedPlaceNumbers"] = []
+
+    assert run_direction_module._attrs_sha256(
+        attrs
+    ) == run_direction_module._attrs_sha256(volatile_changed)
+    assert run_direction_module._attrs_sha256(
+        attrs
+    ) != run_direction_module._attrs_sha256(quality_changed)
+
+
+def test_run_direction_dry_run_degraded_preview_is_nonmutating_and_successful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    state_store = store(tmp_path)
+    before = deepcopy(state_store.as_dict())
+    forbid_state_mutation(monkeypatch, state_store)
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=FakeDbConnection({60: degraded_window()}),
+            orion=orion,
+            metadata=[place(10), place(11)],
+            state_store=state_store,
+            run_settings=settings(tmp_path, send_mode="dry-run"),
+        )
+
+    assert result.exit_code == 0
+    assert result.windows_degraded == 1
+    assert result.windows_complete == 0
+    assert state_store.as_dict() == before
+    assert len(orion.replace_calls) == 1
+    assert orion.replace_calls[0]["dry_run"] is True
+    assert records(caplog, "direction_window_degraded")
+
+
+def test_run_direction_revision_degraded_to_clean_restores_dense_matrix(
+    tmp_path: Path,
+) -> None:
+    revised_startdate = "20260701_0900"
+    degraded_rows = degraded_window(revised_startdate)
+    clean_rows = [
+        *degraded_rows,
+        *sendable_window(revised_startdate, place_number=11, from_all=12, to_all=13),
+    ]
+    prior = transform_direction_window(
+        degraded_rows,
+        {(10, 60): place(10), (11, 60): place(11)},
+        aggregate_entity_id=AGGREGATE_ID,
+        aggregate_entity_type=AGGREGATE_TYPE,
+        now=Clock([NOW - timedelta(days=1)]),
+    )
+    assert isinstance(prior, DirectionPayloadOutcome)
+    path = tmp_path / "state" / "direction.json"
+    key = f"per3600/{revised_startdate}"
+    write_state(
+        path,
+        {
+            key: window_record(
+                status="complete",
+                targets={
+                    AGGREGATE_ID: target_record(
+                        status="ok", payload_sha256=attrs_hash(prior.payload["attrs"])
+                    )
+                },
+            )
+        },
+        last_aggregated_at="2026-07-15T12:00:00+09:00",
+    )
+    state_store = WindowStateStore.load(path, now=Clock([NOW] * 30))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: clean_rows},
+        discovery_rows_by_interval={
+            60: [revision_row(revised_startdate, "2026-07-15 12:01:00")]
+        },
+    )
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=db_connection,
+        orion=orion,
+        metadata=[place(10), place(11)],
+        state_store=state_store,
+        run_settings=settings(tmp_path, revision_sweep_enabled=True),
+    )
+
+    assert len(orion.replace_calls) == 1
+    attrs = orion.replace_calls[0]["attrs"]
+    assert db_connection.startdate_queries == [(60, (revised_startdate,))]
+    assert result.windows_degraded == 0
+    assert result.windows_complete == 1
+    assert attrs["sourceQuality"]["value"]["status"] == "clean"
+    assert attrs["peopleCount_flow_10"]["value"]["to"]["11"] == 3
+    assert attrs["peopleCount_flow_11"]["value"]["from"]["10"] == 3
+    assert set(attrs["peopleCount_flow_11"]["value"]["to"]) == {"10", "11", "all"}
+    saved = state_store.target_record(key, AGGREGATE_ID)
+    assert saved is not None
+    assert saved["last_payload_sha256"] == attrs_hash(attrs)
+
+
+def test_run_direction_revision_clean_to_degraded_keeps_sparse_boundary(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    revised_startdate = "20260701_0900"
+    degraded_rows = degraded_window(revised_startdate)
+    clean_rows = [
+        *degraded_rows,
+        *sendable_window(revised_startdate, place_number=11, from_all=12, to_all=13),
+    ]
+    prior = transform_direction_window(
+        clean_rows,
+        {(10, 60): place(10), (11, 60): place(11)},
+        aggregate_entity_id=AGGREGATE_ID,
+        aggregate_entity_type=AGGREGATE_TYPE,
+        now=Clock([NOW - timedelta(days=1)]),
+    )
+    assert isinstance(prior, DirectionPayloadOutcome)
+    path = tmp_path / "state" / "direction.json"
+    key = f"per3600/{revised_startdate}"
+    write_state(
+        path,
+        {
+            key: window_record(
+                status="complete",
+                targets={
+                    AGGREGATE_ID: target_record(
+                        status="ok", payload_sha256=attrs_hash(prior.payload["attrs"])
+                    )
+                },
+            )
+        },
+        last_aggregated_at="2026-07-15T12:00:00+09:00",
+    )
+    state_store = WindowStateStore.load(path, now=Clock([NOW] * 30))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={60: degraded_rows},
+        discovery_rows_by_interval={
+            60: [revision_row(revised_startdate, "2026-07-15 12:01:00")]
+        },
+    )
+    orion = FakeOrionClient()
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        result = run_once(
+            tmp_path=tmp_path,
+            db_connection=db_connection,
+            orion=orion,
+            metadata=[place(10), place(11)],
+            state_store=state_store,
+            run_settings=settings(tmp_path, revision_sweep_enabled=True),
+        )
+
+    assert len(orion.replace_calls) == 1
+    attrs = orion.replace_calls[0]["attrs"]
+    assert result.exit_code == 1
+    assert result.windows_degraded == 1
+    assert result.windows_complete == 1
+    assert "peopleCount_flow_11" not in attrs
+    assert attrs["peopleCount_flow_10"]["value"]["to"]["11"] == 3
+    assert state_store.window_status(key) == "complete"
+    assert records(caplog, "direction_window_degraded")
+
+
 def test_run_direction_logging_allowlist_carries_aggregate_contract_fields() -> None:
     assert {
         "puts_ok",
         "puts_failed",
         "windows_no_payload",
         "windows_source_invalid",
+        "windows_degraded",
+        "excluded_place_numbers",
         "missing_from_all_place_numbers",
         "missing_to_all_place_numbers",
     } <= _ALLOWED_EXTRA_KEYS

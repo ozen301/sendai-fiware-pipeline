@@ -173,6 +173,17 @@ def test_transform_direction_builds_aggregate_with_exact_ngsi_contract() -> None
                 "value": AGGREGATE_ENTITY_ID,
                 "metadata": timeinstant(),
             },
+            "sourceQuality": {
+                "type": "StructuredValue",
+                "value": {
+                    "status": "clean",
+                    "evaluatedAt": FIXED_NOW_ISO,
+                    "excludedPlaceNumbers": [],
+                    "missingFromAllPlaceNumbers": [],
+                    "missingToAllPlaceNumbers": [],
+                },
+                "metadata": timeinstant(),
+            },
             "peopleCount_flow_105": {
                 "type": "StructuredValue",
                 "value": {
@@ -223,6 +234,7 @@ def test_transform_direction_ignores_five_minute_rows_in_sendable_window() -> No
         "dateObservedTo",
         "dateRetrieved",
         "identifcation",
+        "sourceQuality",
         "peopleCount_flow_105",
     }
     assert payload["attrs"]["dateObservedFrom"]["value"] == OBSERVED_FROM
@@ -327,6 +339,7 @@ def test_transform_direction_emits_candidate_with_totals_and_no_pairwise_rows() 
         "dateObservedTo",
         "dateRetrieved",
         "identifcation",
+        "sourceQuality",
         "peopleCount_flow_105",
     }
     assert payload["attrs"]["peopleCount_flow_105"]["value"] == {
@@ -452,7 +465,7 @@ def test_transform_direction_drops_ignored_prefix_before_metadata_lookup(
     assert records(caplog, "unknown_place_interval") == []
 
 
-def test_transform_direction_rejects_pairwise_candidate_without_totals() -> None:
+def test_transform_direction_contains_pairwise_candidate_without_totals() -> None:
     metadata_index = {
         (105, 60): place(place_number=105),
         (106, 60): place(
@@ -467,12 +480,24 @@ def test_transform_direction_rejects_pairwise_candidate_without_totals() -> None
 
     outcome = transform(rows, metadata_index)
 
-    assert isinstance(outcome, DirectionSourceInvalidOutcome)
-    assert not isinstance(outcome, DirectionNoPayloadOutcome)
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    assert outcome.excluded_place_numbers == (106,)
     assert outcome.missing_from_all_place_numbers == (106,)
     assert outcome.missing_to_all_place_numbers == (106,)
     assert outcome.rows_dropped == 0
-    assert not hasattr(outcome, "payload")
+    attrs = outcome.payload["attrs"]
+    assert "peopleCount_flow_106" not in attrs
+    assert attrs["peopleCount_flow_105"]["value"] == {
+        "from": {"105": 0, "all": 85},
+        "to": {"105": 0, "106": 12, "all": 82},
+    }
+    assert attrs["sourceQuality"]["value"] == {
+        "status": "degraded",
+        "evaluatedAt": FIXED_NOW_ISO,
+        "excludedPlaceNumbers": [106],
+        "missingFromAllPlaceNumbers": [106],
+        "missingToAllPlaceNumbers": [106],
+    }
 
 
 def test_transform_direction_sorts_multiple_missing_total_places_ascending() -> None:
@@ -523,7 +548,7 @@ def test_transform_direction_sorts_multiple_missing_total_places_ascending() -> 
     ],
     ids=("only-all-to-place", "only-place-to-all"),
 )
-def test_transform_direction_rejects_candidate_whose_only_row_is_one_total(
+def test_transform_direction_excludes_candidate_whose_only_row_is_one_total(
     row: dict[str, Any],
     missing_from: tuple[int, ...],
     missing_to: tuple[int, ...],
@@ -543,8 +568,229 @@ def test_transform_direction_rejects_candidate_whose_only_row_is_one_total(
         metadata_index,
     )
 
-    assert isinstance(outcome, DirectionSourceInvalidOutcome)
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    assert outcome.excluded_place_numbers == (106,)
     assert outcome.missing_from_all_place_numbers == missing_from
     assert outcome.missing_to_all_place_numbers == missing_to
     assert outcome.rows_dropped == 0
-    assert not hasattr(outcome, "payload")
+    assert "peopleCount_flow_106" not in outcome.payload["attrs"]
+    assert outcome.payload["attrs"]["sourceQuality"]["value"] == {
+        "status": "degraded",
+        "evaluatedAt": FIXED_NOW_ISO,
+        "excludedPlaceNumbers": [106],
+        "missingFromAllPlaceNumbers": list(missing_from),
+        "missingToAllPlaceNumbers": list(missing_to),
+    }
+
+
+def test_transform_direction_payload_outcome_reports_sorted_quality_tuples() -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(place_number=106, entity_id="test.106"),
+        (107, 60): place(place_number=107, entity_id="test.107"),
+        (108, 60): place(place_number=108, entity_id="test.108"),
+    }
+    rows = [
+        *complete_totals("sendai202603.105", from_all=20, to_all=21),
+        direction_row(
+            from_group_place_id="sendai202603.108",
+            to_group_place_id="ALL",
+            count=8,
+        ),
+        direction_row(
+            from_group_place_id="ALL",
+            to_group_place_id="sendai202603.107",
+            count=7,
+        ),
+        direction_row(
+            from_group_place_id="sendai202603.106",
+            to_group_place_id="sendai202603.105",
+            count=6,
+        ),
+    ]
+
+    outcome = transform(rows, metadata_index)
+
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    assert outcome.excluded_place_numbers == (106, 107, 108)
+    assert outcome.missing_from_all_place_numbers == (106, 108)
+    assert outcome.missing_to_all_place_numbers == (106, 107)
+    assert outcome.payload["attrs"]["sourceQuality"]["value"] == {
+        "status": "degraded",
+        "evaluatedAt": FIXED_NOW_ISO,
+        "excludedPlaceNumbers": [106, 107, 108],
+        "missingFromAllPlaceNumbers": [106, 108],
+        "missingToAllPlaceNumbers": [106, 107],
+    }
+
+
+def test_transform_direction_clean_payload_reports_empty_quality_tuples() -> None:
+    outcome = transform(
+        complete_totals("sendai202603.105", from_all=5, to_all=4),
+        {(105, 60): place(place_number=105)},
+    )
+
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    assert outcome.excluded_place_numbers == ()
+    assert outcome.missing_from_all_place_numbers == ()
+    assert outcome.missing_to_all_place_numbers == ()
+
+
+def test_transform_direction_keeps_directional_sparse_boundary_rows() -> None:
+    metadata_index = {
+        number_key: place(place_number=number_key[0], entity_id=f"test.{number_key[0]}")
+        for number_key in ((105, 60), (106, 60), (107, 60), (108, 60))
+    }
+    rows = [
+        *complete_totals("sendai202603.105", from_all=100, to_all=101),
+        *complete_totals("sendai202603.106", from_all=110, to_all=111),
+        direction_row(
+            from_group_place_id="sendai202603.105",
+            to_group_place_id="sendai202603.107",
+            count=3,
+        ),
+        direction_row(
+            from_group_place_id="sendai202603.108",
+            to_group_place_id="sendai202603.105",
+            count=4,
+        ),
+        direction_row(
+            from_group_place_id="sendai202603.106",
+            to_group_place_id="sendai202603.108",
+            count=5,
+        ),
+    ]
+
+    attrs = payload_from(transform(rows, metadata_index))["attrs"]
+
+    assert attrs["peopleCount_flow_105"]["value"] == {
+        "from": {"105": 0, "106": 0, "108": 4, "all": 100},
+        "to": {"105": 0, "106": 0, "107": 3, "all": 101},
+    }
+    assert attrs["peopleCount_flow_106"]["value"] == {
+        "from": {"105": 0, "106": 0, "all": 110},
+        "to": {"105": 0, "106": 0, "108": 5, "all": 111},
+    }
+    assert "peopleCount_flow_107" not in attrs
+    assert "peopleCount_flow_108" not in attrs
+
+
+def test_transform_direction_boundary_observed_zero_is_not_synthesized() -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(place_number=106, entity_id="test.106"),
+    }
+    base_rows = [
+        *complete_totals("sendai202603.105", from_all=9, to_all=8),
+        direction_row(
+            from_group_place_id="ALL",
+            to_group_place_id="sendai202603.106",
+            count=4,
+        ),
+    ]
+    boundary_zero = direction_row(
+        from_group_place_id="sendai202603.105",
+        to_group_place_id="sendai202603.106",
+        count=0,
+    )
+
+    with_row = payload_from(transform([*base_rows, boundary_zero], metadata_index))
+    without_row = payload_from(transform(base_rows, metadata_index))
+
+    assert with_row["attrs"]["peopleCount_flow_105"]["value"]["to"]["106"] == 0
+    assert "106" not in without_row["attrs"]["peopleCount_flow_105"]["value"]["to"]
+
+
+def test_transform_direction_omits_excluded_only_routes_and_self_loops() -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(place_number=106, entity_id="test.106"),
+        (107, 60): place(place_number=107, entity_id="test.107"),
+    }
+    rows = [
+        *complete_totals("sendai202603.105", from_all=9, to_all=8),
+        direction_row(
+            from_group_place_id="sendai202603.106",
+            to_group_place_id="sendai202603.107",
+            count=4,
+        ),
+        direction_row(
+            from_group_place_id="sendai202603.106",
+            to_group_place_id="sendai202603.106",
+            count=2,
+        ),
+    ]
+
+    attrs = payload_from(transform(rows, metadata_index))["attrs"]
+
+    assert set(name for name in attrs if name.startswith("peopleCount_flow_")) == {
+        "peopleCount_flow_105"
+    }
+    assert attrs["peopleCount_flow_105"]["value"] == {
+        "from": {"105": 0, "all": 9},
+        "to": {"105": 0, "all": 8},
+    }
+
+
+def test_transform_direction_restores_clean_roster_on_later_transform() -> None:
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(place_number=106, entity_id="test.106"),
+    }
+    degraded_rows = [
+        *complete_totals("sendai202603.105", from_all=9, to_all=8),
+        direction_row(
+            from_group_place_id="sendai202603.105",
+            to_group_place_id="sendai202603.106",
+            count=3,
+        ),
+    ]
+    repaired_rows = [
+        *degraded_rows,
+        *complete_totals("sendai202603.106", from_all=7, to_all=6),
+    ]
+
+    degraded = transform(degraded_rows, metadata_index)
+    later = FIXED_NOW + timedelta(minutes=5)
+    repaired = transform_direction_window(
+        repaired_rows,
+        metadata_index,
+        aggregate_entity_id=AGGREGATE_ENTITY_ID,
+        aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        now=lambda: later,
+    )
+
+    degraded_attrs = payload_from(degraded)["attrs"]
+    repaired_attrs = payload_from(repaired)["attrs"]
+    assert "peopleCount_flow_106" not in degraded_attrs
+    assert repaired_attrs["peopleCount_flow_105"]["value"]["to"]["106"] == 3
+    assert "peopleCount_flow_106" in repaired_attrs
+    assert repaired_attrs["sourceQuality"]["value"] == {
+        "status": "clean",
+        "evaluatedAt": "2026-05-24T13:30:43+09:00",
+        "excludedPlaceNumbers": [],
+        "missingFromAllPlaceNumbers": [],
+        "missingToAllPlaceNumbers": [],
+    }
+
+
+def test_transform_direction_rows_dropped_is_independent_of_exclusion() -> None:
+    rows = [
+        *complete_totals("sendai202603.105", from_all=9, to_all=8),
+        direction_row(
+            from_group_place_id="sendai202603.106",
+            to_group_place_id="sendai202603.105",
+            count=3,
+        ),
+        direction_row(interval_min=5),
+    ]
+    metadata_index = {
+        (105, 60): place(place_number=105),
+        (106, 60): place(place_number=106, entity_id="test.106"),
+    }
+
+    outcome = transform(rows, metadata_index)
+
+    assert isinstance(outcome, DirectionPayloadOutcome)
+    assert outcome.excluded_place_numbers == (106,)
+    assert outcome.rows_dropped == 1

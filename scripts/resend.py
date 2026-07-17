@@ -357,6 +357,7 @@ def _send_resend(plan: ResendPlan) -> int:
     windows_empty = 0
     windows_no_payload = 0
     windows_source_invalid = 0
+    windows_degraded = 0
     windows_gc = 0
     run_windows_partial = 0
     run_windows_complete = 0
@@ -411,6 +412,7 @@ def _send_resend(plan: ResendPlan) -> int:
                     writes_failed += counts.puts_failed
                     windows_no_payload += counts.windows_no_payload
                     windows_source_invalid += counts.windows_source_invalid
+                    windows_degraded += counts.windows_degraded
                 run_windows_partial += counts.windows_partial
                 run_windows_complete += counts.windows_complete
                 _log_window_processed(
@@ -455,11 +457,16 @@ def _send_resend(plan: ResendPlan) -> int:
         windows_empty=windows_empty,
         windows_no_payload=windows_no_payload,
         windows_source_invalid=windows_source_invalid,
+        windows_degraded=windows_degraded,
         windows_gc=windows_gc,
         windows_partial=run_windows_partial,
         windows_complete=run_windows_complete,
     )
-    return 0 if writes_failed == 0 and windows_source_invalid == 0 else 1
+    return (
+        0
+        if writes_failed == 0 and windows_source_invalid == 0 and windows_degraded == 0
+        else 1
+    )
 
 
 def _abort_on_dead_letter_windows(
@@ -864,6 +871,7 @@ def _log_summary(
     windows_gc: int = 0,
     windows_no_payload: int = 0,
     windows_source_invalid: int = 0,
+    windows_degraded: int = 0,
 ) -> None:
     write_counts = (
         {"puts_ok": writes_ok, "puts_failed": writes_failed}
@@ -874,6 +882,7 @@ def _log_summary(
         {
             "windows_no_payload": windows_no_payload,
             "windows_source_invalid": windows_source_invalid,
+            "windows_degraded": windows_degraded,
         }
         if plan.product == "direction"
         else {}

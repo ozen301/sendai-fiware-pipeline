@@ -21,6 +21,7 @@ AGGREGATE_ATTRS = [
     "dateObservedTo",
     "dateRetrieved",
     "identifcation",
+    "sourceQuality",
     "peopleCount_flow_10",
     "peopleCount_flow_11",
     "peopleCount_flow_14",

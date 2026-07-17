@@ -318,12 +318,14 @@ interval `60`, so a partial selection has no meaning.
     `resend_window_processed` records (zero posts) rather than the
     aggregate counts.
 - **Direction exit code.** For direction the run exits 1 when any
-  aggregate `PUT` fails (`puts_failed > 0`) **or** any window is
-  source-invalid (`windows_source_invalid > 0` — a candidate place is
-  missing its `from.all` / `to.all` total, so the whole window is rejected
-  without a write). A window with no payload (`windows_no_payload`, no
-  candidate places this window) is not a failure and does not change the
-  exit code.
+  aggregate `PUT` fails (`puts_failed > 0`), a degraded package is sent
+  (`windows_degraded > 0`), **or** every candidate place in a window is
+  excluded (`windows_source_invalid > 0`). A degraded package still attempts
+  one `PUT` for the emitted places. An all-excluded window writes nothing. A
+  window with no payload (`windows_no_payload`, no candidate places this
+  window) is not a failure and does not change the exit code. An unchanged
+  prior-`ok` degraded package that is not forced is skipped at DEBUG level; it
+  does not increment `windows_degraded` or change the exit code.
 - **A dead-letter window in range aborts the run (exit 2).** The dead-letter
   pre-flight (Behavior step 3) refuses the run up front, before any POST,
   and lists every offending key. Clear them with `state_repair.py` or
@@ -396,8 +398,10 @@ interval `60`, so a partial selection has no meaning.
   count. Direction reports those same `windows_empty` / `windows_gc` /
   `windows_partial` / `windows_complete` counts and, in place of the
   `posts_*` fields, additionally reports `puts_ok` / `puts_failed`,
-  `windows_no_payload`, and `windows_source_invalid`. See the exit-code
-  notes under Safety).
+  `windows_no_payload`, `windows_source_invalid`, and `windows_degraded`.
+  `windows_degraded` counts degraded packages whose `PUT` was attempted; a
+  successful degraded `PUT` therefore increments both `puts_ok` and
+  `windows_degraded`. See the exit-code notes under Safety.
 
 ### Tests
 

@@ -145,6 +145,25 @@ def test_json_formatter_includes_allowed_extras() -> None:
     assert payload["ok"] is True
 
 
+def test_json_formatter_includes_degraded_direction_extras() -> None:
+    record = make_record(
+        extras={
+            "event": "direction_window_degraded",
+            "windows_degraded": 2,
+            "excluded_place_numbers": [210, 209],
+            "missing_from_all_place_numbers": [209],
+            "missing_to_all_place_numbers": [210],
+        }
+    )
+
+    payload = json.loads(JsonFormatter().format(record))
+
+    assert payload["windows_degraded"] == 2
+    assert payload["excluded_place_numbers"] == [210, 209]
+    assert payload["missing_from_all_place_numbers"] == [209]
+    assert payload["missing_to_all_place_numbers"] == [210]
+
+
 def test_json_formatter_includes_exception_traceback() -> None:
     try:
         raise RuntimeError("boom")

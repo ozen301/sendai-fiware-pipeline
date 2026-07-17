@@ -112,6 +112,8 @@ _ALLOWED_EXTRA_KEYS: frozenset[str] = frozenset(
         "puts_failed",
         "windows_no_payload",
         "windows_source_invalid",
+        "windows_degraded",
+        "excluded_place_numbers",
         "missing_from_all_place_numbers",
         "missing_to_all_place_numbers",
         "windows_empty",

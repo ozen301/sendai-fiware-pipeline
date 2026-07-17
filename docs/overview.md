@@ -107,8 +107,8 @@ complete attribute set.
 
 **Entity.** A single addressable thing in Orion. Product A uses one per
 (place, interval); for example, `jp.sendai.Blesensor.per3600.105` is place 105's
-60-minute aggregate. Product B uses one aggregate entity for all emitted places
-in a source window.
+60-minute aggregate. Product B uses one aggregate entity for all places included
+in a source-window package.
 
 **Attribute.** A named field on an entity (e.g. `peopleCount_immedate`).
 Each attribute carries an NGSI type, a value, and optional metadata.
@@ -125,8 +125,15 @@ publishes `5` and `60`; Product B publishes only `60`. The source also stores
 identified by its start time and interval. For example,
 `per3600/20260524_1000` is the 60-minute window starting at 2026-05-24
 10:00 JST and ending at 11:00 JST. Product A can produce one update per
-observed place. Product B produces one aggregate replacement when at least one
-candidate place survives and every candidate has both required source totals.
+observed place. Product B can build one aggregate replacement when at least one
+place has both required hourly totals. A place missing either total does not get
+its own flow attribute, but other places with complete totals can still be
+included. The package's `sourceQuality` attribute lists the places excluded for
+missing totals and names those totals. If source rows survive filtering but no
+place has both totals, the source is invalid and Product B has nothing safe to
+write. If no row survives the ordinary filters, there is simply no payload.
+These are source-data outcomes; the delivery step can also skip a package that
+was already written successfully and has not changed.
 
 **`TimeInstant`.** An NGSI metadata field attached to every attribute we
 write. In this pipeline, we set its value to the window's start time. STH-Comet, when configured
@@ -149,7 +156,10 @@ targets:
   eligible for the next run's retry.
 - `complete`: every entity id in `expected_target_ids` has a recorded `ok`.
   Product A uses its observed-target union; Product B uses the single aggregate
-  id. A Product B no-payload or source-invalid attempt creates no state record.
+  id. Product B creates no state record when no candidate row survives, or when
+  candidates survive but every one is missing a required total. If Product B
+  successfully writes the complete places while omitting other candidates with
+  missing totals, that delivery is still `complete`.
 - `dead_letter`: operator-marked unrecoverable. Never retried.
 
 **Target status.** Per-target outcome: `ok` / `failed` / `pending`. An unchanged
@@ -190,9 +200,12 @@ corrective history rows.
 observation was recorded," and `0` means "observed zero." The two are
 semantically different and the pipeline preserves both: 
 nullable source values are sent as JSON `null`, never coerced to `0`.
-For Product B, dense matrix `0` means observed zero between two emitted places.
-No observation is represented by absence from the emitted-place roster, not by
-a sentinel matrix attribute.
+For Product B, a missing pairwise row between two places whose hourly totals are
+complete becomes `0` because both places were measuring. If a place is missing
+a total, a movement between it and a place whose totals are complete appears
+only when the source recorded that exact row. A recorded count of `0` remains
+`0`; an absent row produces no place-number key. Product B does not invent a
+zero or a sentinel attribute for missing source data.
 
 **Source stability delay.** `SOURCE_STABILITY_DELAY_HOURS` (default 3h).
 A window is eligible to publish only if its source `startdate` is at or
@@ -326,15 +339,17 @@ The five stages in plain words:
       selected type is `Pixel3aUT`; with only 2026 active targets, it is
       `M5Stack`.
 
-   Product B keeps self-loops and cross-batch pairs that pass those filters. It
-   derives a candidate place from any surviving non-`ALL` endpoint and requires
-   both `ALL → N` and `N → ALL` source totals for every candidate. The emitted
-   roster is the candidates with both totals. Each emitted place gets a dynamic
-   `peopleCount_flow_<N>` attribute whose `from` and `to` dictionaries are
-   dense over that roster, including the place's own key. A missing pairwise
-   row between emitted places becomes `0`; a self-loop populates both sides.
-   Missing totals reject the whole window, while zero candidates produce no
-   payload.
+   Product B keeps self-loops and cross-batch pairs that pass those filters. A
+   place needs both `ALL → N` (people arriving from everywhere) and `N → ALL`
+   (people leaving for everywhere) before it gets its own
+   `peopleCount_flow_<N>` attribute. Places with both totals are **emitted
+   places**; places missing either total are **excluded places** and listed in
+   `sourceQuality`. Movements among emitted places fill their `from` and `to`
+   dictionaries, with a missing pairwise row written as `0`. If the source
+   recorded a movement between an excluded place and an emitted place, that one
+   observed count is kept in the emitted place's dictionary; no key is invented
+   when the source row is absent. Product B writes nothing when every place is
+   missing a required total, or when no place survives the ordinary filters.
 
 4. **Write Orion attributes.** Product A sends one update-only `POST /attrs`
    per `(entity, window)`. Product B sends one replace-all `PUT /attrs` to the
@@ -352,7 +367,8 @@ The five stages in plain words:
 
 5. **Record outcome.** Each write result is written back to the
    per-product state file with the entity id, HTTP status, and a SHA-256
-   of the payload bytes (used to detect "would this re-send the
+   of the payload's stable attributes, excluding volatile fields like
+   `dateRetrieved` (used to detect "would this re-send the
    same value?" during retries). The window aggregate status (`pending`,
    `partial`, `complete`, `dead_letter`) is then recomputed against the
    window's `expected_target_ids`. The two products define that set
@@ -369,10 +385,13 @@ The five stages in plain words:
      `startdate`) and expands the expected set on a later run.
    - **Product B (inter-place flow):** a sendable window expects only the
      configured aggregate entity. A 204 response marks that target `ok`. A
-     zero-candidate or source-invalid attempt creates no state record; the
-     former logs `direction_window_no_payload` at DEBUG, while the latter logs
-     `direction_window_source_invalid` at WARNING and makes the run exit
-     nonzero.
+     source result with no candidate places, or with candidates but no place
+     having both required totals, creates no state record. A PUT that includes
+     complete places while omitting candidates with missing totals uses normal
+     delivery state and counters, also increments `windows_degraded`, and makes
+     send mode exit nonzero even after a successful PUT. If that same package
+     was already written successfully and has not changed, it is skipped at
+     DEBUG without repeating the counter or exit effect.
 
    In both cases the window goes to `complete` once every id in its
    expected set has a recorded `ok`; otherwise it stays `partial`.
@@ -471,9 +490,12 @@ package per sendable 60-minute source window. Key differences from Product A:
   sides must pass metadata resolution. Cross-batch pairs (a 2023 place
   paired with a 2026 place) are sent when both sides resolve.
 - **The literal string `ALL` is a real aggregation key**, not a noise prefix.
-  `ALL → N` supplies `peopleCount_flow_<N>.value.from.all`, and `N → ALL`
-  supplies `peopleCount_flow_<N>.value.to.all`. The pipeline never sums
-  pairwise rows to approximate these deduplicated totals.
+  Each place needs both hourly totals before Product B publishes its own flow
+  attribute. `ALL → N` is the total arriving at `N` from everywhere and
+  supplies `peopleCount_flow_<N>.value.from.all`; `N → ALL` is the total
+  leaving `N` for everywhere and supplies
+  `peopleCount_flow_<N>.value.to.all`. The pipeline never sums pairwise rows to
+  approximate these deduplicated totals.
 - **The source table stores parallel rows** under both
   `(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every per-place
   target. Product B selects one device type per interval from the oldest
@@ -481,29 +503,88 @@ package per sendable 60-minute source window. Key differences from Product A:
   the nested inter-place values and the deduplicated totals use the same
   source population. The device-type filter is therefore a required
   disambiguator; omitting it would double-count every movement.
-- **Candidate places define integrity checks.** A non-`ALL` endpoint of any
-  surviving row is a candidate. Every candidate needs both source totals; one
-  missing total rejects the whole window. Zero candidates produce no write.
-- **The emitted roster defines a dense matrix.** Each emitted place has both
-  totals. Its `from` and `to` dictionaries include every emitted place number,
-  including its own. Missing pairwise routes become `0`. A surviving `N→N`
-  self-loop populates both `from.<N>` and `to.<N>`.
+- **Product B drops only the places with incomplete totals.** A **candidate
+  place** is any non-`ALL` place in a row that survives filtering. An **emitted
+  place** has both totals and receives a `peopleCount_flow_<N>` attribute. An
+  **excluded place** is missing one or both totals and does not receive its own
+  attribute. A package containing both emitted and excluded places is called
+  **degraded**. Product B writes the complete places instead of dropping the
+  whole hour. It writes nothing when every candidate is excluded; zero
+  candidates also produce no write.
+- **Emitted places contain a complete set of emitted-place keys.** Each
+  emitted place's `from` and `to` dictionaries contain every emitted place
+  number, including its own. A missing pairwise row between emitted places
+  becomes `0`; a surviving `N→N` self-loop populates both `from.<N>` and
+  `to.<N>`.
+- **Recorded movements involving an excluded place are still useful.** If the
+  source recorded a movement between an emitted place and an excluded place,
+  Product B keeps that count in the emitted place's attribute. The direction
+  determines whether it goes under `from` or `to`, as the example below shows.
+  A recorded count of `0` is kept, but an absent row creates no key.
 - **The attributes are dynamic.** The aggregate body contains
   `peopleCount_flow_<N>` for emitted places only. It has no fixed `1..28`
-  range and no sentinel attributes for absent places.
+  range and no sentinel attributes for excluded or absent places. Every written
+  package also has `sourceQuality`, which names excluded candidates and the
+  missing total direction. Emitted `from.all` and `to.all` values remain the
+  verbatim source totals and need not equal the sum of visible matrix entries.
 - **Completion has one target.** A sendable Product B window records only the
-  configured aggregate entity in `expected_target_ids`. A source-invalid or
-  zero-candidate attempt records no state.
+  configured aggregate entity in `expected_target_ids`. An all-excluded
+  source-invalid or zero-candidate attempt records no state. A successfully
+  written degraded package is complete.
 - **Current state is last-written.** A revision write for an older window can
   replace Orion current state. `dateObservedFrom` and `dateObservedTo`, not
   arrival order, identify the current package's source window. STH-Comet keeps
-  the original `TimeInstant` and appends a corrective row with a newer
-  `dateRetrieved`.
+  the original `TimeInstant` and appends a corrective row. Equal-`recvTime`
+  `sourceQuality` samples are selected by greatest parseable `evaluatedAt`, not
+  response order. If two writes occur in the same whole second, raw history
+  cannot resolve the tie and Orion current state is the last-written view.
 - **The history subscription follows dynamic attributes.** It selects the exact
   aggregate id/type, triggers on `dateRetrieved`, requests `TimeInstant`, and
   omits `notification.attrs` so the full replaced entity is notified. This is
   safe because Product B exclusively owns the entity. Subscription throttling
   is unsupported for both products because it can silently discard bursts.
+
+Here is the concrete degraded case. Place 3 has both hourly totals, so Product B
+publishes `peopleCount_flow_3`. Place 5 has `ALL → 5` but is missing `5 → ALL`,
+so Product B does not publish `peopleCount_flow_5`. The source did record 12
+people moving `5 → 3`, so that count is kept on place 3 as
+`peopleCount_flow_3.value.from["5"]`. If the `5 → 3` row had been absent, the
+`"5"` key would also be absent; Product B would not invent `"5": 0`.
+
+Place 3's `from.all` stays at the source value 85. Product B does not recompute
+it from the visible place-number keys under `from`, which sum to 12 in this
+abbreviated example.
+`sourceQuality` tells consumers that place 5 was omitted because its outgoing
+total was missing. The example omits `dateObservedFrom` and `dateObservedTo`
+and elides repeated metadata:
+
+```json
+{
+  "dateRetrieved": {"type": "DateTime", "value": "2026-05-24T13:25:43+09:00", "metadata": {…}},
+  "identifcation": {"type": "Text", "value": "jp.sendai.Blesensor.flow", "metadata": {…}},
+  "sourceQuality": {
+    "type": "StructuredValue",
+    "value": {
+      "status": "degraded",
+      "evaluatedAt": "2026-05-24T13:25:43+09:00",
+      "excludedPlaceNumbers": [5],
+      "missingFromAllPlaceNumbers": [],
+      "missingToAllPlaceNumbers": [5]
+    },
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-05-24T10:00:00+09:00"}}
+  },
+  "peopleCount_flow_3": {
+    "type": "StructuredValue",
+    "value": {"from": {"all": 85, "3": 0, "5": 12}, "to": {"all": 82, "3": 0}},
+    "metadata": {…}
+  }
+}
+```
+
+This package does not contain place 5's own attribute, its surviving
+`ALL → 5` total, or any movement whose two places are both excluded. A later
+full-window rebuild restores those values if the source supplies `5 → ALL` and
+place 5 becomes publishable.
 
 ## Repo map
 
