@@ -104,12 +104,10 @@ When working with Codex:
   API integration, or extra-care reviews; **xhigh** for architecture
   decisions, multi-step planning, or work with significant
   consequences if wrong.
-- A Codex thread's sandbox is fixed when the thread is created. The
-  `codex:*` skills expose this through their `task` command: a
-  read-only thread, such as a review pass, that later needs to write
-  must start fresh with `--fresh --write`, not `--resume --write`
-  (resuming inherits the original thread's read-only sandbox, so
-  `apply_patch` is rejected).
+- A Codex thread's sandbox is fixed when the thread is created
+  (reasoning effort can be chosen per call): a read-only thread (e.g. a
+  review pass) that later needs to write can't be resumed into write
+  mode — start a fresh write thread.
 - To continue a review across rounds, invoke `codex:codex-rescue` with
   `--resume` (not `SendMessage` to the wrapper, which cold-starts a fresh
   Codex session each round).
@@ -149,13 +147,19 @@ implementation complete; they must be clean.
 
 ### Docstrings and Comments
 
-Write for a developer seeing this code for the first time, who does not
-hold the design in their head. The goal is not to record all you know
-but to move that reader to understanding by the shortest clear path.
+Write for a developer seeing this code for the first time, who does
+not hold the design in their head and has only the committed
+repository. Avoid terms and context that come from planning documents
+or discussions the reader cannot see (e.g. agent sessions); the
+goal is not to record all you know but to move that reader to
+understanding by the shortest clear path.
 Before calling a docstring or comment done, read it once cold: does it
 state what the code does up front, follow a logical order, and say only
 what the reader needs? If not, revise, judging the whole docstring or
 comment rather than a single phrase.
+
+These principles, apart from the code-specific mechanics below, apply
+to documentation files as well.
 
 - Use Google-style docstrings for public modules, classes, and
   functions. State what the code does first; let the "why", if
