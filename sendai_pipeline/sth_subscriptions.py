@@ -47,6 +47,12 @@ _NOTIFICATION_RUNTIME_FIELDS: frozenset[str] = frozenset(
         "timesSent",
     }
 )
+_NOTIFICATION_FALSE_DEFAULT_FIELDS: frozenset[str] = frozenset(
+    {
+        "covered",
+        "onlyChangedAttrs",
+    }
+)
 PRODUCT_B_STABLE_WRITE_ATTRS: tuple[str, ...] = (
     "dateObservedFrom",
     "dateObservedTo",
@@ -884,8 +890,22 @@ def _entity_selector_pair_may_overlap(
     left: Mapping[str, str],
     right: Mapping[str, str],
 ) -> bool:
-    """Return whether two exact Product A/B selector mappings can overlap."""
-    if left.get("type") != right.get("type"):
+    """Return whether two selector mappings may select an entity in common.
+
+    A missing exact type is broad in Orion, and a type pattern is outside the
+    canonical Product A/B shapes, so either case remains conservatively
+    overlapping. Only two present, unequal exact types prove disjointness.
+    """
+    left_type = left.get("type")
+    right_type = right.get("type")
+    if (
+        not isinstance(left_type, str)
+        or not left_type
+        or not isinstance(right_type, str)
+        or not right_type
+    ):
+        return True
+    if left_type != right_type:
         return False
     left_id = left.get("id")
     right_id = right.get("id")
@@ -957,14 +977,14 @@ def _find_unsafe_peer_subscription(
         if not set(condition_attrs) & own_written:
             continue
 
-        peer_selectors = subject.get("entities")
-        if (
-            _has_exact_peer_shape(settings, peer_label, subscription)
-            and isinstance(peer_selectors, list)
-            and not _entity_selectors_may_overlap(
-                tuple(peer_selectors),
-                own_entity_selectors,
-            )
+        peer_selectors = _canonical_peer_entity_selectors(
+            settings,
+            peer_label,
+            subject.get("entities"),
+        )
+        if peer_selectors is not None and not _entity_selectors_may_overlap(
+            peer_selectors,
+            own_entity_selectors,
         ):
             continue
 
@@ -1027,6 +1047,29 @@ def _matching_product_b_subscription_ids(
     return tuple(matches)
 
 
+def _notification_behavior_fields(
+    notification: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return client-controlled notification fields in canonical GET form.
+
+    Orion GET responses can add delivery telemetry and can materialize the
+    omitted ``onlyChangedAttrs`` and ``covered`` defaults as ``false``. Those
+    representations are equivalent to the body builders' omissions. A true or
+    non-Boolean default field changes or invalidates notification behavior and
+    therefore does not have a canonical equivalent.
+    """
+    behavior: dict[str, Any] = {}
+    for key, value in notification.items():
+        if key in _NOTIFICATION_RUNTIME_FIELDS:
+            continue
+        if key in _NOTIFICATION_FALSE_DEFAULT_FIELDS:
+            if value is not False:
+                return None
+            continue
+        behavior[key] = value
+    return behavior
+
+
 def _has_product_b_aggregate_shape(
     settings: StHSubscriptionSettings, subscription: Mapping[str, Any]
 ) -> bool:
@@ -1042,43 +1085,75 @@ def _has_product_b_aggregate_shape(
       an omitted key and an empty list both match here; any non-empty ``attrs``
       is a different subscription and does not match. This keeps a re-run from
       creating a duplicate of the subscription it just wrote.
+    - ``onlyChangedAttrs`` and ``covered``: Orion can echo either omitted
+      false-default field as ``false``. Omission and literal ``false`` match;
+      ``true`` or a non-Boolean value is different behavior.
     - The notify URL must equal the configured URL exactly; a different URL is a
       different subscription, not this one.
     """
+    expected_top_level = {
+        "id",
+        "status",
+        "description",
+        "subject",
+        "notification",
+    }
+    if settings.expires:
+        expected_top_level.add("expires")
+    if set(subscription) != expected_top_level:
+        return False
+
     description = subscription.get("description")
-    subject = subscription.get("subject")
-    notification = subscription.get("notification")
     if (
-        not isinstance(description, str)
+        subscription.get("status") != "active"
+        or not isinstance(description, str)
         or not description.startswith(_PRODUCT_B_DESCRIPTION_PREFIX)
-        or not isinstance(subject, dict)
-        or not isinstance(notification, dict)
     ):
         return False
 
-    condition = subject.get("condition")
-    http = notification.get("http")
-    if not isinstance(condition, dict) or not isinstance(http, dict):
+    subject = subscription.get("subject")
+    notification = subscription.get("notification")
+    if not isinstance(subject, dict) or not isinstance(notification, dict):
+        return False
+    if set(subject) != {"entities", "condition"}:
         return False
 
-    notification_attrs_match = (
-        "attrs" not in notification or notification.get("attrs") == []
-    )
-    return (
-        subject.get("entities")
-        == [
-            {
-                "id": settings.product_b_aggregate_entity_id,
-                "type": settings.product_b_aggregate_entity_type,
-            }
-        ]
-        and condition.get("attrs") == ["dateRetrieved"]
-        and condition.get("notifyOnMetadataChange") is True
+    entities = subject.get("entities")
+    condition = subject.get("condition")
+    if (
+        not _entity_selectors_equal(
+            entities,
+            _product_b_entity_selectors(settings),
+        )
+        or not isinstance(condition, dict)
+        or set(condition) != {"attrs", "notifyOnMetadataChange"}
+        or condition.get("attrs") != ["dateRetrieved"]
+        or condition.get("notifyOnMetadataChange") is not True
+    ):
+        return False
+
+    behavior_notification = _notification_behavior_fields(notification)
+    if behavior_notification is None or set(behavior_notification) not in (
+        {"http", "attrsFormat", "metadata"},
+        {"http", "attrsFormat", "metadata", "attrs"},
+    ):
+        return False
+
+    http = behavior_notification.get("http")
+    notification_matches = (
+        isinstance(http, dict)
+        and set(http) == {"url"}
         and http.get("url") == settings.comet_notify_url
-        and notification.get("attrsFormat") == "legacy"
-        and notification.get("metadata") == ["TimeInstant"]
-        and notification_attrs_match
+        and behavior_notification.get("attrsFormat") == "legacy"
+        and behavior_notification.get("metadata") == ["TimeInstant"]
+        and (
+            "attrs" not in behavior_notification
+            or behavior_notification.get("attrs") == []
+        )
     )
+    if not notification_matches:
+        return False
+    return _subscription_expiration_matches(settings.expires, subscription)
 
 
 def _is_product_a_subscription_candidate(
@@ -1100,84 +1175,24 @@ def _is_product_a_subscription_candidate(
     )
 
 
-def _has_exact_peer_shape(
+def _canonical_peer_entity_selectors(
     settings: StHSubscriptionSettings,
     peer_label: str,
-    subscription: Mapping[str, Any],
-) -> bool:
-    """Return whether a peer is current enough for selector disjointness."""
+    raw_selectors: Any,
+) -> tuple[Mapping[str, str], ...] | None:
+    """Return a peer's canonical selectors when the raw list is an exact match.
+
+    Peer notification behavior is intentionally irrelevant here: exact,
+    disjoint entity selectors alone prove that this product's writes cannot
+    trigger the peer.
+    """
     if peer_label == "Product A":
-        return _has_product_a_shape(settings, subscription)
-
-    expected_top_level = {
-        "id",
-        "status",
-        "description",
-        "subject",
-        "notification",
-    }
-    if settings.expires:
-        expected_top_level.add("expires")
-    if set(subscription) != expected_top_level:
-        return False
-    description = subscription.get("description")
-    if (
-        subscription.get("status") != "active"
-        or not isinstance(description, str)
-        or not description.startswith(_PRODUCT_B_DESCRIPTION_PREFIX)
-    ):
-        return False
-
-    subject = subscription.get("subject")
-    notification = subscription.get("notification")
-    if not isinstance(subject, dict) or not isinstance(notification, dict):
-        return False
-    if set(subject) != {"entities", "condition"}:
-        return False
-
-    entities = subject.get("entities")
-    condition = subject.get("condition")
-    if (
-        not isinstance(entities, list)
-        or len(entities) != 1
-        or not isinstance(entities[0], dict)
-        or set(entities[0]) != {"id", "type"}
-        or not all(
-            isinstance(entities[0].get(key), str) and bool(entities[0][key])
-            for key in ("id", "type")
-        )
-        or not isinstance(condition, dict)
-        or set(condition) != {"attrs", "notifyOnMetadataChange"}
-        or condition.get("attrs") != ["dateRetrieved"]
-        or condition.get("notifyOnMetadataChange") is not True
-    ):
-        return False
-
-    behavior_notification = {
-        key: value
-        for key, value in notification.items()
-        if key not in _NOTIFICATION_RUNTIME_FIELDS
-    }
-    if set(behavior_notification) not in (
-        {"http", "attrsFormat", "metadata"},
-        {"http", "attrsFormat", "metadata", "attrs"},
-    ):
-        return False
-    http = behavior_notification.get("http")
-    notification_matches = (
-        isinstance(http, dict)
-        and set(http) == {"url"}
-        and http.get("url") == settings.comet_notify_url
-        and behavior_notification.get("attrsFormat") == "legacy"
-        and behavior_notification.get("metadata") == ["TimeInstant"]
-        and (
-            "attrs" not in behavior_notification
-            or behavior_notification.get("attrs") == []
-        )
-    )
-    if not notification_matches:
-        return False
-    return _subscription_expiration_matches(settings.expires, subscription)
+        expected = _product_a_entity_selectors(settings)
+    elif peer_label == "Product B":
+        expected = _product_b_entity_selectors(settings)
+    else:
+        return None
+    return expected if _entity_selectors_equal(raw_selectors, expected) else None
 
 
 def _has_product_a_shape(
@@ -1231,12 +1246,8 @@ def _has_product_a_shape(
     ):
         return False
 
-    behavior_notification = {
-        key: value
-        for key, value in notification.items()
-        if key not in _NOTIFICATION_RUNTIME_FIELDS
-    }
-    if set(behavior_notification) != {
+    behavior_notification = _notification_behavior_fields(notification)
+    if behavior_notification is None or set(behavior_notification) != {
         "http",
         "attrsFormat",
         "attrs",

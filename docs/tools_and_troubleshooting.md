@@ -81,7 +81,9 @@ uv run python scripts/create_sth_subscriptions.py [--product a|b|all] [--send] [
 Reads `COMET_NOTIFY_URL` from `.env`. Dry-run prints the proposed bodies without
 contacting FIWARE. In live send mode, the creator inventories existing
 subscriptions and skips only an exact current shape. A description prefix alone
-is not an idempotency match.
+is not an idempotency match. Orion's omitted and literal-`false`
+`notification.onlyChangedAttrs` / `notification.covered` representations are
+equivalent; `true` remains behavior-changing drift.
 
 > **Ordering matters.** Create subscriptions before the first live
 > attribute-update POST (see deployment.md §6). `skipInitialNotification`
@@ -132,8 +134,10 @@ reviewed target.
 
 The creator also fails fast if a peer-product subscription has an unsafe
 overlapping trigger. The exact current Product A and Product B selectors are
-disjoint, so their shared `dateRetrieved` name is safe. A recognized stale peer
-that cannot prove that separation must be removed before creation proceeds.
+disjoint, so their shared `dateRetrieved` name is safe. This separation depends
+on exact selector canonicality, not the peer's notification behavior. A peer
+with a broad, malformed, typeless, or otherwise non-canonical selector cannot
+prove that separation and must be removed before creation proceeds.
 
 ---
 

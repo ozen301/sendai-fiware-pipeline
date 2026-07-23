@@ -920,6 +920,20 @@ Shape matching also requires the new description prefix and the configured
 notification URL; an old per-place Product B subscription or a subscription
 routed to a stale URL is not a match.
 
+For both products, Orion may materialize omitted
+`notification.onlyChangedAttrs` and `notification.covered` defaults as
+`false` in a GET response. The matchers treat omission and literal `false` as
+equivalent, while `true` or a non-Boolean value remains behavior-changing
+drift. Server-managed delivery timestamps and counters are likewise excluded
+from behavior matching.
+
+The cross-product guard treats a shared trigger attribute as safe only when the
+peer's entity selectors exactly equal that product's configured current
+selectors and those selectors are disjoint from the product being created.
+This proof depends only on the selectors: unrelated notification drift does
+not make disjoint entities reachable. A missing type, type pattern, malformed
+selector, or other non-canonical selector fails closed.
+
 Subscription creation keeps `options=skipInitialNotification` when
 `STH_SUBSCRIPTION_SKIP_INITIAL=true`. The body contains no `throttling` field.
 

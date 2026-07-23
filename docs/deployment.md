@@ -159,7 +159,11 @@ current subscription only when its Orion response has the exact behavior
 required by the product contract. For Product A, a recognized same-product
 subscription with a stale selector, trigger, projection, notification setting,
 status, or expiration causes a safe failure. The creator reports its id and
-does not replace it or create a second Product A subscription.
+does not replace it or create a second Product A subscription. Orion GET
+responses may include server-managed delivery telemetry and may echo omitted
+`onlyChangedAttrs` / `covered` defaults as `false`; those representation
+differences do not make a current subscription stale, while either field set to
+`true` does.
 
 Confirm the result with [`show_subscriptions.py`](tools_and_troubleshooting.md#show_subscriptionspy),
 a read-only listing of what is on the broker — check that Product A has exactly

@@ -14,6 +14,7 @@ from sendai_pipeline.sth_subscriptions import (
     StHSubscriptionError,
     StHSubscriptionResult,
     StHSubscriptionSettings,
+    _entity_selector_pair_may_overlap,
     build_product_a_subscription_body,
     build_product_b_subscription_body,
     create_product_a_sth_subscription,
@@ -191,7 +192,14 @@ def product_b_subscription(
         "notification": {
             "http": {"url": notify_url},
             "attrsFormat": "legacy",
+            "attrs": [],
             "metadata": ["TimeInstant"],
+            "onlyChangedAttrs": False,
+            "covered": False,
+            "timesSent": 9,
+            "lastNotification": "2026-07-24T00:00:01.000Z",
+            "lastSuccess": "2026-07-24T00:00:01.000Z",
+            "lastSuccessCode": 200,
         },
     }
 
@@ -226,6 +234,9 @@ def product_a_get_subscription(
             "lastNotification": "2026-07-23T00:00:01.000Z",
             "timesSent": 17,
             "lastSuccess": "2026-07-23T00:00:01.000Z",
+            "lastSuccessCode": 200,
+            "onlyChangedAttrs": False,
+            "covered": False,
         },
     }
     if expires is not None:
@@ -549,6 +560,9 @@ def test_create_product_a_subscription_skips_representative_orion_get_shape() ->
         "lastNotification",
         "timesSent",
         "lastSuccess",
+        "lastSuccessCode",
+        "onlyChangedAttrs",
+        "covered",
     } <= existing["notification"].keys()
     assert result.skipped == 1
     assert result.failed == 0
@@ -574,6 +588,51 @@ def test_create_product_a_subscription_skips_exact_shape_with_fails_counter() ->
     assert result.skipped == 1
     assert result.failed == 0
     assert result.subscription_ids == ("shape-sub",)
+    assert fake_session.posts == []
+
+
+@pytest.mark.parametrize("field", ["onlyChangedAttrs", "covered"])
+def test_create_product_a_subscription_skips_when_false_default_is_omitted(
+    field: str,
+) -> None:
+    existing = product_a_get_subscription(subscription_id=f"omitted-{field}")
+    existing["notification"].pop(field)
+    fake_session = FakeSession(get_responses=[FakeResponse(200, json_body=[existing])])
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False, expires="2030-01-01T09:00:00+09:00"),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.skipped == 1
+    assert result.failed == 0
+    assert result.subscription_ids == (f"omitted-{field}",)
+    assert fake_session.posts == []
+
+
+@pytest.mark.parametrize("field", ["onlyChangedAttrs", "covered"])
+def test_create_product_a_subscription_rejects_enabled_notification_default(
+    field: str,
+) -> None:
+    stale = product_a_get_subscription(subscription_id=f"enabled-{field}")
+    stale["notification"][field] = True
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[stale])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T00:00:00Z",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == (f"enabled-{field}",)
     assert fake_session.posts == []
 
 
@@ -1143,6 +1202,29 @@ def test_create_product_b_unaffected_by_product_a_peer_with_fails_counter() -> N
     assert result.subscription_ids == ("sub-b",)
 
 
+def test_create_product_b_ignores_disjoint_product_a_with_notification_drift() -> None:
+    existing_product_a = product_a_get_subscription(
+        subscription_id="existing-product-a",
+        expires=None,
+    )
+    existing_product_a["notification"]["covered"] = True
+    fake_session = FakeSession(
+        post_responses=[
+            FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-b"}),
+        ],
+        get_responses=[FakeResponse(200, json_body=[existing_product_a])],
+    )
+
+    result = create_product_b_sth_subscription(
+        settings=settings(dry_run=False),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.created == 1
+    assert result.subscription_ids == ("sub-b",)
+
+
 def test_create_product_a_ignores_legacy_product_b_subscription() -> None:
     fake_session = FakeSession(
         post_responses=[
@@ -1202,7 +1284,11 @@ def test_create_product_a_ignores_exact_product_b_despite_shared_date_retrieved(
     )
 
     result = create_product_a_sth_subscription(
-        settings=settings(dry_run=False),
+        settings=settings(
+            dry_run=False,
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
         auth=FakeAuth(),
         session=fake_session,
     )
@@ -1213,6 +1299,30 @@ def test_create_product_a_ignores_exact_product_b_despite_shared_date_retrieved(
     assert "dateRetrieved" in PRODUCT_A_ATTRS
 
 
+def test_create_product_a_ignores_disjoint_product_b_with_notification_drift() -> None:
+    existing_product_b = product_b_subscription()
+    existing_product_b["notification"]["onlyChangedAttrs"] = True
+    fake_session = FakeSession(
+        post_responses=[
+            FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-a"})
+        ],
+        get_responses=[FakeResponse(200, json_body=[existing_product_b])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            product_b_aggregate_entity_id=AGGREGATE_ENTITY_ID,
+            product_b_aggregate_entity_type=AGGREGATE_ENTITY_TYPE,
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.created == 1
+    assert result.subscription_ids == ("sub-a",)
+
+
 def test_create_product_b_subscription_skips_complete_shape_with_exact_url() -> None:
     result, fake_session = create_product_b_with_existing(product_b_subscription())
 
@@ -1221,15 +1331,42 @@ def test_create_product_b_subscription_skips_complete_shape_with_exact_url() -> 
     assert fake_session.posts == []
 
 
-def test_create_product_b_subscription_skips_when_notification_attrs_empty() -> None:
+def test_create_product_b_subscription_skips_when_notification_attrs_omitted() -> None:
     existing = product_b_subscription()
-    existing["notification"]["attrs"] = []
+    existing["notification"].pop("attrs")
 
     result, fake_session = create_product_b_with_existing(existing)
 
     assert result.skipped == 1
     assert result.subscription_ids == ("aggregate-sub",)
     assert fake_session.posts == []
+
+
+def test_create_product_b_subscription_skips_when_false_defaults_are_omitted() -> None:
+    existing = product_b_subscription()
+    existing["notification"].pop("onlyChangedAttrs")
+    existing["notification"].pop("covered")
+
+    result, fake_session = create_product_b_with_existing(existing)
+
+    assert result.skipped == 1
+    assert result.subscription_ids == ("aggregate-sub",)
+    assert fake_session.posts == []
+
+
+@pytest.mark.parametrize("field", ["onlyChangedAttrs", "covered"])
+def test_create_product_b_subscription_creates_when_notification_default_enabled(
+    field: str,
+) -> None:
+    existing = product_b_subscription()
+    existing["notification"][field] = True
+
+    result, fake_session = create_product_b_with_existing(existing)
+
+    assert result.created == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == ("correct-sub",)
+    assert len(fake_session.posts) == 1
 
 
 @pytest.mark.parametrize(
@@ -1621,6 +1758,13 @@ def test_product_b_trigger_shares_date_retrieved_with_product_a_by_design() -> N
     assert "dateRetrieved" in PRODUCT_A_TRIGGER_ATTRS
     assert "dateRetrieved" in PRODUCT_A_HISTORY_ATTRS
     assert set(trigger_attrs) <= set(PRODUCT_A_HISTORY_ATTRS)
+
+
+def test_entity_selector_pair_treats_typeless_selector_as_may_overlap() -> None:
+    assert _entity_selector_pair_may_overlap(
+        {"id": AGGREGATE_ENTITY_ID},
+        {"idPattern": ".*", "type": "Blesensor.per300"},
+    )
 
 
 def test_sth_subscription_logging_extras_are_allowed() -> None:
