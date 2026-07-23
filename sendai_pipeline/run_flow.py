@@ -522,6 +522,7 @@ def _process_interval(
                 interval_metadata=interval_metadata,
                 expected_target_ids=(),
                 counts=counts,
+                transformed_at=run_started_at,
             )
         else:
             _process_dry_run_window(
@@ -530,6 +531,7 @@ def _process_interval(
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata,
                 counts=counts,
+                transformed_at=run_started_at,
             )
 
     if settings.send_mode == "send":
@@ -544,6 +546,7 @@ def _process_interval(
             cutoff=cutoff,
             normal_lower_bound=normal_lower_bound,
             counts=counts,
+            transformed_at=run_started_at,
         )
         _log_windows_near_retry_horizon(
             state_store,
@@ -566,6 +569,7 @@ def _process_send_window(
     interval_metadata: Mapping[tuple[int, int], SensorPlace],
     expected_target_ids: Iterable[str],
     counts: _RunCounts,
+    transformed_at: datetime,
     force_resend: bool = False,
     skip_if_no_new_target: bool = False,
     persist_each_target: bool = True,
@@ -583,6 +587,7 @@ def _process_send_window(
     payloads = transform_flow_rows(
         rows_for_window,
         interval_metadata,
+        transformed_at=transformed_at,
         ignored_place_prefixes=filter_settings.ignored_place_prefixes,
     )
     observed_target_ids = _payload_target_ids(payloads)
@@ -691,6 +696,7 @@ def _process_supplemental_complete_windows(
     cutoff: datetime,
     normal_lower_bound: datetime,
     counts: _RunCounts,
+    transformed_at: datetime,
 ) -> None:
     """Re-query retained complete windows older than the normal source range."""
     prefix = f"{_INTERVAL_PREFIXES[interval_min]}/"
@@ -728,6 +734,7 @@ def _process_supplemental_complete_windows(
             interval_metadata=interval_metadata,
             expected_target_ids=(),
             counts=counts,
+            transformed_at=transformed_at,
             skip_if_no_new_target=True,
         )
         if attempted:
@@ -931,6 +938,7 @@ def _process_revision_sweep(
                 interval_metadata=interval_metadata_by_interval[item.interval_min],
                 expected_target_ids=(),
                 counts=counts,
+                transformed_at=run_started_at,
             )
         else:
             _process_dry_run_window(
@@ -939,6 +947,7 @@ def _process_revision_sweep(
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata_by_interval[item.interval_min],
                 counts=counts,
+                transformed_at=run_started_at,
             )
 
     if settings.send_mode == "send":
@@ -1144,6 +1153,7 @@ def _process_dry_run_window(
     filter_settings: FilterSettings,
     interval_metadata: Mapping[tuple[int, int], SensorPlace],
     counts: _RunCounts,
+    transformed_at: datetime,
 ) -> None:
     """Build and log payloads for one source window without sending live POSTs.
 
@@ -1153,6 +1163,7 @@ def _process_dry_run_window(
     payloads = transform_flow_rows(
         rows_for_window,
         interval_metadata,
+        transformed_at=transformed_at,
         ignored_place_prefixes=filter_settings.ignored_place_prefixes,
     )
     counts.rows_dropped += len(rows_for_window) - len(payloads)
@@ -1334,19 +1345,20 @@ def _metadata_index_for_interval(
 
 
 def _attrs_sha256(attrs: Mapping[str, Any]) -> str:
-    """Return the canonical SHA-256 hash of a serialized NGSI attribute dict.
+    """Return the Product A semantic SHA-256 hash.
 
-    Uses ``sort_keys=True`` + ``separators=(",", ":")`` so two equivalent
-    attribute dicts always produce the same hash regardless of key insertion
-    order.  Flow attributes do not contain a per-run wall-clock timestamp, so
-    the entire ``attrs`` dict is hashed directly — unlike Product B, no keys
-    need to be excluded.  If envelope fields that change every run (e.g. a
-    ``dateRetrieved`` timestamp) are ever added to flow payloads, they must be
-    excluded from ``attrs`` before hashing, or the skip-on-unchanged
-    optimization would never fire.  See ``run_direction._attrs_sha256`` for the
-    matching pattern in Product B, which does exclude ``dateRetrieved``.
+    The canonical serialization excludes only the top-level
+    ``dateRetrieved`` attribute because it is the per-run wall-clock value.
+    All other Product A attributes remain part of the hash.  A shallow copy
+    keeps the outgoing payload unchanged.
     """
-    body = json.dumps(attrs, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    semantic_attrs = dict(attrs)
+    semantic_attrs.pop("dateRetrieved", None)
+    body = json.dumps(
+        semantic_attrs,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
     return hashlib.sha256(body).hexdigest()
 
 

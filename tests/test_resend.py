@@ -676,6 +676,7 @@ def test_resend_flow_place_filter_posts_requested_target_but_preserves_stored_ex
             "flow_gt_m120": 430,
             "stay_gt_m60": 0.2,
             "stay_gt_m80": 40.9,
+            "stay_gt_m120": 80.1,
             "imputation_tier": 0,
         }
     ]
@@ -772,6 +773,45 @@ def test_resend_forwards_persist_each_target_false_flow(
     assert calls[0].persist_each_target is False
 
 
+def test_resend_flow_reuses_run_started_at_for_every_payload_seam(
+    tmp_path: Path,
+    metadata_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resend = _resend_module()
+    run_started_at = datetime(
+        2026,
+        6,
+        20,
+        12,
+        34,
+        56,
+        987654,
+        tzinfo=run_direction.JST,
+    )
+    _freeze_resend_now(monkeypatch, resend, run_started_at)
+    _patch_basic_environment(monkeypatch, tmp_path, metadata_path)
+    _patch_send_dependencies(monkeypatch, resend)
+    calls: list[ProcessCall] = []
+    _patch_process_windows(monkeypatch, resend, calls)
+
+    result = _call_main(
+        resend,
+        _base_args(
+            send=True,
+            from_window="20260524_1000",
+            to_window="20260524_1200",
+        )
+        + ["--force"],
+    )
+
+    assert result == 0
+    assert len(calls) == 3
+    assert {call.transformed_at for call in calls} == {run_started_at}
+    assert all(call.force_resend is True for call in calls)
+    assert all(call.persist_each_target is False for call in calls)
+
+
 def test_resend_direction_omits_legacy_per_target_arguments(
     tmp_path: Path,
     metadata_path: Path,
@@ -847,6 +887,7 @@ def test_resend_real_path_not_per_target(
             "flow_gt_m120": 430,
             "stay_gt_m60": 0.2,
             "stay_gt_m80": 40.9,
+            "stay_gt_m120": 80.1,
             "imputation_tier": 0,
         },
         {
@@ -859,6 +900,7 @@ def test_resend_real_path_not_per_target(
             "flow_gt_m120": 431,
             "stay_gt_m60": 0.3,
             "stay_gt_m80": 41.9,
+            "stay_gt_m120": 81.1,
             "imputation_tier": 0,
         },
     ]
@@ -895,6 +937,9 @@ def test_resend_real_path_not_per_target(
 
     assert result == 0
     assert [call["entity_id"] for call in orion.calls] == [ENTITY_10, ENTITY_11]
+    assert {call["attrs"]["dateRetrieved"]["value"] for call in orion.calls} == {
+        "2026-06-20T12:00:00+09:00"
+    }
     assert save_count == 1
     window = json.loads((tmp_path / "state" / "flow.json").read_text(encoding="utf-8"))[
         "windows"
@@ -1649,6 +1694,7 @@ def test_resend_gc_reclaims_just_resent_old_window(
             "flow_gt_m120": 430,
             "stay_gt_m60": 0.2,
             "stay_gt_m80": 40.9,
+            "stay_gt_m120": 80.1,
             "imputation_tier": 0,
         },
         {
@@ -1661,6 +1707,7 @@ def test_resend_gc_reclaims_just_resent_old_window(
             "flow_gt_m120": 431,
             "stay_gt_m60": 0.3,
             "stay_gt_m80": 41.9,
+            "stay_gt_m120": 81.1,
             "imputation_tier": 0,
         },
     ]
@@ -2238,6 +2285,7 @@ def test_resend_preflight_allows_range_with_no_dead_letter(
             "flow_gt_m120": 430,
             "stay_gt_m60": 0.2,
             "stay_gt_m80": 40.9,
+            "stay_gt_m120": 80.1,
             "imputation_tier": 0,
         }
     ]

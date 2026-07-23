@@ -257,6 +257,21 @@ def test_update_attrs_posts_canonical_body_to_entity_attrs_endpoint() -> None:
     assert auth.calls == [False]
 
 
+def test_update_attrs_product_a_request_omits_forced_update_option() -> None:
+    session = FakeSession([FakeResponse(204)])
+    client = make_client(session)
+
+    client.update_attrs(
+        "jp.sendai.Blesensor.per3600.10",
+        "Blesensor.per3600",
+        sample_attrs(),
+    )
+
+    [call] = session.calls
+    assert "options=forcedUpdate" not in call["url"]
+    assert call.get("params", {}).get("options") != "forcedUpdate"
+
+
 def test_update_attrs_omits_type_query_and_empty_service_header() -> None:
     session = FakeSession([FakeResponse(204)])
     client = make_client(session, settings=make_settings(service=""))

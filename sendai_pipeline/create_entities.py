@@ -24,16 +24,6 @@ logger = logging.getLogger(__name__)
 
 _ALREADY_EXISTS_STATUSES: frozenset[int] = frozenset({409, 422})
 
-_SEED_ATTRS: dict[str, dict[str, Any]] = {
-    "dateObservedFrom": {"type": "DateTime", "value": None},
-    "dateObservedTo": {"type": "DateTime", "value": None},
-    "peopleCount_immedate": {"type": "number", "value": None},
-    "peopleCount_near": {"type": "number", "value": None},
-    "peopleCount_far": {"type": "number", "value": None},
-    "peopleOccupancy_immedate": {"type": "number", "value": None},
-    "peopleOccupancy_near": {"type": "number", "value": None},
-}
-
 
 class CreateEntitiesError(RuntimeError):
     """Raised when create-entities configuration or input is invalid."""
@@ -282,9 +272,7 @@ def create_entities(
 
 def _entity_body(spec: EntitySpec) -> dict[str, Any]:
     """Build the NGSI v2 entity creation body for one entity spec."""
-    body: dict[str, Any] = {"id": spec.entity_id, "type": spec.entity_type}
-    body.update(_SEED_ATTRS)
-    return body
+    return {"id": spec.entity_id, "type": spec.entity_type}
 
 
 def _headers(token: str, settings: CreateEntitiesSettings) -> dict[str, str]:

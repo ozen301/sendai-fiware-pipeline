@@ -60,7 +60,7 @@ Sample row, truncated:
 id=1, startdate='20260315_1551', group_place_id='sendai2023.10',
 chip_id='30EDA00AFBCC', device_type='M5Stack', interval_min=1,
 flow_gt_m60=6, flow_gt_m80=237, flow_gt_m120=430,
-stay_gt_m60=0.2, stay_gt_m80=40.9, ...
+stay_gt_m60=0.2, stay_gt_m80=40.9, stay_gt_m120=...
 ```
 
 ## Product B -- `direction_metrics2_per_place2_agg`

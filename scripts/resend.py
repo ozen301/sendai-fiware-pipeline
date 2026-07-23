@@ -594,6 +594,7 @@ def _process_window(
             interval_metadata=plan.interval_metadata,
             expected_target_ids=plan.expected_target_ids,
             counts=counts,
+            transformed_at=transformed_at,
             force_resend=plan.force,
             persist_each_target=False,
         )

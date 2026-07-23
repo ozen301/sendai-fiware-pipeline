@@ -58,13 +58,23 @@ where this lives in the code).
 
 Product A entity IDs, entity types, install batches, expected device types, and
 the required `identifcation` column are loaded from `metadata/sensors.csv`.
-The column's per-place value is not emitted in any payload: Product A does not
-write an `identifcation` attribute, and Product B sets the aggregate
-`identifcation` value to `PRODUCT_B_AGGREGATE_ENTITY_ID`. The pipeline reads
-this file at startup and does not reconstruct Product A entity ids or types
-from a pattern. Product B also uses the metadata for source eligibility and
-device-type selection, but its single aggregate target comes from
-`PRODUCT_B_AGGREGATE_ENTITY_ID` and `PRODUCT_B_AGGREGATE_ENTITY_TYPE` (§4).
+Product A writes an `identifcation` attribute whose value is the exact
+metadata-selected `entity_id` used in that payload's Orion request URL, for
+example `jp.sendai.Blesensor.per3600.1000`. It does not use the CSV column also
+named `identifcation`; that legacy column's per-place values may be bare place
+numbers. Product B sets the aggregate `identifcation` value to
+`PRODUCT_B_AGGREGATE_ENTITY_ID`. The pipeline reads this file at startup and
+does not reconstruct Product A entity ids or types from a pattern. Product B
+also uses the metadata for source eligibility and device-type selection, but
+its single aggregate target comes from `PRODUCT_B_AGGREGATE_ENTITY_ID` and
+`PRODUCT_B_AGGREGATE_ENTITY_TYPE` (§4).
+
+Product A exclusively owns product data on the per-sensor `Blesensor.per300`
+and `Blesensor.per3600` entities, while Product B exclusively owns product data
+on its configured aggregate entity. Descriptive sensor attributes such as
+`latitude`, `longitude`, `locationName`, and `status` may coexist with Product A
+data on sensor entities. Bare legacy Product B `peopleCount_flow` may not
+coexist there.
 
 Orion entity queries only validate non-blockingly that configured targets
 exist. A missing entity is logged, but the configured target remains
@@ -166,19 +176,17 @@ and create mixed-type history in STH-Comet.
 | `dateObservedFrom`, `dateObservedTo`, `dateRetrieved` | `DateTime` |
 | `identifcation` | `Text` |
 | `peopleCount_immedate`, `peopleCount_near`, `peopleCount_far` | `"number"` (lowercase string) |
-| `peopleOccupancy_immedate`, `peopleOccupancy_near` | `"number"` (lowercase string) |
+| `peopleOccupancy_immedate`, `peopleOccupancy_near`, `peopleOccupancy_far` | `"number"` (lowercase string) |
 | historical bare `peopleCount_flow` | `StructuredValue` |
 
-The `immedate` spelling is intentional. The live Sendai entities
-already used that attribute name before this pipeline, so the pipeline
-keeps it for compatibility instead of renaming it to `immediate`.
+The `identifcation` and `immedate` spellings are intentional. The live Sendai
+entities already used these names before this pipeline, so the pipeline keeps
+them for compatibility instead of renaming them.
 
 > Verified 2026-05-23 against the live broker for `Blesensor.per3600.*`
-> and `Blesensor.per300.*` entities. Live entities also carry a
-> `peopleOccupancy_far` attribute (also `"number"`); Product A does not
-> write it because the source has no matching column, and NGSI
-> `POST .../attrs` is append/update, so leaving it out keeps the
-> existing value undisturbed.
+> and `Blesensor.per300.*` entities. Their `peopleOccupancy_far` attribute
+> uses `"number"`; Product A preserves that existing type when mapping
+> `stay_gt_m120`.
 
 ### 2.6 TimeInstant metadata
 
@@ -210,12 +218,17 @@ the row is absent, the place-number key is absent. Product B never uses a null
 matrix or invents a `0` for an unrecorded movement involving a place whose
 totals are incomplete.
 
-### 2.8 Time zone
+### 2.8 Time zone and retrieval timestamp
 
 All `DateTime` values are explicit JST (`+09:00`). NTP sync is required
 on the pipeline host. Orion v2 rejects sub-second precision in
 DateTime values; the pipeline truncates to whole seconds before
 emitting.
+
+Each top-level Product A run or resend captures one retrieval timestamp at its
+invocation boundary, normalizes it to JST, and truncates it to whole seconds.
+That timestamp becomes `dateRetrieved` and is reused across every Product A
+payload and every HTTP retry in the invocation.
 
 ### 2.9 Idempotency
 
@@ -230,6 +243,11 @@ recorded `ok`. Product A unions that set from the targets actually observed
 (§3.2). Product B has exactly one expected target, the configured aggregate
 entity (§4). A Product B attempt that produces no aggregate payload records no
 window state.
+
+Product A's semantic hash excludes only the top-level `dateRetrieved` attribute
+and includes the other nine §3.3 attributes. The stable `identifcation` and
+`peopleOccupancy_far` values remain in the hash, so a new retrieval timestamp
+alone does not cause another POST.
 
 Once STH-Comet subscriptions are enabled, a drift or revision write appends a
 corrective history row instead of replacing the old row. For Product B, the
@@ -314,7 +332,7 @@ Load-bearing columns:
 | `aggregated_at` | DB-stamped timestamp (`DEFAULT` / `ON UPDATE CURRENT_TIMESTAMP`) that moves on every insert or revision. The revision sweep uses it to discover changed `(interval_min, startdate)` windows. |
 | `imputation_tier` | Product A source-quality gate; only rows at or below `SOURCE_MAX_IMPUTATION_TIER` are read. |
 | `flow_gt_m60`, `flow_gt_m80`, `flow_gt_m120` | Count attributes. |
-| `stay_gt_m60`, `stay_gt_m80` | Occupancy attributes. |
+| `stay_gt_m60`, `stay_gt_m80`, `stay_gt_m120` | Nullable occupancy attributes (`decimal(10,1)`). |
 
 The source uniquely identifies rows by
 `(startdate, group_place_id, device_type, interval_min)`.
@@ -370,15 +388,83 @@ recomputes status, and drops windows that recorded no targets.
 |---|---|---|
 | `dateObservedFrom` | `DateTime` | `startdate` parsed as JST → ISO 8601 (`YYYY-MM-DDTHH:MM:00+09:00`) |
 | `dateObservedTo` | `DateTime` | `dateObservedFrom + interval_min` minutes |
+| `dateRetrieved` | `DateTime` | Run-level retrieval timestamp from §2.8 |
+| `identifcation` | `Text` | Exact metadata-selected `entity_id` used in the request URL |
 | `peopleCount_immedate` | `number` | `flow_gt_m60` |
 | `peopleCount_near` | `number` | `flow_gt_m80` |
 | `peopleCount_far` | `number` | `flow_gt_m120` |
-| `peopleOccupancy_immedate` | `number` | `stay_gt_m60` |
-| `peopleOccupancy_near` | `number` | `stay_gt_m80` |
+| `peopleOccupancy_immedate` | `number` | Nullable `stay_gt_m60` converted to `float` |
+| `peopleOccupancy_near` | `number` | Nullable `stay_gt_m80` converted to `float` |
+| `peopleOccupancy_far` | `number` | Nullable `stay_gt_m120` converted to `float` |
 
 The same column names (`flow_gt_mXX`, `stay_gt_mXX`) are used for both
 5-min and 60-min rows; the interval is carried by the row's
 `interval_min` column, not the column name.
+
+For the occupancy attributes, source `null` becomes JSON `null`, while source
+zero becomes `0.0`; no observation and observed zero remain distinct. Every
+attribute in the ten-attribute payload carries `TimeInstant` metadata whose
+value is `dateObservedFrom`, as specified in §2.6.
+
+For example, a 60-minute row for the metadata-selected entity
+`jp.sendai.Blesensor.per3600.1000` produces this request body. The retrieval
+timestamp is shared by all Product A payloads and retries in the invocation;
+the `TimeInstant` on every attribute remains the source-window start.
+
+```json
+{
+  "dateObservedFrom": {
+    "type": "DateTime",
+    "value": "2026-03-15T15:00:00+09:00",
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "dateObservedTo": {
+    "type": "DateTime",
+    "value": "2026-03-15T16:00:00+09:00",
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "dateRetrieved": {
+    "type": "DateTime",
+    "value": "2026-07-23T09:12:34+09:00",
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "identifcation": {
+    "type": "Text",
+    "value": "jp.sendai.Blesensor.per3600.1000",
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "peopleCount_immedate": {
+    "type": "number",
+    "value": 6,
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "peopleCount_near": {
+    "type": "number",
+    "value": 237,
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "peopleCount_far": {
+    "type": "number",
+    "value": 430,
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "peopleOccupancy_immedate": {
+    "type": "number",
+    "value": 0.2,
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "peopleOccupancy_near": {
+    "type": "number",
+    "value": null,
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  },
+  "peopleOccupancy_far": {
+    "type": "number",
+    "value": 0.0,
+    "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-03-15T15:00:00+09:00"}}
+  }
+}
+```
 
 ---
 
@@ -715,6 +801,16 @@ PUT {url_orion_v20_entities}/{PRODUCT_B_AGGREGATE_ENTITY_ID}/attrs
     ?type={PRODUCT_B_AGGREGATE_ENTITY_TYPE}
 ```
 
+When a Product A sensor entity or the Product B aggregate entity must be
+created, its creation body is exactly the bare identity:
+
+```json
+{"id": "<entity_id>", "type": "<entity_type>"}
+```
+
+The creation body seeds no attributes. The first successful publication by the
+owning product establishes that entity's product-owned attributes.
+
 Product B dry-run output shows this `PUT /attrs` operation and its full
 aggregate body without mutating Orion.
 
@@ -727,10 +823,66 @@ necessarily the newest source window. A revision write for an older window can
 remain current until another write occurs. Consumers must use
 `dateObservedFrom` and `dateObservedTo` to identify the represented window.
 
+### Product A STH-Comet subscription
+
 Product A keeps one subscription selecting `idPattern: ".*"` for
-`Blesensor.per300` and `Blesensor.per3600`, triggering on
-`peopleCount_immedate`, projecting the §3.3 attributes in legacy format, and
-requesting `TimeInstant` metadata with metadata-change notifications enabled.
+`Blesensor.per300` and `Blesensor.per3600`. Both its projection and trigger use
+the same ten-attribute list from §3.3:
+
+```json
+{
+  "subject": {
+    "entities": [
+      {"idPattern": ".*", "type": "Blesensor.per300"},
+      {"idPattern": ".*", "type": "Blesensor.per3600"}
+    ],
+    "condition": {
+      "attrs": [
+        "dateObservedFrom",
+        "dateObservedTo",
+        "dateRetrieved",
+        "identifcation",
+        "peopleCount_immedate",
+        "peopleCount_near",
+        "peopleCount_far",
+        "peopleOccupancy_immedate",
+        "peopleOccupancy_near",
+        "peopleOccupancy_far"
+      ],
+      "notifyOnMetadataChange": true
+    }
+  },
+  "notification": {
+    "http": {"url": "<COMET_NOTIFY_URL>"},
+    "attrs": [
+      "dateObservedFrom",
+      "dateObservedTo",
+      "dateRetrieved",
+      "identifcation",
+      "peopleCount_immedate",
+      "peopleCount_near",
+      "peopleCount_far",
+      "peopleOccupancy_immedate",
+      "peopleOccupancy_near",
+      "peopleOccupancy_far"
+    ],
+    "attrsFormat": "legacy",
+    "metadata": ["TimeInstant"]
+  }
+}
+```
+
+Subscription creation uses `options=skipInitialNotification` when
+`STH_SUBSCRIPTION_SKIP_INITIAL=true`. Because `condition.attrs` lists all ten
+projected attributes, a semantic correction to any one of them — for example a
+same-window change to only `peopleOccupancy_near` — triggers a Comet
+notification. Because all ten attributes carry the source-window `TimeInstant`,
+Comet indexes every projected attribute at that window's start.
+
+The subscription body does not set `alterationTypes: ["entityUpdate"]`, and
+Product A write requests do not use `options=forcedUpdate`. The contract is one
+notification for each semantic Product A payload change, not one notification
+for each wire attempt. An identical retry does not append duplicate history.
 
 ### Product B STH-Comet subscription
 

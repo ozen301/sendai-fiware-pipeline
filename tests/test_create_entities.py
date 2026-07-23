@@ -251,70 +251,33 @@ def test_post_no_fiware_service_header_when_empty() -> None:
     assert "Fiware-Service" not in session.calls[0]["headers"]
 
 
-def test_entity_body_has_id_type_and_all_attributes() -> None:
+@pytest.mark.parametrize(
+    ("entity_id", "entity_type"),
+    [
+        (
+            "jp.sendai.Blesensor.per3600.101",
+            "Blesensor.per3600",
+        ),
+        (
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+        ),
+    ],
+    ids=["product-a", "product-b"],
+)
+def test_entity_body_contains_only_bare_identity_for_each_product(
+    entity_id: str,
+    entity_type: str,
+) -> None:
     session = FakeSession([FakeResponse(201)])
-    settings = _settings(
-        entities=(EntitySpec("jp.sendai.Blesensor.per3600.101", "Blesensor.per3600"),)
-    )
+    settings = _settings(entities=(EntitySpec(entity_id, entity_type),))
 
     create_entities(
         settings.entities, settings=settings, auth=FakeAuth(), session=session
     )
 
     body = json.loads(session.calls[0]["data"])
-    assert body["id"] == "jp.sendai.Blesensor.per3600.101"
-    assert body["type"] == "Blesensor.per3600"
-    expected_attrs = {
-        "dateObservedFrom",
-        "dateObservedTo",
-        "peopleCount_immedate",
-        "peopleCount_near",
-        "peopleCount_far",
-        "peopleOccupancy_immedate",
-        "peopleOccupancy_near",
-    }
-    assert expected_attrs.issubset(body.keys())
-
-
-def test_entity_attribute_types_correct() -> None:
-    session = FakeSession([FakeResponse(201)])
-    settings = _settings()
-
-    create_entities(
-        settings.entities,
-        settings=settings,
-        auth=FakeAuth(),
-        session=session,
-    )
-
-    body = json.loads(session.calls[0]["data"])
-    assert body["dateObservedFrom"]["type"] == "DateTime"
-    assert body["dateObservedTo"]["type"] == "DateTime"
-    assert body["peopleCount_immedate"]["type"] == "number"
-    assert body["peopleCount_near"]["type"] == "number"
-    assert body["peopleCount_far"]["type"] == "number"
-    assert body["peopleOccupancy_immedate"]["type"] == "number"
-    assert body["peopleOccupancy_near"]["type"] == "number"
-
-
-def test_entity_attribute_values_are_null() -> None:
-    session = FakeSession([FakeResponse(201)])
-
-    create_entities(
-        _settings().entities, settings=_settings(), auth=FakeAuth(), session=session
-    )
-
-    body = json.loads(session.calls[0]["data"])
-    for attr in (
-        "dateObservedFrom",
-        "dateObservedTo",
-        "peopleCount_immedate",
-        "peopleCount_near",
-        "peopleCount_far",
-        "peopleOccupancy_immedate",
-        "peopleOccupancy_near",
-    ):
-        assert body[attr]["value"] is None, f"{attr} value should be null"
+    assert body == {"id": entity_id, "type": entity_type}
 
 
 def test_201_counted_as_created() -> None:

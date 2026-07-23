@@ -20,7 +20,7 @@ EXPECTED_FLOW_SQL = " ".join(
     """
     SELECT startdate, group_place_id, device_type, interval_min,
            flow_gt_m60, flow_gt_m80, flow_gt_m120,
-           stay_gt_m60, stay_gt_m80
+           stay_gt_m60, stay_gt_m80, stay_gt_m120
     FROM flow_metrics2_per_place2_agg_imputed
     WHERE interval_min = %s
       AND startdate >= %s
@@ -34,7 +34,7 @@ EXPECTED_FLOW_STARTDATES_SQL = " ".join(
     """
     SELECT startdate, group_place_id, device_type, interval_min,
            flow_gt_m60, flow_gt_m80, flow_gt_m120,
-           stay_gt_m60, stay_gt_m80
+           stay_gt_m60, stay_gt_m80, stay_gt_m120
     FROM flow_metrics2_per_place2_agg_imputed
     WHERE interval_min = %s
       AND startdate IN (%s, %s, %s)

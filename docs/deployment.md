@@ -122,6 +122,14 @@ uv run python scripts/create_entities.py --send \
 `201` is treated as created, `409` / `422` as already-existing. The
 operation is safe to re-run.
 
+The creation body contains only the bare identity:
+`{"id": "<entity_id>", "type": "<entity_type>"}`. Bootstrap does not seed
+attributes. The owning product's first successful publication establishes its
+product-data attributes. Product A exclusively owns product data on sensor
+entities, although descriptive sensor metadata such as `latitude`, `longitude`,
+`locationName`, and `status` may coexist there. Product B owns product data only
+on its configured aggregate entity.
+
 ## 6. Create STH-Comet subscriptions
 
 Do this **before** any live write. Subscriptions ship with
@@ -146,9 +154,45 @@ right:
 uv run python scripts/create_sth_subscriptions.py --send
 ```
 
-The creator is idempotent (it matches existing subscriptions on either
-the description prefix or the structural shape), so re-running is
-safe.
+In live send mode, the creator inventories existing subscriptions and skips a
+current subscription only when its Orion response has the exact behavior
+required by the product contract. For Product A, a recognized same-product
+subscription with a stale selector, trigger, projection, notification setting,
+status, or expiration causes a safe failure. The creator reports its id and
+does not replace it or create a second Product A subscription.
+
+Confirm the result with [`show_subscriptions.py`](tools_and_troubleshooting.md#show_subscriptionspy),
+a read-only listing of what is on the broker — check that Product A has exactly
+one current subscription and that its trigger and notification attributes are the
+expected ones:
+
+```sh
+uv run python scripts/show_subscriptions.py
+```
+
+### Replace a stale Product A subscription
+
+Perform this only in an approved operator maintenance window. Take the id the
+creator reported (or find it with `show_subscriptions.py`), use it with the
+deletion tool in dry-run, then repeat the exact command with `--send`, and
+finally create Product A's current shape:
+
+```sh
+uv run python scripts/delete_subscriptions.py \
+  --reason "replace stale Product A STH-Comet subscription" \
+  "$STALE_PRODUCT_A_SUBSCRIPTION_ID"
+
+uv run python scripts/delete_subscriptions.py \
+  --reason "replace stale Product A STH-Comet subscription" \
+  --send \
+  "$STALE_PRODUCT_A_SUBSCRIPTION_ID"
+
+uv run python scripts/create_sth_subscriptions.py --product a --send
+```
+
+For a catch-all FIWARE service or service path, the live deletion command also
+requires `--i-know-this-is-production`. Review the prefetched subscription
+description before allowing the deletion.
 
 ## 7. Cut over
 
@@ -164,6 +208,7 @@ safe.
 - [ ] STH-Comet subscriptions are live (§6 complete with `--send`).
       Creating subscriptions **before** the first live write is required;
       `skipInitialNotification` means earlier updates are never replayed.
+      Confirm with `uv run python scripts/show_subscriptions.py`.
 - [ ] `.env` credentials (`FIWARE_*`, `MYSQL_*`) are correct and
       dry-run completes without `token_refresh_failed` or
       MySQL connection errors in `logs/{product}.log`.
@@ -250,6 +295,7 @@ for most often:
 |---|---|
 | `scripts/show_data.py --source orion` | Inspect what Orion currently stores for one or more entity ids. |
 | `scripts/show_data.py --source comet` | Inspect what STH-Comet has recorded for an attribute over time. |
+| `scripts/show_subscriptions.py` | List the Orion subscriptions on the broker (ids, triggers, delivery telemetry). Read-only. |
 | `scripts/delete_entities.py` / `scripts/delete_history.py` | Remove reviewed Orion entities or Comet history. Dry-run first. |
 | `scripts/delete_subscriptions.py` | Retire stale Orion subscriptions by id (e.g. old STH-Comet subscriptions). Dry-run first. |
 | `scripts/state_doctor.py` | A window is stuck in `pending` or `partial` and you need to see why. |

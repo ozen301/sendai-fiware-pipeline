@@ -5,7 +5,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Protocol, Self
 
 import requests
@@ -20,16 +20,33 @@ PRODUCT_A_ENTITY_TYPES: tuple[str, ...] = ("Blesensor.per300", "Blesensor.per360
 PRODUCT_A_HISTORY_ATTRS: tuple[str, ...] = (
     "dateObservedFrom",
     "dateObservedTo",
+    "dateRetrieved",
+    "identifcation",
     "peopleCount_immedate",
     "peopleCount_near",
     "peopleCount_far",
     "peopleOccupancy_immedate",
     "peopleOccupancy_near",
+    "peopleOccupancy_far",
 )
-PRODUCT_A_TRIGGER_ATTRS: tuple[str, ...] = ("peopleCount_immedate",)
+PRODUCT_A_TRIGGER_ATTRS: tuple[str, ...] = PRODUCT_A_HISTORY_ATTRS
 
 _PRODUCT_A_DESCRIPTION_PREFIX = "Product A STH-Comet history"
 _PRODUCT_B_DESCRIPTION_PREFIX = "Product B aggregate STH-Comet history"
+_PRODUCT_B_LEGACY_DESCRIPTION_PREFIX = "Product B STH-Comet history"
+_SUBSCRIPTION_INVENTORY_PAGE_SIZE = 100
+_NOTIFICATION_RUNTIME_FIELDS: frozenset[str] = frozenset(
+    {
+        "failsCounter",
+        "lastFailure",
+        "lastFailureCode",
+        "lastFailureReason",
+        "lastNotification",
+        "lastSuccess",
+        "lastSuccessCode",
+        "timesSent",
+    }
+)
 PRODUCT_B_STABLE_WRITE_ATTRS: tuple[str, ...] = (
     "dateObservedFrom",
     "dateObservedTo",
@@ -61,6 +78,15 @@ _PRODUCT_A_SPEC = _ProductSpec(
 
 class StHSubscriptionError(RuntimeError):
     """Raised when STH subscription configuration or creation fails."""
+
+
+class SubscriptionInventoryError(RuntimeError):
+    """Failure while reading Orion's complete subscription inventory."""
+
+    def __init__(self, message: str, *, http_status: int = 0) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+        self.response_excerpt = message[:512]
 
 
 class TokenProvider(Protocol):
@@ -246,14 +272,145 @@ def build_product_b_subscription_body(
     return body
 
 
+def fetch_subscription_inventory(
+    *,
+    settings: Any,
+    auth: TokenProvider,
+    session: Any = None,
+) -> list[dict[str, Any]]:
+    """Read and validate Orion's complete counted subscription inventory."""
+    http = requests.Session() if session is None else session
+    url = f"{settings.base_url}/orion/v2.0/subscriptions"
+    subscriptions: list[dict[str, Any]] = []
+    subscription_ids: set[str] = set()
+    expected_total: int | None = None
+    offset = 0
+
+    while expected_total is None or offset < expected_total:
+        params = {
+            "limit": _SUBSCRIPTION_INVENTORY_PAGE_SIZE,
+            "offset": offset,
+            "options": "count",
+        }
+        try:
+            response = http.get(
+                url,
+                params=params,
+                headers=_headers(
+                    auth.get_token(), settings, include_content_type=False
+                ),
+                timeout=settings.timeout,
+                verify=settings.verify_tls,
+            )
+            if response.status_code == 401:
+                response = http.get(
+                    url,
+                    params=params,
+                    headers=_headers(
+                        auth.get_token(force_refresh=True),
+                        settings,
+                        include_content_type=False,
+                    ),
+                    timeout=settings.timeout,
+                    verify=settings.verify_tls,
+                )
+        except requests.RequestException as exc:
+            raise SubscriptionInventoryError(str(exc)) from exc
+        if response.status_code != 200:
+            raise SubscriptionInventoryError(
+                response.text,
+                http_status=response.status_code,
+            )
+
+        total_text = _response_header(response.headers, "Fiware-Total-Count")
+        if total_text is None or not total_text.isdigit():
+            raise SubscriptionInventoryError(
+                "Orion subscription inventory returned a missing or invalid "
+                "Fiware-Total-Count",
+                http_status=response.status_code,
+            )
+        page_total = int(total_text)
+        if expected_total is None:
+            expected_total = page_total
+        elif page_total != expected_total:
+            raise SubscriptionInventoryError(
+                "Orion subscription inventory total changed between pages",
+                http_status=response.status_code,
+            )
+
+        try:
+            page = response.json()
+        except (TypeError, ValueError) as exc:
+            raise SubscriptionInventoryError(
+                "Orion subscription inventory returned invalid JSON",
+                http_status=response.status_code,
+            ) from exc
+        if not isinstance(page, list):
+            raise SubscriptionInventoryError(
+                "Orion subscription inventory returned a non-list page",
+                http_status=response.status_code,
+            )
+
+        expected_page_size = min(
+            _SUBSCRIPTION_INVENTORY_PAGE_SIZE,
+            expected_total - offset,
+        )
+        if len(page) != expected_page_size:
+            raise SubscriptionInventoryError(
+                "Orion subscription inventory was incomplete",
+                http_status=response.status_code,
+            )
+        for subscription in page:
+            if not isinstance(subscription, dict):
+                raise SubscriptionInventoryError(
+                    "Orion subscription inventory returned a malformed entry",
+                    http_status=response.status_code,
+                )
+            subscription_id = subscription.get("id")
+            if not isinstance(subscription_id, str) or not subscription_id:
+                raise SubscriptionInventoryError(
+                    "Orion subscription inventory returned a malformed entry",
+                    http_status=response.status_code,
+                )
+            if subscription_id in subscription_ids:
+                raise SubscriptionInventoryError(
+                    "Orion subscription inventory repeated a subscription id",
+                    http_status=response.status_code,
+                )
+            subscription_ids.add(subscription_id)
+        subscriptions.extend(page)
+        offset += _SUBSCRIPTION_INVENTORY_PAGE_SIZE
+
+    if expected_total is None or len(subscriptions) != expected_total:
+        raise SubscriptionInventoryError(
+            "Orion subscription inventory was incomplete",
+            http_status=200,
+        )
+    return subscriptions
+
+
+def _response_header(headers: Mapping[str, Any], name: str) -> str | None:
+    """Return one response header using a case-insensitive name match."""
+    for key, value in headers.items():
+        if key.lower() == name.lower() and isinstance(value, str):
+            return value
+    return None
+
+
 def _create_sth_subscription(
     *,
     label: str,
-    own_history_attrs: tuple[str, ...],
+    own_written_attrs: tuple[str, ...],
+    own_entity_selectors: Callable[
+        [StHSubscriptionSettings], tuple[Mapping[str, str], ...]
+    ],
     peer_label: str,
     peer_description_prefixes: tuple[str, ...],
     body_builder: Callable[[StHSubscriptionSettings], dict[str, Any]],
     subscription_matcher: Callable[[StHSubscriptionSettings, Any], tuple[str, ...]],
+    stale_subscription_finder: (
+        Callable[[StHSubscriptionSettings, Any], tuple[str, ...]] | None
+    ),
     settings: StHSubscriptionSettings,
     auth: TokenProvider | None,
     session: Any = None,
@@ -263,30 +420,38 @@ def _create_sth_subscription(
     Runs the shared create flow used by both products:
 
     1. In dry-run mode, log the intent and return without any HTTP call.
-    2. GET the existing subscriptions (the preflight read); return ``failed``
-       when the response is not 200 after the authentication retry.
+    2. Read the complete counted subscription inventory; return ``failed`` when
+       any page is unavailable, malformed, or inconsistent.
     3. Abort if a *peer* product's subscription would cross-fire on this
-       product's writes (see ``_find_stale_peer_subscription``). Creating this
+       product's writes (see ``_find_unsafe_peer_subscription``). Creating this
        subscription alongside such a peer would append duplicate history rows,
        so the run fails instead of creating it.
-    4. Skip if this product's subscription already exists, per
+    4. Abort if a recognized same-product subscription has stale behavior that
+       requires exact-id operator removal.
+    5. Skip if this product's subscription already exists, per
        ``subscription_matcher`` (the idempotent no-op on re-runs).
-    5. Otherwise POST the built body. Return ``created`` and report its id for
+    6. Otherwise POST the built body. Return ``created`` and report its id for
        a 201 response; return ``failed`` for any other response after the
        authentication retry.
 
     Args:
         label: Product name used in log messages, e.g. ``"Product A"``.
-        own_history_attrs: The product's stable written attribute names to
-            compare with peer triggers. The stale-peer check aborts when a peer
+        own_written_attrs: The product's complete enumerable written attribute
+            names to compare with peer triggers. The peer check aborts when a
             subscription triggers on any of these (or triggers on everything),
             since that peer would then fire on this product's own updates.
+        own_entity_selectors: Builds the entity selectors for this product's
+            writes. The peer guard uses them to prove canonical peer selectors
+            disjoint before allowing a shared attribute name.
         peer_label: The other product's name, used in log messages.
         peer_description_prefixes: Description prefixes that identify the peer
             product's subscriptions during the stale-peer check.
         body_builder: Builds the subscription body to POST for this product.
         subscription_matcher: Returns the ids of existing subscriptions that
             already match this product's contract; drives the step-4 skip.
+        stale_subscription_finder: Returns ids of recognized same-product
+            subscriptions whose behavior does not match the current contract.
+            Such subscriptions require operator removal before creation.
         settings: Subscription settings (base URL, TLS, dry-run, entity ids).
         auth: Token provider; required unless ``settings.dry_run`` is set.
         session: Optional injected HTTP session for tests.
@@ -311,46 +476,35 @@ def _create_sth_subscription(
         raise StHSubscriptionError("auth is required when dry_run is false")
 
     http = session or requests.Session()
-    existing_response = http.get(
-        f"{settings.base_url}/orion/v2.0/subscriptions",
-        headers=_headers(auth.get_token(), settings, include_content_type=False),
-        timeout=settings.timeout,
-        verify=settings.verify_tls,
-    )
-    if existing_response.status_code == 401:
-        existing_response = http.get(
-            f"{settings.base_url}/orion/v2.0/subscriptions",
-            headers=_headers(
-                auth.get_token(force_refresh=True),
-                settings,
-                include_content_type=False,
-            ),
-            timeout=settings.timeout,
-            verify=settings.verify_tls,
+    try:
+        existing_subscriptions = fetch_subscription_inventory(
+            settings=settings,
+            auth=auth,
+            session=http,
         )
-    if existing_response.status_code != 200:
+    except SubscriptionInventoryError as exc:
         logger.error(
             f"{label} STH subscription preflight failed",
             extra={
                 "event": "sth_subscription_failed",
                 "dry_run": False,
-                "http_status": existing_response.status_code,
-                "response_excerpt": existing_response.text[:512],
+                "http_status": exc.http_status,
+                "response_excerpt": exc.response_excerpt,
                 "count_failed": 1,
             },
         )
         return StHSubscriptionResult(would_create=0, created=0, skipped=0, failed=1)
 
-    existing_subscriptions = existing_response.json()
-
-    stale_peer = _find_stale_peer_subscription(
+    unsafe_peer = _find_unsafe_peer_subscription(
         existing_subscriptions,
-        own_history_attrs=own_history_attrs,
+        settings=settings,
+        own_written_attrs=own_written_attrs,
+        own_entity_selectors=own_entity_selectors(settings),
         peer_label=peer_label,
         peer_description_prefixes=peer_description_prefixes,
     )
-    if stale_peer is not None:
-        peer_label, peer_id, peer_trigger = stale_peer
+    if unsafe_peer is not None:
+        peer_label, peer_id, peer_trigger = unsafe_peer
         logger.error(
             (
                 f"{label} STH subscription aborted: peer "
@@ -367,6 +521,29 @@ def _create_sth_subscription(
             },
         )
         return StHSubscriptionResult(would_create=0, created=0, skipped=0, failed=1)
+
+    if stale_subscription_finder is not None:
+        stale_ids = stale_subscription_finder(settings, existing_subscriptions)
+        if stale_ids:
+            logger.error(
+                (
+                    f"{label} STH subscription creation aborted: an existing "
+                    "same-product subscription requires operator removal"
+                ),
+                extra={
+                    "event": "sth_subscription_failed",
+                    "dry_run": False,
+                    "subscription_id": stale_ids[0],
+                    "count_failed": 1,
+                },
+            )
+            return StHSubscriptionResult(
+                would_create=0,
+                created=0,
+                skipped=0,
+                failed=1,
+                subscription_ids=stale_ids,
+            )
 
     existing_ids = subscription_matcher(settings, existing_subscriptions)
     if existing_ids:
@@ -449,11 +626,13 @@ def create_product_a_sth_subscription(
     """Create the Product A Orion subscription, or report it in dry-run mode."""
     return _create_sth_subscription(
         label="Product A",
-        own_history_attrs=PRODUCT_A_HISTORY_ATTRS,
+        own_written_attrs=PRODUCT_A_HISTORY_ATTRS,
+        own_entity_selectors=_product_a_entity_selectors,
         peer_label="Product B",
         peer_description_prefixes=(_PRODUCT_B_DESCRIPTION_PREFIX,),
         body_builder=build_product_a_subscription_body,
         subscription_matcher=_matching_product_a_subscription_ids,
+        stale_subscription_finder=_stale_product_a_subscription_ids,
         settings=settings,
         auth=auth,
         session=session,
@@ -469,16 +648,16 @@ def create_product_b_sth_subscription(
     """Create the Product B Orion subscription, or report it in dry-run mode."""
     return _create_sth_subscription(
         label="Product B",
-        # Product B always writes these stable scalar attrs. A Product A
-        # subscription triggering on any of them would fire on Product B's
-        # writes. Dynamic peopleCount_flow_<N> attrs are absent because their
-        # names are not enumerable; the current Product A trigger names only
-        # peopleCount_immedate, so it cannot overlap them.
-        own_history_attrs=PRODUCT_B_STABLE_WRITE_ATTRS,
+        # Product B always writes these scalar attrs. Dynamic
+        # peopleCount_flow_<N> attrs are absent because their names are not
+        # enumerable; Product A's fixed trigger cannot overlap them.
+        own_written_attrs=PRODUCT_B_STABLE_WRITE_ATTRS,
+        own_entity_selectors=_product_b_entity_selectors,
         peer_label="Product A",
         peer_description_prefixes=(_PRODUCT_A_DESCRIPTION_PREFIX,),
         body_builder=build_product_b_subscription_body,
         subscription_matcher=_matching_product_b_subscription_ids,
+        stale_subscription_finder=None,
         settings=settings,
         auth=auth,
         session=session,
@@ -641,10 +820,88 @@ def _headers(
     return headers
 
 
-def _find_stale_peer_subscription(
+def _product_a_entity_selectors(
+    _settings: StHSubscriptionSettings | None = None,
+) -> tuple[Mapping[str, str], ...]:
+    """Return Product A's exact per-place subscription selectors."""
+    return tuple(
+        {"idPattern": ".*", "type": entity_type}
+        for entity_type in PRODUCT_A_ENTITY_TYPES
+    )
+
+
+def _product_b_entity_selectors(
+    settings: StHSubscriptionSettings,
+) -> tuple[Mapping[str, str], ...]:
+    """Return Product B's exact configured aggregate selector."""
+    return (
+        {
+            "id": settings.product_b_aggregate_entity_id,
+            "type": settings.product_b_aggregate_entity_type,
+        },
+    )
+
+
+def _entity_selectors_equal(
+    raw_selectors: Any,
+    expected_selectors: tuple[Mapping[str, str], ...],
+) -> bool:
+    """Return whether selector lists contain exactly the same mappings."""
+    if not isinstance(raw_selectors, list) or len(raw_selectors) != len(
+        expected_selectors
+    ):
+        return False
+    if not all(isinstance(selector, dict) for selector in raw_selectors):
+        return False
+    # Compare only string-valued selectors. A selector whose value is a list or
+    # dict is unhashable (and never equal to the string-valued expected
+    # selectors); rejecting it here keeps the set build below from raising and
+    # lets the caller treat the entry as "not this product's exact shape".
+    if not all(
+        isinstance(value, str)
+        for selector in raw_selectors
+        for value in selector.values()
+    ):
+        return False
+    return {tuple(sorted(selector.items())) for selector in raw_selectors} == {
+        tuple(sorted(selector.items())) for selector in expected_selectors
+    }
+
+
+def _entity_selectors_may_overlap(
+    left: tuple[Mapping[str, str], ...],
+    right: tuple[Mapping[str, str], ...],
+) -> bool:
+    """Return whether two canonical selector sets can select one same entity."""
+    return any(
+        _entity_selector_pair_may_overlap(left_selector, right_selector)
+        for left_selector in left
+        for right_selector in right
+    )
+
+
+def _entity_selector_pair_may_overlap(
+    left: Mapping[str, str],
+    right: Mapping[str, str],
+) -> bool:
+    """Return whether two exact Product A/B selector mappings can overlap."""
+    if left.get("type") != right.get("type"):
+        return False
+    left_id = left.get("id")
+    right_id = right.get("id")
+    if left_id is not None and right_id is not None:
+        return left_id == right_id
+    if left.get("idPattern") == ".*" or right.get("idPattern") == ".*":
+        return True
+    return True
+
+
+def _find_unsafe_peer_subscription(
     subscriptions: Any,
     *,
-    own_history_attrs: tuple[str, ...],
+    settings: StHSubscriptionSettings,
+    own_written_attrs: tuple[str, ...],
+    own_entity_selectors: tuple[Mapping[str, str], ...],
     peer_label: str,
     peer_description_prefixes: tuple[str, ...],
 ) -> tuple[str, str, list[str]] | None:
@@ -658,42 +915,95 @@ def _find_stale_peer_subscription(
     fires for every attribute update on its subject entities). Returns ``None``
     when no recognized current peer subscription has such a trigger.
 
-    The comparison is on trigger attributes only; it deliberately ignores which
-    entities the peer targets. Hence "could" rather than "would": a disjoint
-    entity set means no real cross-fire, but the check still returns the peer.
-    This is a conservative fail-safe — it can abort creation on a
-    trigger-attribute overlap alone, rather than risk missing a real cross-fire.
+    An overlapping trigger is safe only when the peer uses its exact current
+    selector and that selector is provably disjoint from this product's exact
+    selector. Broad or malformed triggers and non-canonical selectors fail
+    closed.
     """
     if not isinstance(subscriptions, list):
         return None
-    own_history = set(own_history_attrs)
+    own_written = set(own_written_attrs)
     for subscription in subscriptions:
         if not isinstance(subscription, dict):
             continue
         subscription_id = subscription.get("id")
         description = subscription.get("description")
-        if not isinstance(subscription_id, str) or not isinstance(description, str):
+        if (
+            not isinstance(subscription_id, str)
+            or not subscription_id
+            or not isinstance(description, str)
+        ):
             continue
         if not description.startswith(peer_description_prefixes):
             continue
+
         subject = subscription.get("subject")
-        condition_attrs: list[str] = []
-        if isinstance(subject, dict):
-            condition = subject.get("condition")
-            if isinstance(condition, dict):
-                raw = condition.get("attrs")
-                if isinstance(raw, list):
-                    condition_attrs = [item for item in raw if isinstance(item, str)]
-        if not condition_attrs or set(condition_attrs) & own_history:
+        if not isinstance(subject, dict):
+            return peer_label, subscription_id, []
+        condition = subject.get("condition")
+        if not isinstance(condition, dict):
+            return peer_label, subscription_id, []
+        raw_condition_attrs = condition.get("attrs")
+        if (
+            not isinstance(raw_condition_attrs, list)
+            or not raw_condition_attrs
+            or not all(
+                isinstance(item, str) and bool(item) for item in raw_condition_attrs
+            )
+        ):
+            return peer_label, subscription_id, []
+
+        condition_attrs = list(raw_condition_attrs)
+        if not set(condition_attrs) & own_written:
+            continue
+
+        peer_selectors = subject.get("entities")
+        if (
+            _has_exact_peer_shape(settings, peer_label, subscription)
+            and isinstance(peer_selectors, list)
+            and not _entity_selectors_may_overlap(
+                tuple(peer_selectors),
+                own_entity_selectors,
+            )
+        ):
+            continue
+
+        if set(condition_attrs) & own_written:
             return peer_label, subscription_id, condition_attrs
     return None
 
 
 def _matching_product_a_subscription_ids(
-    _settings: StHSubscriptionSettings, subscriptions: Any
+    settings: StHSubscriptionSettings, subscriptions: Any
 ) -> tuple[str, ...]:
-    """Return ids for subscriptions matching Product A's existing shape."""
-    return _matching_subscription_ids(_PRODUCT_A_SPEC, subscriptions)
+    """Return ids for active subscriptions matching Product A's exact contract."""
+    if not isinstance(subscriptions, list):
+        return ()
+    return tuple(
+        subscription["id"]
+        for subscription in subscriptions
+        if isinstance(subscription, dict)
+        and isinstance(subscription.get("id"), str)
+        and bool(subscription["id"])
+        and _has_product_a_shape(settings, subscription)
+    )
+
+
+def _stale_product_a_subscription_ids(
+    settings: StHSubscriptionSettings, subscriptions: Any
+) -> tuple[str, ...]:
+    """Return ids for recognized Product A subscriptions with stale behavior."""
+    if not isinstance(subscriptions, list):
+        return ()
+    return tuple(
+        subscription["id"]
+        for subscription in subscriptions
+        if isinstance(subscription, dict)
+        and isinstance(subscription.get("id"), str)
+        and bool(subscription["id"])
+        and _is_product_a_subscription_candidate(subscription)
+        and not _has_product_a_shape(settings, subscription)
+    )
 
 
 def _matching_product_b_subscription_ids(
@@ -771,67 +1081,218 @@ def _has_product_b_aggregate_shape(
     )
 
 
-def _matching_subscription_ids(
-    spec: _ProductSpec, subscriptions: Any
-) -> tuple[str, ...]:
-    """Return ids for subscriptions matching this product's history shape."""
-    if not isinstance(subscriptions, list):
-        return ()
-
-    matches: list[str] = []
-    for subscription in subscriptions:
-        if not isinstance(subscription, dict):
-            continue
-        subscription_id = subscription.get("id")
-        if not isinstance(subscription_id, str) or not subscription_id:
-            continue
-        description = subscription.get("description")
-        if isinstance(description, str) and description.startswith(
-            spec.description_prefix
+def _is_product_a_subscription_candidate(
+    subscription: Mapping[str, Any],
+) -> bool:
+    """Return whether a subscription is recognizable as Product A."""
+    description = subscription.get("description")
+    if isinstance(description, str):
+        if description.startswith(_PRODUCT_A_DESCRIPTION_PREFIX):
+            return True
+        if description.startswith(
+            (_PRODUCT_B_DESCRIPTION_PREFIX, _PRODUCT_B_LEGACY_DESCRIPTION_PREFIX)
         ):
-            matches.append(subscription_id)
-            continue
-        if _has_product_shape(spec, subscription):
-            matches.append(subscription_id)
-    return tuple(matches)
+            return False
+    subject = subscription.get("subject")
+    return isinstance(subject, dict) and _entity_selectors_equal(
+        subject.get("entities"),
+        _product_a_entity_selectors(),
+    )
 
 
-def _has_product_shape(spec: _ProductSpec, subscription: Mapping[str, Any]) -> bool:
-    """Return whether a subscription already covers this product's STH history."""
+def _has_exact_peer_shape(
+    settings: StHSubscriptionSettings,
+    peer_label: str,
+    subscription: Mapping[str, Any],
+) -> bool:
+    """Return whether a peer is current enough for selector disjointness."""
+    if peer_label == "Product A":
+        return _has_product_a_shape(settings, subscription)
+
+    expected_top_level = {
+        "id",
+        "status",
+        "description",
+        "subject",
+        "notification",
+    }
+    if settings.expires:
+        expected_top_level.add("expires")
+    if set(subscription) != expected_top_level:
+        return False
+    description = subscription.get("description")
+    if (
+        subscription.get("status") != "active"
+        or not isinstance(description, str)
+        or not description.startswith(_PRODUCT_B_DESCRIPTION_PREFIX)
+    ):
+        return False
+
     subject = subscription.get("subject")
     notification = subscription.get("notification")
     if not isinstance(subject, dict) or not isinstance(notification, dict):
         return False
-
-    condition = subject.get("condition")
-    if not isinstance(condition, dict):
+    if set(subject) != {"entities", "condition"}:
         return False
 
     entities = subject.get("entities")
-    if not isinstance(entities, list):
-        return False
-    entity_types = {
-        entity.get("type")
-        for entity in entities
-        if isinstance(entity, dict) and isinstance(entity.get("type"), str)
-    }
-    if not set(spec.entity_types) <= entity_types:
-        return False
-
-    condition_attrs = condition.get("attrs")
-    notification_attrs = notification.get("attrs")
-    if not isinstance(condition_attrs, list) or not isinstance(
-        notification_attrs, list
+    condition = subject.get("condition")
+    if (
+        not isinstance(entities, list)
+        or len(entities) != 1
+        or not isinstance(entities[0], dict)
+        or set(entities[0]) != {"id", "type"}
+        or not all(
+            isinstance(entities[0].get(key), str) and bool(entities[0][key])
+            for key in ("id", "type")
+        )
+        or not isinstance(condition, dict)
+        or set(condition) != {"attrs", "notifyOnMetadataChange"}
+        or condition.get("attrs") != ["dateRetrieved"]
+        or condition.get("notifyOnMetadataChange") is not True
     ):
         return False
 
-    return (
-        notification.get("attrsFormat") == "legacy"
-        and notification.get("metadata") == ["TimeInstant"]
-        and condition.get("notifyOnMetadataChange") is True
-        and set(spec.trigger_attrs) <= set(condition_attrs)
-        and set(spec.history_attrs) <= set(notification_attrs)
+    behavior_notification = {
+        key: value
+        for key, value in notification.items()
+        if key not in _NOTIFICATION_RUNTIME_FIELDS
+    }
+    if set(behavior_notification) not in (
+        {"http", "attrsFormat", "metadata"},
+        {"http", "attrsFormat", "metadata", "attrs"},
+    ):
+        return False
+    http = behavior_notification.get("http")
+    notification_matches = (
+        isinstance(http, dict)
+        and set(http) == {"url"}
+        and http.get("url") == settings.comet_notify_url
+        and behavior_notification.get("attrsFormat") == "legacy"
+        and behavior_notification.get("metadata") == ["TimeInstant"]
+        and (
+            "attrs" not in behavior_notification
+            or behavior_notification.get("attrs") == []
+        )
     )
+    if not notification_matches:
+        return False
+    return _subscription_expiration_matches(settings.expires, subscription)
+
+
+def _has_product_a_shape(
+    settings: StHSubscriptionSettings,
+    subscription: Mapping[str, Any],
+) -> bool:
+    """Return whether an Orion GET body matches Product A's live contract."""
+    expected_top_level = {
+        "id",
+        "status",
+        "description",
+        "subject",
+        "notification",
+    }
+    if settings.expires:
+        expected_top_level.add("expires")
+    if set(subscription) != expected_top_level:
+        return False
+
+    description = subscription.get("description")
+    if (
+        subscription.get("status") != "active"
+        or not isinstance(description, str)
+        or not description.startswith(_PRODUCT_A_DESCRIPTION_PREFIX)
+    ):
+        return False
+
+    subject = subscription.get("subject")
+    notification = subscription.get("notification")
+    if not isinstance(subject, dict) or set(subject) != {"entities", "condition"}:
+        return False
+    if not isinstance(notification, dict):
+        return False
+
+    condition = subject.get("condition")
+    if not isinstance(condition, dict) or set(condition) != {
+        "attrs",
+        "notifyOnMetadataChange",
+    }:
+        return False
+
+    if not _entity_selectors_equal(
+        subject.get("entities"),
+        _product_a_entity_selectors(settings),
+    ):
+        return False
+
+    if (
+        not _exact_string_list(condition.get("attrs"), PRODUCT_A_TRIGGER_ATTRS)
+        or condition.get("notifyOnMetadataChange") is not True
+    ):
+        return False
+
+    behavior_notification = {
+        key: value
+        for key, value in notification.items()
+        if key not in _NOTIFICATION_RUNTIME_FIELDS
+    }
+    if set(behavior_notification) != {
+        "http",
+        "attrsFormat",
+        "attrs",
+        "metadata",
+    }:
+        return False
+    http = behavior_notification.get("http")
+    if (
+        not isinstance(http, dict)
+        or set(http) != {"url"}
+        or http.get("url") != settings.comet_notify_url
+        or behavior_notification.get("attrsFormat") != "legacy"
+        or not _exact_string_list(
+            behavior_notification.get("attrs"),
+            PRODUCT_A_HISTORY_ATTRS,
+        )
+        or behavior_notification.get("metadata") != ["TimeInstant"]
+    ):
+        return False
+
+    return _subscription_expiration_matches(settings.expires, subscription)
+
+
+def _exact_string_list(value: Any, expected: tuple[str, ...]) -> bool:
+    """Return whether a list contains each expected string exactly once."""
+    return (
+        isinstance(value, list)
+        and len(value) == len(expected)
+        and all(isinstance(item, str) for item in value)
+        and set(value) == set(expected)
+    )
+
+
+def _parse_subscription_expiration(value: Any) -> datetime | None:
+    """Parse an aware ISO 8601 subscription expiration for instant comparison."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _subscription_expiration_matches(
+    configured_expires: str,
+    subscription: Mapping[str, Any],
+) -> bool:
+    """Return whether a GET body has the configured expiration instant."""
+    if not configured_expires:
+        return "expires" not in subscription
+    configured = _parse_subscription_expiration(configured_expires)
+    live = _parse_subscription_expiration(subscription.get("expires"))
+    return configured is not None and live is not None and configured == live
 
 
 def _required_env(env: Mapping[str, str], key: str) -> str:

@@ -17,7 +17,7 @@ Tools fall into six groups:
 |---|---|
 | **Bootstrap** | [`create_entities.py`](#create_entitiespy), [`create_sth_subscriptions.py`](#create_sth_subscriptionspy) |
 | **Metadata** | [`refresh_metadata.py`](#refresh_metadatapy) |
-| **Inspect Orion / Comet** | [`show_data.py`](#show_datapy) |
+| **Inspect Orion / Comet** | [`show_data.py`](#show_datapy), [`show_subscriptions.py`](#show_subscriptionspy) |
 | **Delete Orion / Comet** | [`delete_entities.py`](#delete_entitiespy), [`delete_history.py`](#delete_historypy), [`delete_subscriptions.py`](#delete_subscriptionspy) |
 | **Inspect / repair state** | [`state_doctor.py`](#state_doctorpy), [`state_repair.py`](#state_repairpy), [`migrate_flow_state.py`](#migrate_flow_statepy) |
 | **Replay** | [`resend.py`](#resendpy) |
@@ -78,9 +78,10 @@ uv run python scripts/create_sth_subscriptions.py [--product a|b|all] [--send] [
 | `--send` | Perform live creation. Omit for dry-run (default). |
 | `--no-show-body` | In dry-run, suppress printing the redacted body. |
 
-Reads `COMET_NOTIFY_URL` from `.env`. The creator is idempotent: it
-skips existing subscriptions matched on either the per-product
-description prefix or the subscription's structural shape.
+Reads `COMET_NOTIFY_URL` from `.env`. Dry-run prints the proposed bodies without
+contacting FIWARE. In live send mode, the creator inventories existing
+subscriptions and skips only an exact current shape. A description prefix alone
+is not an idempotency match.
 
 > **Ordering matters.** Create subscriptions before the first live
 > attribute-update POST (see deployment.md §6). `skipInitialNotification`
@@ -98,32 +99,41 @@ uv run python scripts/create_sth_subscriptions.py
 uv run python scripts/create_sth_subscriptions.py --send
 ```
 
-**Changing a subscription's trigger attribute or shape.** Because the
-creator is idempotent on the description prefix, re-running it after
-you change a trigger attribute in code will **not** replace a live
-subscription whose shape has drifted; it will see the old one as
-"exists" and skip. You have to delete the live subscription first:
+**Replacing a stale Product A subscription.** A recognized Product A
+subscription that does not match the current exact contract makes creation fail
+safely. The creator reports the stale id; it does not delete the subscription,
+replace it, or create a second Product A subscription. During an approved
+operator maintenance window, remove that exact id and then create the current
+shape:
 
 ```sh
-# Find the subscription id, e.g. via:
-curl -H "Authorization: Bearer ${TOKEN}" \
-  "${FIWARE_BASE_URL}/orion/v2.0/subscriptions?limit=100"
+# If needed, find the subscription id by listing what is on the broker:
+uv run python scripts/show_subscriptions.py
 
-# Then delete it via the operator tool (dry-run first; --send to act).
+# Preview deletion of the exact stale id.
 uv run python scripts/delete_subscriptions.py \
-  --reason "replace stale subscription before re-creating with new shape" \
-  <id>
+  --reason "replace stale Product A STH-Comet subscription" \
+  "$STALE_PRODUCT_A_SUBSCRIPTION_ID"
 
-# Now re-run the creator to install the new shape.
-uv run python scripts/create_sth_subscriptions.py --send
+# Repeat the same reviewed target in live mode.
+uv run python scripts/delete_subscriptions.py \
+  --reason "replace stale Product A STH-Comet subscription" \
+  --send \
+  "$STALE_PRODUCT_A_SUBSCRIPTION_ID"
+
+# Install Product A's current exact shape.
+uv run python scripts/create_sth_subscriptions.py --product a --send
 ```
 
-The creator also fails fast if it detects a peer-product subscription
-whose trigger overlaps this product's history attributes (e.g. Product
-B creation aborts when Product A is still on a stale
-`dateObservedFrom` trigger), so the correct order is: delete stale
-Product A subscription → create new Product A subscription → create
-Product B subscription.
+For a catch-all FIWARE service or service path, add
+`--i-know-this-is-production` to the live deletion command. The tool fetches and
+prints the subscription description before deletion; confirm it matches the
+reviewed target.
+
+The creator also fails fast if a peer-product subscription has an unsafe
+overlapping trigger. The exact current Product A and Product B selectors are
+disjoint, so their shared `dateRetrieved` name is safe. A recognized stale peer
+that cannot prove that separation must be removed before creation proceeds.
 
 ---
 
@@ -196,7 +206,7 @@ uv run python scripts/show_data.py
 | `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Canonical `jp.sendai.Blesensor.per300/per3600.<N>` ids infer the type; append `:ENTITY_TYPE` per id or supply `--type` for custom ids or overrides. The `:ENTITY_TYPE` suffix splits on the *last* colon. So a colon-bearing entity id (e.g. a URN-style id) must be given *with* a colon-free inline type, like `urn:ngsi-ld:Foo:Bar:SomeType`; it cannot be passed bare, and `--type` alone will not fix it (the trailing segment is taken as the type first). The configured Product B aggregate id is exempt: it is matched as a whole before any split and works bare. A colon-bearing type cannot be given inline; pass it with `--type`, which works only for a colon-free id or the aggregate id. |
 | `--place N` | Resolve place numbers through metadata. With `--interval-min`, selects that interval; without it, selects every active interval for the place. Mutually exclusive with explicit entity ids. |
 | `--attrs LIST` | Comma-separated attributes. Required for non-aggregate Comet reads. On `--source comet`, for the configured Product B aggregate id, omitting it enumerates the contract scalars plus `peopleCount_flow_<place_number>` for every active interval-60 metadata row. Use an explicit list to inspect inactive or historical dynamic attributes. |
-| `--flow-attrs` | Shortcut for the seven Product A attributes. |
+| `--flow-attrs` | Shortcut for all ten Product A attributes: `dateObservedFrom`, `dateObservedTo`, `dateRetrieved`, `identifcation`, `peopleCount_immedate`, `peopleCount_near`, `peopleCount_far`, `peopleOccupancy_immedate`, `peopleOccupancy_near`, and `peopleOccupancy_far`. |
 | `--from` / `--to` / `--last-n` | Comet-only history bounds. `--last-n` defaults to `10` when no bounds are provided. |
 | `--h-limit` / `--h-offset` | STH-Comet pagination passthrough. |
 | `--aggr-method` / `--aggr-period` | STH-Comet aggregation passthrough. |
@@ -228,6 +238,48 @@ uv run python scripts/show_data.py --source comet \
   --entity-id "$PRODUCT_B_AGGREGATE_ENTITY_ID" --pretty
 
 uv run python scripts/show_data.py --source orion --place 101 --pretty
+```
+
+### `show_subscriptions.py`
+
+List the Orion subscriptions currently on the broker — each one's id,
+selectors, trigger attributes, notification shape, and server-managed
+delivery telemetry (`timesSent`, `failsCounter`, last success/failure).
+Read-only: it never creates, edits, or deletes. Use it to see what is
+subscribed, confirm exactly one current Product A subscription after a
+cutover, and read the exact id to retire with
+[`delete_subscriptions.py`](#delete_subscriptionspy). To recreate a
+product's current shape, run
+[`create_sth_subscriptions.py`](#create_sth_subscriptionspy) (it takes a
+product, not an id); use this tool to confirm the result.
+
+```
+uv run python scripts/show_subscriptions.py [SUBSCRIPTION_ID ...] [--json]
+```
+
+With no ids it lists every subscription; with ids it shows only those
+exact ones (24-char lowercase hex). Output is unredacted — endpoint
+URLs, custom headers, and broker credentials are all shown, since the
+tool runs on internal hosts for authorized operators; the one rule is
+that credentials are never written to the log file. The default is a
+human-readable summary; `--json` emits the raw broker objects as a JSON
+array on stdout (diagnostics and the count line go to stderr, so the
+array pipes cleanly into `jq`).
+
+Exit codes: `0` read succeeded (including an empty broker); `1` an
+operational read failure — a named id was absent or its fetch errored,
+an inventory read failed, or a runtime auth/token failure prevented the
+read; `2` an argument or configuration error — a bad or duplicate id, or
+a settings/auth construction failure before any request.
+
+```sh
+# Summary of every subscription.
+uv run python scripts/show_subscriptions.py
+
+# Raw JSON for two specific ids, piped into jq.
+uv run python scripts/show_subscriptions.py --json \
+  65e87f5c20bd0c390e057c62 65e87f5c20bd0c390e057c63 \
+  | jq '.[] | {id, description}'
 ```
 
 ### `delete_entities.py`
@@ -306,13 +358,14 @@ stops there. `--send` then issues the actual `DELETE`. 204 = deleted,
 same catch-all scope guard as `delete_entities.py`. Ids must be 24-char
 hex (Orion's ObjectId shape); anything else is rejected at parse time.
 
-Find subscription ids with:
+Find subscription ids with [`show_subscriptions.py`](#show_subscriptionspy):
 
 ```bash
-curl -sS -H "Authorization: Bearer ${TOKEN}" \
-  -H "Fiware-Service: ${FIWARE_SERVICE}" \
-  -H "Fiware-ServicePath: ${FIWARE_SERVICE_PATH:-/}" \
-  "${FIWARE_BASE_URL}/orion/v2.0/subscriptions?limit=100" \
+# Human-readable summary of every subscription (id, trigger, notification).
+uv run python scripts/show_subscriptions.py
+
+# Or pull the raw objects and pick fields with jq.
+uv run python scripts/show_subscriptions.py --json \
   | jq '.[] | {id, description, condition_attrs: .subject.condition.attrs}'
 ```
 

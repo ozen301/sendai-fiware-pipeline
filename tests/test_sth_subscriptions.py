@@ -29,6 +29,27 @@ JST = timezone(timedelta(hours=9))
 AGGREGATE_ENTITY_ID = "custom.aggregate.entity"
 AGGREGATE_ENTITY_TYPE = "Custom.aggregate.type"
 COMET_NOTIFY_URL = "http://internal-comet.example/notify"
+PRODUCT_A_ATTRS = (
+    "dateObservedFrom",
+    "dateObservedTo",
+    "dateRetrieved",
+    "identifcation",
+    "peopleCount_immedate",
+    "peopleCount_near",
+    "peopleCount_far",
+    "peopleOccupancy_immedate",
+    "peopleOccupancy_near",
+    "peopleOccupancy_far",
+)
+OLD_PRODUCT_A_ATTRS = (
+    "dateObservedFrom",
+    "dateObservedTo",
+    "peopleCount_immedate",
+    "peopleCount_near",
+    "peopleCount_far",
+    "peopleOccupancy_immedate",
+    "peopleOccupancy_near",
+)
 
 
 class FakeAuth:
@@ -48,11 +69,19 @@ class FakeResponse:
         text: str = "",
         headers: dict[str, str] | None = None,
         json_body: Any = None,
+        infer_total_count: bool = True,
     ) -> None:
         self.status_code = status_code
         self.text = text
-        self.headers = headers or {}
         self.json_body = [] if json_body is None else json_body
+        self.headers = dict(headers or {})
+        if (
+            infer_total_count
+            and status_code == 200
+            and isinstance(self.json_body, list)
+            and "Fiware-Total-Count" not in self.headers
+        ):
+            self.headers["Fiware-Total-Count"] = str(len(self.json_body))
 
     def json(self) -> Any:
         return self.json_body
@@ -62,7 +91,7 @@ class FakeSession:
     def __init__(
         self,
         post_responses: list[FakeResponse] | None = None,
-        get_responses: list[FakeResponse] | None = None,
+        get_responses: list[Any] | None = None,
         delete_responses: list[FakeResponse] | None = None,
     ) -> None:
         self.post_responses = post_responses or []
@@ -74,7 +103,10 @@ class FakeSession:
 
     def get(self, url: str, **kwargs: Any) -> FakeResponse:
         self.gets.append({"url": url, **kwargs})
-        return self.get_responses.pop(0)
+        outcome = self.get_responses.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
     def post(self, url: str, **kwargs: Any) -> FakeResponse:
         self.posts.append({"url": url, **kwargs})
@@ -83,6 +115,49 @@ class FakeSession:
     def delete(self, url: str, **kwargs: Any) -> FakeResponse:
         self.deletes.append({"url": url, **kwargs})
         return self.delete_responses.pop(0)
+
+
+class PaginatedInventorySession(FakeSession):
+    def __init__(
+        self,
+        later_page: list[dict[str, Any]],
+        *,
+        second_total_delta: int = 0,
+    ) -> None:
+        super().__init__(
+            post_responses=[
+                FakeResponse(201, headers={"Location": "/subscriptions/unexpected"})
+            ]
+        )
+        self.later_page = later_page
+        self.second_total_delta = second_total_delta
+
+    def get(self, url: str, **kwargs: Any) -> FakeResponse:
+        self.gets.append({"url": url, **kwargs})
+        params = kwargs.get("params")
+        if not isinstance(params, dict):
+            return FakeResponse(200, json_body=[])
+
+        limit = params.get("limit")
+        offset = params.get("offset")
+        if not isinstance(limit, int) or limit <= 0:
+            return FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "1"},
+                json_body=[],
+            )
+        total = limit + 1
+        if offset == 0:
+            return FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": str(total)},
+                json_body=[unrelated_subscription(index) for index in range(limit)],
+            )
+        return FakeResponse(
+            200,
+            headers={"Fiware-Total-Count": str(total + self.second_total_delta)},
+            json_body=self.later_page,
+        )
 
 
 def settings(**overrides: Any) -> StHSubscriptionSettings:
@@ -104,6 +179,7 @@ def product_b_subscription(
 ) -> dict[str, Any]:
     return {
         "id": subscription_id,
+        "status": "active",
         "description": description,
         "subject": {
             "entities": [{"id": entity_id, "type": entity_type}],
@@ -114,6 +190,60 @@ def product_b_subscription(
         },
         "notification": {
             "http": {"url": notify_url},
+            "attrsFormat": "legacy",
+            "metadata": ["TimeInstant"],
+        },
+    }
+
+
+def product_a_get_subscription(
+    *,
+    subscription_id: str = "product-a-current",
+    status: Any = "active",
+    attrs: tuple[str, ...] = PRODUCT_A_ATTRS,
+    trigger_attrs: tuple[str, ...] = PRODUCT_A_ATTRS,
+    expires: Any = "2030-01-01T00:00:00.000Z",
+) -> dict[str, Any]:
+    subscription: dict[str, Any] = {
+        "id": subscription_id,
+        "status": status,
+        "description": "Product A STH-Comet history set at earlier",
+        "subject": {
+            "entities": [
+                {"idPattern": ".*", "type": "Blesensor.per300"},
+                {"idPattern": ".*", "type": "Blesensor.per3600"},
+            ],
+            "condition": {
+                "attrs": list(trigger_attrs),
+                "notifyOnMetadataChange": True,
+            },
+        },
+        "notification": {
+            "http": {"url": COMET_NOTIFY_URL},
+            "attrsFormat": "legacy",
+            "attrs": list(attrs),
+            "metadata": ["TimeInstant"],
+            "lastNotification": "2026-07-23T00:00:01.000Z",
+            "timesSent": 17,
+            "lastSuccess": "2026-07-23T00:00:01.000Z",
+        },
+    }
+    if expires is not None:
+        subscription["expires"] = expires
+    return subscription
+
+
+def unrelated_subscription(index: int) -> dict[str, Any]:
+    return {
+        "id": f"unrelated-{index}",
+        "status": "active",
+        "description": f"Unrelated subscription {index}",
+        "subject": {
+            "entities": [{"id": f"other-{index}", "type": "Other.Type"}],
+            "condition": {"attrs": ["otherAttr"]},
+        },
+        "notification": {
+            "http": {"url": COMET_NOTIFY_URL},
             "attrsFormat": "legacy",
             "metadata": ["TimeInstant"],
         },
@@ -162,17 +292,39 @@ def test_build_product_a_subscription_preserves_shape_without_throttling() -> No
                 {"idPattern": ".*", "type": "Blesensor.per3600"},
             ],
             "condition": {
-                "attrs": ["peopleCount_immedate"],
+                "attrs": list(PRODUCT_A_ATTRS),
                 "notifyOnMetadataChange": True,
             },
         },
         "notification": {
             "http": {"url": COMET_NOTIFY_URL},
             "attrsFormat": "legacy",
-            "attrs": list(PRODUCT_A_HISTORY_ATTRS),
+            "attrs": list(PRODUCT_A_ATTRS),
             "metadata": ["TimeInstant"],
         },
     }
+
+
+def test_product_a_shared_constants_equal_exact_ten_attribute_contract() -> None:
+    assert PRODUCT_A_HISTORY_ATTRS == PRODUCT_A_ATTRS
+    assert PRODUCT_A_TRIGGER_ATTRS == PRODUCT_A_ATTRS
+
+
+def test_product_a_trigger_covers_people_occupancy_near_only_correction_gap() -> None:
+    body = build_product_a_subscription_body(settings())
+    before = {"peopleCount_immedate": 6, "peopleOccupancy_near": 40.9}
+    after = {"peopleCount_immedate": 6, "peopleOccupancy_near": 41.0}
+    changed_attrs = {name for name in before if before[name] != after[name]}
+
+    assert changed_attrs == {"peopleOccupancy_near"}
+    assert changed_attrs <= set(body["subject"]["condition"]["attrs"])
+    assert before["peopleCount_immedate"] == after["peopleCount_immedate"]
+
+
+def test_product_a_subscription_omits_unconditional_entity_update_trigger() -> None:
+    body = build_product_a_subscription_body(settings())
+
+    assert "alterationTypes" not in body["subject"]["condition"]
 
 
 def test_redacted_subscription_json_omits_private_notify_url() -> None:
@@ -349,7 +501,7 @@ def test_create_product_a_subscription_posts_body_and_skip_initial_param() -> No
     assert "throttling" not in body
 
 
-def test_create_product_a_subscription_skips_when_subscription_already_exists() -> None:
+def test_create_product_a_rejects_description_only_stale_shape() -> None:
     fake_session = FakeSession(
         get_responses=[
             FakeResponse(
@@ -371,78 +523,344 @@ def test_create_product_a_subscription_skips_when_subscription_already_exists() 
     )
 
     assert result.created == 0
-    assert result.skipped == 1
-    assert result.failed == 0
+    assert result.skipped == 0
+    assert result.failed == 1
     assert result.subscription_ids == ("existing-sub",)
     assert fake_session.posts == []
 
 
-def test_create_product_a_subscription_detects_existing_matching_shape() -> None:
-    fake_session = FakeSession(
-        get_responses=[
-            FakeResponse(
-                200,
-                json_body=[
-                    {
-                        "id": "shape-sub",
-                        "subject": {
-                            "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
-                            ],
-                            "condition": {
-                                "attrs": list(PRODUCT_A_TRIGGER_ATTRS),
-                                "notifyOnMetadataChange": True,
-                            },
-                        },
-                        "notification": {
-                            "attrsFormat": "legacy",
-                            "attrs": list(PRODUCT_A_HISTORY_ATTRS),
-                            "metadata": ["TimeInstant"],
-                        },
-                    }
-                ],
-            )
-        ]
-    )
+def test_create_product_a_subscription_skips_representative_orion_get_shape() -> None:
+    existing = product_a_get_subscription(subscription_id="shape-sub")
+    fake_session = FakeSession(get_responses=[FakeResponse(200, json_body=[existing])])
 
     result = create_product_a_sth_subscription(
-        settings=settings(dry_run=False),
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T09:00:00+09:00",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert existing["id"]
+    assert existing["status"] == "active"
+    assert existing["expires"] == "2030-01-01T00:00:00.000Z"
+    assert {
+        "lastNotification",
+        "timesSent",
+        "lastSuccess",
+    } <= existing["notification"].keys()
+    assert result.skipped == 1
+    assert result.failed == 0
+    assert result.subscription_ids == ("shape-sub",)
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_skips_exact_shape_with_fails_counter() -> None:
+    # Orion adds notification.failsCounter after consecutive delivery failures.
+    # It is server-managed telemetry like timesSent, so an otherwise-exact
+    # subscription carrying it must still match and be skipped, not flagged
+    # stale (which would happen exactly when Comet is unhealthy).
+    existing = product_a_get_subscription(subscription_id="shape-sub")
+    existing["notification"]["failsCounter"] = 4
+    fake_session = FakeSession(get_responses=[FakeResponse(200, json_body=[existing])])
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False, expires="2030-01-01T09:00:00+09:00"),
         auth=FakeAuth(),
         session=fake_session,
     )
 
     assert result.skipped == 1
+    assert result.failed == 0
     assert result.subscription_ids == ("shape-sub",)
     assert fake_session.posts == []
 
 
-def test_create_product_a_subscription_ignores_shape_without_timeinstant_metadata() -> (
+def test_create_product_a_reports_stale_for_unhashable_selector_without_crashing() -> (
     None
 ):
+    # A recognized Product A subscription whose entity selector carries a
+    # non-string (unhashable) value must yield a controlled stale result, not a
+    # raw TypeError escaping the preflight's failed=1 contract.
+    malformed = product_a_get_subscription(subscription_id="malformed-selector")
+    malformed["subject"]["entities"][0]["type"] = ["Blesensor.per300"]
+    fake_session = FakeSession(get_responses=[FakeResponse(200, json_body=[malformed])])
+
+    # settings.expires matches the fixture's expires so the top-level-key check
+    # passes and the shape check reaches the selector comparison — the code path
+    # this guard covers. Without matching expires the subscription would be
+    # rejected earlier and the test would pass regardless of the guard.
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False, expires="2030-01-01T09:00:00+09:00"),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.created == 0
+    assert result.subscription_ids == ("malformed-selector",)
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_reports_stale_shape_for_operator_removal() -> (
+    None
+):
+    stale = product_a_get_subscription(subscription_id="legacy-sub")
+    stale["notification"].pop("metadata")
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[stale])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T00:00:00Z",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.created == 0
+    assert result.skipped == 0
+    assert result.failed == 1
+    assert result.subscription_ids == ("legacy-sub",)
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_rejects_old_seven_attribute_shape() -> None:
+    old = product_a_get_subscription(
+        subscription_id="old-seven",
+        attrs=OLD_PRODUCT_A_ATTRS,
+        trigger_attrs=("peopleCount_immedate",),
+    )
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[old])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T00:00:00Z",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == ("old-seven",)
+    assert fake_session.posts == []
+
+
+@pytest.mark.parametrize(
+    "live_status",
+    [
+        pytest.param("inactive", id="inactive"),
+        pytest.param("expired", id="expired"),
+        pytest.param("oneshot", id="oneshot"),
+        pytest.param(None, id="absent"),
+        pytest.param({"unexpected": "shape"}, id="unparseable"),
+    ],
+)
+def test_create_product_a_subscription_treats_non_active_status_as_stale(
+    live_status: Any,
+) -> None:
+    stale = product_a_get_subscription(
+        subscription_id="status-stale",
+        status=live_status,
+    )
+    if live_status is None:
+        stale.pop("status")
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[stale])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T00:00:00Z",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.skipped == 0
+    assert result.subscription_ids == ("status-stale",)
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_matches_normalized_expiration_instant() -> None:
+    existing = product_a_get_subscription(
+        expires="2030-01-01T00:00:00.000Z",
+    )
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[existing])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T09:00:00+09:00",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.skipped == 1
+    assert result.failed == 0
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_rejects_different_expiration_instant() -> None:
+    stale = product_a_get_subscription(
+        subscription_id="wrong-expiry",
+        expires="2030-01-02T00:00:00Z",
+    )
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[stale])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(
+            dry_run=False,
+            expires="2030-01-01T09:00:00+09:00",
+        ),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.subscription_ids == ("wrong-expiry",)
+    assert fake_session.posts == []
+
+
+def test_create_product_a_permanent_subscription_matches_without_live_expires() -> None:
+    existing = product_a_get_subscription(expires=None)
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[existing])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False, expires=""),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert "expires" not in existing
+    assert result.skipped == 1
+    assert result.failed == 0
+    assert fake_session.posts == []
+
+
+def test_create_product_a_permanent_config_rejects_live_expiring_subscription() -> None:
+    stale = product_a_get_subscription(
+        subscription_id="unexpected-expiry",
+        expires="2030-01-01T00:00:00Z",
+    )
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[stale])],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False, expires=""),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.subscription_ids == ("unexpected-expiry",)
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_finds_exact_match_on_later_page() -> None:
+    later_match = product_a_get_subscription(
+        subscription_id="later-page-match",
+        expires=None,
+    )
+    fake_session = PaginatedInventorySession([later_match])
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False, expires=""),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.skipped == 1
+    assert result.subscription_ids == ("later-page-match",)
+    assert fake_session.posts == []
+    assert len(fake_session.gets) == 2
+    first_params = fake_session.gets[0]["params"]
+    second_params = fake_session.gets[1]["params"]
+    assert first_params["limit"] > 0
+    assert first_params["offset"] == 0
+    assert first_params["options"] == "count"
+    assert second_params == {
+        "limit": first_params["limit"],
+        "offset": first_params["limit"],
+        "options": "count",
+    }
+
+
+def test_create_product_a_subscription_detects_unsafe_peer_on_later_page() -> None:
+    unsafe_peer = product_b_subscription(
+        subscription_id="later-unsafe-peer",
+        entity_id="jp.sendai.Blesensor.per3600.10",
+        entity_type="Blesensor.per3600",
+    )
+    unsafe_peer["subject"]["condition"]["attrs"] = ["peopleOccupancy_near"]
+    fake_session = PaginatedInventorySession([unsafe_peer])
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert fake_session.posts == []
+    assert len(fake_session.gets) == 2
+
+
+@pytest.mark.parametrize(
+    ("second_total_delta", "second_page"),
+    [
+        pytest.param(0, [], id="incomplete"),
+        pytest.param(1, [unrelated_subscription(0)], id="inconsistent-total"),
+    ],
+)
+def test_create_product_a_subscription_fails_closed_for_incomplete_inventory(
+    second_total_delta: int,
+    second_page: list[dict[str, Any]],
+) -> None:
+    fake_session = PaginatedInventorySession(
+        second_page,
+        second_total_delta=second_total_delta,
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.created == 0
+    assert result.skipped == 0
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_fails_closed_without_total_count() -> None:
     fake_session = FakeSession(
         post_responses=[
-            FakeResponse(201, headers={"Location": "/subscriptions/correct-sub"}),
+            FakeResponse(201, headers={"Location": "/subscriptions/unexpected"}),
         ],
         get_responses=[
             FakeResponse(
                 200,
-                json_body=[
-                    {
-                        "id": "legacy-sub",
-                        "subject": {
-                            "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
-                            ],
-                            "condition": {"attrs": list(PRODUCT_A_TRIGGER_ATTRS)},
-                        },
-                        "notification": {
-                            "attrsFormat": "legacy",
-                            "attrs": list(PRODUCT_A_HISTORY_ATTRS),
-                        },
-                    }
-                ],
+                json_body=[],
+                infer_total_count=False,
             )
         ],
     )
@@ -453,10 +871,36 @@ def test_create_product_a_subscription_ignores_shape_without_timeinstant_metadat
         session=fake_session,
     )
 
-    assert result.created == 1
-    assert result.skipped == 0
-    assert result.subscription_ids == ("correct-sub",)
-    assert len(fake_session.posts) == 1
+    assert result.failed == 1
+    assert result.created == 0
+    assert fake_session.posts == []
+
+
+def test_create_product_a_subscription_fails_closed_for_unparseable_total_count() -> (
+    None
+):
+    fake_session = FakeSession(
+        post_responses=[
+            FakeResponse(201, headers={"Location": "/subscriptions/unexpected"}),
+        ],
+        get_responses=[
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "not-an-integer"},
+                json_body=[],
+            )
+        ],
+    )
+
+    result = create_product_a_sth_subscription(
+        settings=settings(dry_run=False),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.failed == 1
+    assert result.created == 0
+    assert fake_session.posts == []
 
 
 def test_create_product_a_subscription_retries_post_once_on_unauthorized() -> None:
@@ -651,39 +1095,42 @@ def test_create_product_b_subscription_posts_body_and_skip_initial_param() -> No
     assert "throttling" not in body
 
 
-def test_create_product_b_subscription_does_not_skip_when_only_product_a_exists() -> (
-    None
-):
+def test_create_product_b_creation_unaffected_by_valid_product_a_subscription() -> None:
+    existing_product_a = product_a_get_subscription(
+        subscription_id="existing-product-a",
+        expires=None,
+    )
     fake_session = FakeSession(
         post_responses=[
             FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-b"}),
         ],
-        get_responses=[
-            FakeResponse(
-                200,
-                json_body=[
-                    {
-                        "id": "existing-product-a",
-                        "description": "Product A STH-Comet history set at ...",
-                        "subject": {
-                            "entities": [
-                                {"idPattern": ".*", "type": "Blesensor.per300"},
-                                {"idPattern": ".*", "type": "Blesensor.per3600"},
-                            ],
-                            "condition": {
-                                "attrs": list(PRODUCT_A_TRIGGER_ATTRS),
-                                "notifyOnMetadataChange": True,
-                            },
-                        },
-                        "notification": {
-                            "attrsFormat": "legacy",
-                            "attrs": list(PRODUCT_A_HISTORY_ATTRS),
-                            "metadata": ["TimeInstant"],
-                        },
-                    }
-                ],
-            )
+        get_responses=[FakeResponse(200, json_body=[existing_product_a])],
+    )
+
+    result = create_product_b_sth_subscription(
+        settings=settings(dry_run=False),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result.created == 1
+    assert result.subscription_ids == ("sub-b",)
+
+
+def test_create_product_b_unaffected_by_product_a_peer_with_fails_counter() -> None:
+    # The peer guard must recognize an exact Product A peer even when it carries
+    # notification.failsCounter, so it can prove the selectors are disjoint and
+    # not falsely abort Product B creation on the shared dateRetrieved trigger.
+    existing_product_a = product_a_get_subscription(
+        subscription_id="existing-product-a",
+        expires=None,
+    )
+    existing_product_a["notification"]["failsCounter"] = 9
+    fake_session = FakeSession(
+        post_responses=[
+            FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-b"}),
         ],
+        get_responses=[FakeResponse(200, json_body=[existing_product_a])],
     )
 
     result = create_product_b_sth_subscription(
@@ -743,12 +1190,15 @@ def test_create_product_a_ignores_legacy_product_b_subscription() -> None:
     assert result.subscription_ids == ("sub-a",)
 
 
-def test_create_product_a_ignores_exclusive_current_product_b_subscription() -> None:
+def test_create_product_a_ignores_exact_product_b_despite_shared_date_retrieved() -> (
+    None
+):
+    existing_product_b = product_b_subscription()
     fake_session = FakeSession(
         post_responses=[
             FakeResponse(201, headers={"Location": "/orion/v2.0/subscriptions/sub-a"}),
         ],
-        get_responses=[FakeResponse(200, json_body=[product_b_subscription()])],
+        get_responses=[FakeResponse(200, json_body=[existing_product_b])],
     )
 
     result = create_product_a_sth_subscription(
@@ -759,6 +1209,8 @@ def test_create_product_a_ignores_exclusive_current_product_b_subscription() -> 
 
     assert result.created == 1
     assert result.subscription_ids == ("sub-a",)
+    assert existing_product_b["subject"]["condition"]["attrs"] == ["dateRetrieved"]
+    assert "dateRetrieved" in PRODUCT_A_ATTRS
 
 
 def test_create_product_b_subscription_skips_complete_shape_with_exact_url() -> None:
@@ -1150,20 +1602,25 @@ def test_create_aborts_when_peer_subscription_has_no_trigger_attrs() -> None:
     assert fake_session.posts == []
 
 
-def test_product_b_subscription_api_keeps_trigger_disjoint_from_product_a_history() -> (
-    None
-):
+def test_product_b_trigger_shares_date_retrieved_with_product_a_by_design() -> None:
     body = build_product_b_subscription_body(settings())
 
     assert PRODUCT_B_STABLE_WRITE_ATTRS.count("sourceQuality") == 1
     assert PRODUCT_B_STABLE_WRITE_ATTRS.index(
         "sourceQuality"
     ) > PRODUCT_B_STABLE_WRITE_ATTRS.index("identifcation")
-    assert set(PRODUCT_A_TRIGGER_ATTRS).isdisjoint(PRODUCT_B_STABLE_WRITE_ATTRS)
     trigger_attrs = body["subject"]["condition"]["attrs"]
     assert trigger_attrs == ["dateRetrieved"]
-    assert set(trigger_attrs).isdisjoint(PRODUCT_A_HISTORY_ATTRS)
     assert "attrs" not in body["notification"]
+
+    # Product A triggers on and projects dateRetrieved, so the two products
+    # intentionally overlap on that attribute. Cross-product safety comes from
+    # disjoint entity selectors, not attribute disjointness — see
+    # test_create_product_a_ignores_exact_product_b_despite_shared_date_retrieved
+    # and test_create_product_b_creation_unaffected_by_valid_product_a_subscription.
+    assert "dateRetrieved" in PRODUCT_A_TRIGGER_ATTRS
+    assert "dateRetrieved" in PRODUCT_A_HISTORY_ATTRS
+    assert set(trigger_attrs) <= set(PRODUCT_A_HISTORY_ATTRS)
 
 
 def test_sth_subscription_logging_extras_are_allowed() -> None:
@@ -1281,3 +1738,305 @@ def test_delete_subscription_raises_on_unexpected_status() -> None:
         delete_subscription(
             SUB_ID, settings=settings(), auth=FakeAuth(), session=fake_session
         )
+
+
+@pytest.mark.parametrize(
+    "malformed_entry",
+    [
+        pytest.param("not-an-object", id="non-dict"),
+        pytest.param({}, id="missing-id"),
+        pytest.param({"id": ""}, id="empty-id"),
+    ],
+)
+def test_fetch_subscription_inventory_rejects_malformed_page_entry(
+    malformed_entry: Any,
+) -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    fake_session = FakeSession(
+        get_responses=[FakeResponse(200, json_body=[malformed_entry])]
+    )
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+def test_fetch_subscription_inventory_rejects_repeated_id_across_pages() -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    fake_session = PaginatedInventorySession([unrelated_subscription(0)])
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+def test_fetch_subscription_inventory_rejects_invalid_json_page() -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+
+    class InvalidJsonResponse(FakeResponse):
+        def json(self) -> Any:
+            raise ValueError("invalid JSON")
+
+    fake_session = FakeSession(
+        get_responses=[
+            InvalidJsonResponse(
+                200,
+                headers={"Fiware-Total-Count": "0"},
+                infer_total_count=False,
+            )
+        ]
+    )
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+def test_fetch_subscription_inventory_rejects_non_list_page() -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    fake_session = FakeSession(
+        get_responses=[
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "1"},
+                json_body={"id": SUB_ID},
+            )
+        ]
+    )
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+@pytest.mark.parametrize(
+    "total_header",
+    [
+        pytest.param(None, id="missing"),
+        pytest.param("not-an-integer", id="unparseable"),
+    ],
+)
+def test_fetch_subscription_inventory_rejects_missing_or_unparseable_total_count(
+    total_header: str | None,
+) -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    headers = {} if total_header is None else {"Fiware-Total-Count": total_header}
+    fake_session = FakeSession(
+        get_responses=[
+            FakeResponse(
+                200,
+                headers=headers,
+                json_body=[],
+                infer_total_count=False,
+            )
+        ]
+    )
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+def test_fetch_subscription_inventory_rejects_total_change_between_pages() -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    fake_session = PaginatedInventorySession(
+        [unrelated_subscription(100)],
+        second_total_delta=1,
+    )
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+def test_fetch_subscription_inventory_rejects_incomplete_page() -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    fake_session = FakeSession(
+        get_responses=[
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "2"},
+                json_body=[unrelated_subscription(0)],
+            )
+        ]
+    )
+
+    with pytest.raises(inventory_error):
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+
+def test_fetch_subscription_inventory_refreshes_unauthorized_token_per_page() -> None:
+    fetch_subscription_inventory, _inventory_error = _public_inventory_api()
+    first_page = [unrelated_subscription(index) for index in range(100)]
+    second_page = [unrelated_subscription(100)]
+    fake_auth = FakeAuth()
+    fake_session = FakeSession(
+        get_responses=[
+            FakeResponse(401, text="expired", infer_total_count=False),
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "101"},
+                json_body=first_page,
+            ),
+            FakeResponse(401, text="expired", infer_total_count=False),
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "101"},
+                json_body=second_page,
+            ),
+        ]
+    )
+
+    result = fetch_subscription_inventory(
+        settings=settings(),
+        auth=fake_auth,
+        session=fake_session,
+    )
+
+    assert result == [*first_page, *second_page]
+    assert fake_auth.force_refreshes == [False, True, False, True]
+    assert [call["params"]["offset"] for call in fake_session.gets] == [
+        0,
+        0,
+        100,
+        100,
+    ]
+
+
+@pytest.mark.parametrize(
+    "transport_error",
+    [
+        pytest.param(requests.ConnectionError("connection failed"), id="connection"),
+        pytest.param(requests.Timeout("request timed out"), id="timeout"),
+    ],
+)
+def test_fetch_subscription_inventory_wraps_transport_error(
+    transport_error: requests.RequestException,
+) -> None:
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    fake_session = FakeSession(get_responses=[transport_error])
+
+    with pytest.raises(inventory_error) as exc_info:
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+    assert exc_info.value.http_status == 0
+    assert isinstance(exc_info.value.response_excerpt, str)
+
+
+def test_fetch_subscription_inventory_preserves_http_failure_status_and_excerpt() -> (
+    None
+):
+    fetch_subscription_inventory, inventory_error = _public_inventory_api()
+    response_text = "gateway returned a diagnostic body"
+    fake_session = FakeSession(
+        get_responses=[
+            FakeResponse(
+                503,
+                text=response_text,
+                infer_total_count=False,
+            )
+        ]
+    )
+
+    with pytest.raises(inventory_error) as exc_info:
+        fetch_subscription_inventory(
+            settings=settings(),
+            auth=FakeAuth(),
+            session=fake_session,
+        )
+
+    assert exc_info.value.http_status == 503
+    assert exc_info.value.response_excerpt == response_text
+
+
+def test_fetch_subscription_inventory_builds_session_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fetch_subscription_inventory, _inventory_error = _public_inventory_api()
+    import sendai_pipeline.sth_subscriptions as subscriptions_module
+
+    fake_session = FakeSession(get_responses=[FakeResponse(200, json_body=[])])
+    session_builds = 0
+
+    def build_session() -> FakeSession:
+        nonlocal session_builds
+        session_builds += 1
+        return fake_session
+
+    monkeypatch.setattr(subscriptions_module.requests, "Session", build_session)
+
+    result = fetch_subscription_inventory(
+        settings=settings(),
+        auth=FakeAuth(),
+    )
+
+    assert result == []
+    assert session_builds == 1
+    assert len(fake_session.gets) == 1
+
+
+def test_fetch_subscription_inventory_returns_dicts_from_multiple_pages() -> None:
+    fetch_subscription_inventory, _inventory_error = _public_inventory_api()
+    first_page = [unrelated_subscription(index) for index in range(100)]
+    second_page = [unrelated_subscription(100)]
+    fake_session = FakeSession(
+        get_responses=[
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "101"},
+                json_body=first_page,
+            ),
+            FakeResponse(
+                200,
+                headers={"Fiware-Total-Count": "101"},
+                json_body=second_page,
+            ),
+        ]
+    )
+
+    result = fetch_subscription_inventory(
+        settings=settings(),
+        auth=FakeAuth(),
+        session=fake_session,
+    )
+
+    assert result == [*first_page, *second_page]
+    assert all(isinstance(subscription, dict) for subscription in result)
+
+
+def _public_inventory_api() -> tuple[Any, Any]:
+    # Deliberately imported only when a new contract test runs. During the
+    # tests-first stage these names do not exist yet, but the 65 established
+    # tests in this module must still collect and execute.
+    from sendai_pipeline.sth_subscriptions import (
+        SubscriptionInventoryError,
+        fetch_subscription_inventory,
+    )
+
+    return fetch_subscription_inventory, SubscriptionInventoryError

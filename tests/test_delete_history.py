@@ -14,11 +14,14 @@ REASON = "operator requested comet history purge"
 FLOW_ATTRS = [
     "dateObservedFrom",
     "dateObservedTo",
+    "dateRetrieved",
+    "identifcation",
     "peopleCount_immedate",
     "peopleCount_near",
     "peopleCount_far",
     "peopleOccupancy_immedate",
     "peopleOccupancy_near",
+    "peopleOccupancy_far",
 ]
 
 
@@ -455,7 +458,7 @@ def test_delete_history_per_attribute_calls_delete_attribute_history_once_per_at
     ]
 
 
-def test_delete_history_flow_attrs_expands_to_seven_product_a_attributes(
+def test_delete_history_flow_attrs_expands_to_ten_product_a_attributes(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:

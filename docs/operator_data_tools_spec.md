@@ -1,17 +1,21 @@
 # Operator Data Tools Spec
 
-This spec covers four operator-facing capabilities requested for the
-Sendai FIWARE pipeline:
+This spec covers the operator-facing data tools for the Sendai FIWARE
+pipeline:
 
 1. **Resend** data of a specified date range and/or place.
 2. **Show** data of a specified date range and/or place.
 3. **Delete Comet** history.
 4. **Delete Orion** entities.
+5. **Delete Orion** subscriptions by id.
+6. **Show** the Orion subscriptions currently on the broker.
 
-All four are operator-driven (never cron). All four follow the same
-project conventions: `uv run python scripts/<tool>.py`, dry-run by
-default, `--send` to perform live writes, structured logs to
+All are operator-driven (never cron) and follow the same project
+conventions: `uv run python scripts/<tool>.py`, structured logs to
 `logs/<tool>.log`, no shared mutable global state, secrets never logged.
+The tools that mutate the platform (resend, the deletes) are dry-run by
+default and take `--send` to perform live writes; the two read-only show
+tools have no `--send`.
 
 For the wider context (pipeline workflow, existing tools), see
 [overview.md](overview.md) and
@@ -19,7 +23,10 @@ For the wider context (pipeline workflow, existing tools), see
 
 ## Naming and source-of-truth conventions
 
-These conventions are shared by all four tools below.
+These conventions are shared by the entity-data tools below (resend, show
+data, delete Comet history, delete Orion entities). The subscription tools
+(delete/show subscriptions) act on subscription ids, not entity specs, so
+the entity-spec and date-range conventions do not apply to them.
 
 **Entity spec.** Same shape as `create_entities.py`:
 `ENTITY_ID[:ENTITY_TYPE]`. Canonical Sendai ids such as
@@ -478,7 +485,7 @@ uv run python scripts/show_data.py
 | `--source comet` | One GET per (entity, attr) to STH-Comet. Historical values. `--from/--to/--last-n` honored. |
 | `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. For the configured Product B aggregate id, the type is resolved from the environment when omitted. |
 | `--attrs LIST` | Comma-separated attribute selector. On `--source comet`, omitting it for the configured Product B aggregate id auto-enumerates the contract scalars plus `peopleCount_flow_<place_number>` for every active interval-60 metadata row. |
-| `--flow-attrs` | Shortcut for the Product A attribute set. Mutually exclusive with `--attrs`. |
+| `--flow-attrs` | Shortcut for the shared ten-attribute Product A set: `dateObservedFrom`, `dateObservedTo`, `dateRetrieved`, `identifcation`, `peopleCount_immedate`, `peopleCount_near`, `peopleCount_far`, `peopleOccupancy_immedate`, `peopleOccupancy_near`, and `peopleOccupancy_far`. Mutually exclusive with `--attrs`. |
 | `--place N` | Place number (repeatable). With `--interval-min`, selects that interval; without it, resolves every active interval for the place. Mutually exclusive with `--entity-id`. |
 | `--entity-id ID` | Explicit entity id (repeatable). Canonical ids infer entity type. Mutually exclusive with `--place`. |
 | `--from`, `--to` | ISO-8601 or `YYYYMMDD_HHMM`. Comet-only. |
@@ -533,7 +540,7 @@ attributes of the same window adjacent, and duplicate-POST groups
 under the same window value rather than being interleaved by arrival
 time.
 
-Null values render as `null` (preserving Product B's null/0
+Null values render as `null` (preserving the pipeline's null/0
 distinction); missing entities render with a `(not found)` placeholder
 row and the run still exits 0.
 
@@ -603,7 +610,7 @@ Where `ENTITY_SPEC` is `ENTITY_ID[:ENTITY_TYPE]`.
 | `ENTITY_SPEC` | One or more entities to operate on. |
 | `--type TYPE` | Default entity type for specs that omit one, or an override for inferred canonical ids. |
 | `--attrs LIST` | Comma-separated attribute names. If present, the tool deletes per-attribute (one DELETE per (entity, attr)). |
-| `--flow-attrs` | Shortcut for the Product A attribute set. Mutually exclusive with `--attrs`. To purge the Product B aggregate entity's history, name its attributes with `--attrs` or delete the whole entity's history with no `--attrs`. |
+| `--flow-attrs` | Shortcut for the same shared ten-attribute Product A set defined in §2. Mutually exclusive with `--attrs`. To purge the Product B aggregate entity's history, name its attributes with `--attrs` or delete the whole entity's history with no `--attrs`. |
 | (no `--attrs`) | Per-entity delete (one DELETE per entity). |
 | `--reason` | Required. Audit string written to every log record. |
 | `--send` | Live deletes. Default: dry-run. |
@@ -674,7 +681,7 @@ uv run python scripts/delete_entities.py
 |---|---|
 | `ENTITY_ID[:ENTITY_TYPE]` | One or more entities. Canonical Sendai ids infer the type; custom ids require inline `:ENTITY_TYPE`. |
 | `--purge-history` | After each successful Orion DELETE, also delete the entity's Comet history. |
-| `--attrs` / `--flow-attrs` | With `--purge-history`, scope the Comet purge to specific attributes (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed**; silently ignored attrs flags are a footgun. |
+| `--attrs` / `--flow-attrs` | With `--purge-history`, scope the Comet purge to explicit attributes or the shared ten-attribute Product A set (per-attribute Comet DELETEs). Without, the Comet purge is per-entity. **Rejected at arg-parse time if `--purge-history` is not also passed**; silently ignored attrs flags are a footgun. |
 | `--reason` | Required. |
 | `--send` | Live deletes. Default: dry-run. |
 | `--i-know-this-is-production` | Required for `--send` when `FIWARE_SERVICE=""` or `FIWARE_SERVICE_PATH="/"`. Same guard `delete_history.py` uses; applies to the chained Comet purge as well. |
@@ -842,36 +849,124 @@ it has no need for `COMET_NOTIFY_URL`.
 
 ---
 
-## Shared implementation work
+## 6. Show subscriptions: `scripts/show_subscriptions.py`
 
-Two pieces of new pipeline-side code; both must be import-safe in
-dry-run (no FIWARE creds required for dry-run is the established
-pattern in `create_entities.py`).
+### Goal
 
-### `sendai_pipeline/comet_client.py`: extend
+List the Orion subscriptions currently on the broker so operators can
+inspect delivery state, read a subscription's exact id to retire it with
+`delete_subscriptions.py`, and confirm the result of a
+`create_sth_subscriptions.py` run — without hand-rolling
+`curl .../subscriptions | jq`. Read-only: it never creates, edits, or
+deletes. (`create_sth_subscriptions.py` recreates a product's current
+shape and takes no id; only the delete tool acts on a specific id.)
 
-Add two methods to `CometClient`:
+### CLI
+
+```
+uv run python scripts/show_subscriptions.py [SUBSCRIPTION_ID ...] [--json]
+```
+
+- No ids: list every subscription. Ids given: show only those exact ids
+  (24-char lowercase hex; an invalid or duplicate id is a config error).
+- `--json`: emit the found subscriptions as a JSON array on stdout; all
+  diagnostics and logs go to stderr so the array pipes cleanly into `jq`.
+
+### Behavior
+
+- List mode reads the complete, count-validated, fail-closed inventory via
+  the shared `fetch_subscription_inventory` (below). Id mode fetches each
+  id with `get_subscription`; a per-id 404 or transport error is reported
+  and does not stop the remaining ids.
+- The default human view is a deterministic summary per subscription: id,
+  status, expires, description, entity selectors, trigger attrs,
+  expression, `notifyOnMetadataChange`, throttling, the notification shape
+  for whichever of the six transports it carries, and delivery telemetry
+  (`timesSent`, `failsCounter`, last success/failure and reason). Most
+  absent fields render as `<none>`; an absent description renders as
+  `<no description>`, and an omitted or empty trigger/notification attribute
+  list renders as `<all>`. Structured values render as sorted compact JSON.
+  `--json` passes each object through exactly as Orion returned it.
+- Output is unredacted — endpoint URLs, custom headers/query-strings, and
+  broker credentials are all shown, since the tool runs on internal hosts
+  for authorized operators. The one safety rule is about logs, not output.
+
+### Safety
+
+- No broker mutation of any kind; safe to run against production with no
+  guard flag.
+- Credential-bearing fields are never written to a log record. The tool's
+  own records (the `show_subscriptions_*` events) carry only ids, counts,
+  status codes, modes, and outcomes — never a response body, exception
+  string, or subscription notification contents; the tool itself never
+  calls `logger.exception` and never logs `response_excerpt` or `str(exc)`.
+  A failed read's human-readable detail goes to the stderr diagnostic,
+  which is output, not a log. (The `AuthClient` it calls emits its own
+  `token_refresh_*` records under its own never-log-secrets contract; that
+  is outside this tool's events.)
+
+### Exit codes
+
+- `0`: read succeeded (including an empty broker).
+- `1`: an operational read failure — the inventory read failed/fail-closed,
+  a runtime auth failure that prevented any read, a named id was absent, or
+  a per-id fetch errored.
+- `2`: an argument/config error — a bad or duplicate id, or a settings/auth
+  construction failure.
+
+### Log events
+
+- `show_subscriptions_requested` (run start; carries `phase`, `count_expected`).
+- `show_subscriptions_target` (per id in id mode; carries `subscription_id`,
+  `http_status`, `ok`).
+- `show_subscriptions_failed` (a read that prevented output; carries `http_status`).
+- `show_subscriptions_summary` (run end; carries `phase`, `count_live`, `ok`).
+
+### Library helper in `sendai_pipeline/sth_subscriptions.py`
+
+This tool and the create-preflight read the broker through one shared
+inventory function:
+
+- `fetch_subscription_inventory(*, settings, auth, session=None) -> list[dict]`
+  reads Orion's complete counted inventory (limit/offset, `options=count`,
+  `Fiware-Total-Count`), refreshing the token once per page on 401. It
+  fails closed — raising `SubscriptionInventoryError` (carrying
+  `http_status` and `response_excerpt`) — on a non-200 response, a
+  missing/unparseable/inconsistent/incomplete total, an invalid-JSON or
+  non-list page, a malformed page entry (a non-dict item, or one whose id is
+  missing or not a non-empty string), a repeated id, or a transport error.
+  `settings` is structurally Orion-shaped, like `get_subscription`.
+
+---
+
+## Shared pipeline-side code
+
+The operator scripts share a few pieces of pipeline-side code, all
+import-safe in dry-run (no FIWARE credentials are needed for dry-run, the
+same pattern as `create_entities.py`).
+
+### `sendai_pipeline/comet_client.py`
+
+`CometClient` carries two history-deletion methods:
 
 - `delete_attribute_history(entity_id, entity_type, attr) -> int`
 - `delete_entity_history(entity_id, entity_type) -> int`
 
-Each returns the HTTP status; raises `requests.HTTPError` only on
-non-204/404 results (404 is returned as `404` for the caller to count).
-401 triggers one forced-refresh retry, matching `get_history`.
+Each returns the HTTP status and raises `requests.HTTPError` only on a
+non-204/404 result (404 is returned as `404` for the caller to count).
+A 401 triggers one forced-refresh retry, matching `get_history`.
 
-### `sendai_pipeline/run_flow.py` / `run_direction.py`: extend
+### `sendai_pipeline/run_flow.py` / `run_direction.py`
 
-Add `force_resend: bool = False` kwarg to `_process_send_window` (or
-the equivalent skip-check helper). Default `False` preserves all
-current behavior. The new `resend.py` script passes `True` when
-`--force` is on.
+The send-window helper takes a `force_resend: bool = False` kwarg.
+`False` keeps the normal skip-unchanged behavior; `resend.py` passes
+`True` when `--force` is on.
 
 ### Logging
 
-Each new script uses the same `LoggingSettings.from_env()` +
-`configure_logging(..., product="<script-stem>")` pattern as the
-existing operator scripts. Log file is `logs/<script-stem>.log` per the
-existing convention.
+Each script uses the same `LoggingSettings.from_env()` +
+`configure_logging(..., product="<script-stem>")` pattern as the other
+operator scripts, writing to `logs/<script-stem>.log`.
 
 ---
 

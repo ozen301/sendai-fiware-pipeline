@@ -10,8 +10,11 @@ Usage:
     uv run python scripts/create_sth_subscriptions.py --product b
     uv run python scripts/create_sth_subscriptions.py --send
 
-The default ``--product all`` is safe to re-run: the creator skips any
-subscription it already finds.
+In live send mode, re-running skips a subscription only when its current Orion
+response matches the product's exact contract. A recognized stale Product A
+subscription causes a safe failure and reports the id that an operator must
+remove; the creator does not replace it or create a second Product A
+subscription.
 """
 
 import argparse

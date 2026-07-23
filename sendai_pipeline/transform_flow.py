@@ -17,6 +17,7 @@ def transform_flow_rows(
     rows: Iterable[Mapping[str, Any]],
     metadata_index: Mapping[tuple[int, int], SensorPlace],
     *,
+    transformed_at: datetime,
     ignored_place_prefixes: tuple[str, ...] = ("quick.", "test"),
 ) -> list[dict[str, Any]]:
     """Return Orion-ready attribute payloads for flow metric rows.
@@ -25,6 +26,8 @@ def transform_flow_rows(
         rows: Source rows returned from a dict-style database cursor.
         metadata_index: Active sensor metadata keyed by place number and
             aggregation interval.
+        transformed_at: Invocation timestamp used for every ``dateRetrieved``
+            value in this batch.
         ignored_place_prefixes: ``group_place_id`` prefixes to filter before
             metadata lookup.
 
@@ -32,10 +35,11 @@ def transform_flow_rows(
         List of payload dicts, one per surviving row.  Each dict has keys
         ``entity_id``, ``entity_type``, and ``attrs``.  The ``attrs`` dict
         contains NGSI attribute objects for ``dateObservedFrom``,
-        ``dateObservedTo``, ``peopleCount_immedate`` (note: intentionally
-        misspelled to match the live platform), ``peopleCount_near``,
-        ``peopleCount_far``, ``peopleOccupancy_immedate``, and
-        ``peopleOccupancy_near``; each value follows the shape
+        ``dateObservedTo``, ``dateRetrieved``, ``identifcation``,
+        ``peopleCount_immedate`` (note: intentionally misspelled to match the
+        live platform), ``peopleCount_near``, ``peopleCount_far``,
+        ``peopleOccupancy_immedate``, ``peopleOccupancy_near``, and
+        ``peopleOccupancy_far``; each value follows the shape
         ``{"type": <ngsi-type>, "value": <val>, "metadata": {"TimeInstant": ...}}``.
         Rows with unsupported intervals, configured noise prefixes, unknown
         metadata keys, or device-type mismatches are omitted (dropped rows are
@@ -93,7 +97,12 @@ def transform_flow_rows(
             {
                 "entity_id": place.entity_id,
                 "entity_type": place.entity_type,
-                "attrs": _attrs(row, interval_min),
+                "attrs": _attrs(
+                    row,
+                    interval_min,
+                    entity_id=place.entity_id,
+                    transformed_at=transformed_at,
+                ),
             }
         )
 
@@ -108,11 +117,18 @@ def _matched_prefix(value: str, prefixes: Iterable[str]) -> str | None:
     return None
 
 
-def _attrs(row: Mapping[str, Any], interval_min: int) -> dict[str, Any]:
+def _attrs(
+    row: Mapping[str, Any],
+    interval_min: int,
+    *,
+    entity_id: str,
+    transformed_at: datetime,
+) -> dict[str, Any]:
     observed_from = datetime.strptime(row["startdate"], "%Y%m%d_%H%M").replace(
         tzinfo=JST
     )
     observed_to = observed_from + timedelta(minutes=interval_min)
+    retrieved = transformed_at.astimezone(JST).replace(microsecond=0)
     timeinstant_value = observed_from.isoformat()
 
     return {
@@ -124,6 +140,16 @@ def _attrs(row: Mapping[str, Any], interval_min: int) -> dict[str, Any]:
         "dateObservedTo": {
             "type": "DateTime",
             "value": observed_to.isoformat(),
+            "metadata": _timeinstant_metadata(timeinstant_value),
+        },
+        "dateRetrieved": {
+            "type": "DateTime",
+            "value": retrieved.isoformat(),
+            "metadata": _timeinstant_metadata(timeinstant_value),
+        },
+        "identifcation": {
+            "type": "Text",
+            "value": entity_id,
             "metadata": _timeinstant_metadata(timeinstant_value),
         },
         "peopleCount_immedate": {
@@ -149,6 +175,11 @@ def _attrs(row: Mapping[str, Any], interval_min: int) -> dict[str, Any]:
         "peopleOccupancy_near": {
             "type": "number",
             "value": _float_or_none(row["stay_gt_m80"]),
+            "metadata": _timeinstant_metadata(timeinstant_value),
+        },
+        "peopleOccupancy_far": {
+            "type": "number",
+            "value": _float_or_none(row["stay_gt_m120"]),
             "metadata": _timeinstant_metadata(timeinstant_value),
         },
     }

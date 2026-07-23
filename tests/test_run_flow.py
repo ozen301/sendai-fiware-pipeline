@@ -1,11 +1,10 @@
 import fcntl
-import hashlib
 import json
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -34,6 +33,19 @@ JST = timezone(timedelta(hours=9))
 NOW = datetime(2026, 5, 23, 12, 17, 0, tzinfo=JST)
 NOW_ON_HOUR = datetime(2026, 5, 23, 12, 0, 0, tzinfo=JST)
 REVISION_NOW = datetime(2026, 6, 30, 12, 17, 43, 123456, tzinfo=JST)
+NON_JST_RUN_START = datetime(2026, 5, 23, 3, 17, 59, 987654, tzinfo=UTC)
+PRODUCT_A_ATTR_NAMES = [
+    "dateObservedFrom",
+    "dateObservedTo",
+    "dateRetrieved",
+    "identifcation",
+    "peopleCount_immedate",
+    "peopleCount_near",
+    "peopleCount_far",
+    "peopleOccupancy_immedate",
+    "peopleOccupancy_near",
+    "peopleOccupancy_far",
+]
 
 
 class Clock:
@@ -248,6 +260,7 @@ def flow_row(**overrides: Any) -> dict[str, Any]:
         "flow_gt_m120": 430,
         "stay_gt_m60": Decimal("0.2"),
         "stay_gt_m80": Decimal("40.9"),
+        "stay_gt_m120": Decimal("0.0"),
         "imputation_tier": 0,
     }
     values.update(overrides)
@@ -322,17 +335,61 @@ def entity_ids(places: Iterable[SensorPlace]) -> list[str]:
 
 
 def payload_hash(attrs: Mapping[str, Any]) -> str:
-    body = json.dumps(attrs, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(body).hexdigest()
+    return run_flow_module._attrs_sha256(attrs)
 
 
 def transformed_hash(row: Mapping[str, Any], places: Iterable[SensorPlace]) -> str:
     payloads = transform_flow_rows(
         [row],
         index_by_place_interval(active_places(places, target_batches=["2026"])),
+        transformed_at=NOW,
     )
     assert len(payloads) == 1
     return payload_hash(payloads[0]["attrs"])
+
+
+def expected_product_a_attrs(
+    row: Mapping[str, Any],
+    target: SensorPlace,
+    *,
+    transformed_at: datetime = NOW,
+) -> dict[str, Any]:
+    observed_from = datetime.strptime(str(row["startdate"]), "%Y%m%d_%H%M").replace(
+        tzinfo=JST
+    )
+    observed_to = observed_from + timedelta(minutes=int(row["interval_min"]))
+    retrieved = transformed_at.astimezone(JST).replace(microsecond=0)
+    metadata = {
+        "TimeInstant": {
+            "type": "DateTime",
+            "value": observed_from.isoformat(),
+        }
+    }
+
+    def attr(attr_type: str, value: Any) -> dict[str, Any]:
+        return {"type": attr_type, "value": value, "metadata": deepcopy(metadata)}
+
+    return {
+        "dateObservedFrom": attr("DateTime", observed_from.isoformat()),
+        "dateObservedTo": attr("DateTime", observed_to.isoformat()),
+        "dateRetrieved": attr("DateTime", retrieved.isoformat()),
+        "identifcation": attr("Text", target.entity_id),
+        "peopleCount_immedate": attr("number", row["flow_gt_m60"]),
+        "peopleCount_near": attr("number", row["flow_gt_m80"]),
+        "peopleCount_far": attr("number", row["flow_gt_m120"]),
+        "peopleOccupancy_immedate": attr(
+            "number",
+            None if row["stay_gt_m60"] is None else float(row["stay_gt_m60"]),
+        ),
+        "peopleOccupancy_near": attr(
+            "number",
+            None if row["stay_gt_m80"] is None else float(row["stay_gt_m80"]),
+        ),
+        "peopleOccupancy_far": attr(
+            "number",
+            None if row["stay_gt_m120"] is None else float(row["stay_gt_m120"]),
+        ),
+    }
 
 
 def write_state(
@@ -483,6 +540,40 @@ def test_run_flow_dry_run_default_never_live_posts(tmp_path: Path) -> None:
     assert all(call["dry_run"] is True for call in orion.calls)
 
 
+def test_run_flow_reuses_one_top_level_timestamp_for_five_and_sixty_minute_payloads(
+    tmp_path: Path,
+) -> None:
+    rows_60 = [flow_row()]
+    rows_5 = [
+        flow_row(
+            group_place_id="sendai202603.99",
+            interval_min=5,
+            startdate="20260523_0900",
+        )
+    ]
+    target_60 = place()
+    target_5 = place(place_number=99, interval_min=5)
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({5: rows_5, 60: rows_60}),
+        orion=orion,
+        metadata=[target_5, target_60],
+        now=NON_JST_RUN_START,
+    )
+
+    assert result.exit_code == 0
+    assert {call["entity_id"] for call in orion.calls} == {
+        target_5.entity_id,
+        target_60.entity_id,
+    }
+    assert {call["attrs"]["dateRetrieved"]["value"] for call in orion.calls} == {
+        "2026-05-23T12:17:59+09:00"
+    }
+    assert all(list(call["attrs"]) == PRODUCT_A_ATTR_NAMES for call in orion.calls)
+
+
 def test_run_flow_dry_run_processes_rows_without_state_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -518,6 +609,11 @@ def test_run_flow_dry_run_processes_rows_without_state_mutation(
     assert path.read_text(encoding="utf-8") == before_disk
     assert store.as_dict() == before_memory
     assert [call["dry_run"] for call in orion.calls] == [True]
+    [call] = orion.calls
+    assert list(call["attrs"]) == PRODUCT_A_ATTR_NAMES
+    assert call["attrs"]["dateRetrieved"]["value"] == "2026-05-23T12:17:00+09:00"
+    assert call["attrs"]["identifcation"]["value"] == place().entity_id
+    assert call["attrs"]["peopleOccupancy_far"]["value"] == 0.0
 
 
 def test_run_flow_empty_target_batches_short_circuits_without_side_effects(
@@ -647,6 +743,7 @@ def test_process_send_window_default_saves_per_target(
         ),
         expected_target_ids=(),
         counts=run_flow_module._RunCounts(),
+        transformed_at=NOW,
     )
 
     assert save_count == 2
@@ -683,6 +780,7 @@ def test_process_send_window_no_persist_zero_in_loop_saves(
         ),
         expected_target_ids=(),
         counts=run_flow_module._RunCounts(),
+        transformed_at=NOW,
         persist_each_target=False,
     )
 
@@ -723,6 +821,7 @@ def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
         interval_metadata=interval_metadata,
         expected_target_ids=(),
         counts=run_flow_module._RunCounts(),
+        transformed_at=NOW,
     )
     default_store.save()
 
@@ -737,6 +836,7 @@ def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
         interval_metadata=interval_metadata,
         expected_target_ids=(),
         counts=run_flow_module._RunCounts(),
+        transformed_at=NOW,
         persist_each_target=False,
     )
     deferred_store.save()
@@ -839,6 +939,9 @@ def test_run_flow_expands_complete_window_when_target_observed_posts_only_new_ta
     assert result.posts_ok == 1
     assert result.posts_failed == 0
     assert [call["entity_id"] for call in orion.calls] == [new_target.entity_id]
+    assert orion.calls[0]["attrs"]["dateRetrieved"]["value"] == (
+        "2026-05-23T12:17:00+09:00"
+    )
     window = store.as_dict()["windows"]["per3600/20260523_0900"]
     assert window["status"] == "complete"
     assert window["expected_target_ids"] == entity_ids(
@@ -1097,6 +1200,9 @@ def test_run_flow_supplemental_expands_complete_window_when_late_target_appears(
     assert result.posts_failed == 0
     assert db_connection.startdate_queries == [(60, (startdate,), 2)]
     assert [call["entity_id"] for call in orion.calls] == [new_target.entity_id]
+    assert orion.calls[0]["attrs"]["dateRetrieved"]["value"] == (
+        "2026-05-23T12:17:00+09:00"
+    )
     window = store.as_dict()["windows"][window_key]
     assert window["status"] == "complete"
     assert window["expected_target_ids"] == entity_ids(
@@ -1226,10 +1332,11 @@ def test_run_flow_supplemental_skips_query_when_no_complete_window_eligible(
         startdate_rows_by_interval={60: [normal_row, too_old_row]},
     )
 
+    orion = FakeOrionClient()
     result = run_once(
         tmp_path=tmp_path,
         db_connection=db_connection,
-        orion=FakeOrionClient(),
+        orion=orion,
         metadata=[target],
         store=store,
         settings=run_settings(tmp_path, send_mode="send"),
@@ -1376,6 +1483,7 @@ def test_run_flow_force_resend_reposts_unchanged_ok_target(
             interval_metadata=interval_metadata,
             expected_target_ids=[target.entity_id],
             counts=counts,
+            transformed_at=NOW,
             force_resend=True,
         )
 
@@ -1384,6 +1492,102 @@ def test_run_flow_force_resend_reposts_unchanged_ok_target(
     # No skip event should have fired.
     assert records(caplog, "post_skipped_unchanged") == []
     assert records(caplog, "post_skipped_drift") == []
+
+
+def test_attrs_sha256_excludes_date_retrieved() -> None:
+    target = place()
+    attrs = expected_product_a_attrs(flow_row(), target)
+    changed_retrieval = deepcopy(attrs)
+    changed_retrieval["dateRetrieved"]["value"] = "2026-05-24T12:17:00+09:00"
+
+    assert run_flow_module._attrs_sha256(attrs) == run_flow_module._attrs_sha256(
+        changed_retrieval
+    )
+
+
+@pytest.mark.parametrize(
+    "attr_name",
+    [
+        "dateObservedFrom",
+        "dateObservedTo",
+        "identifcation",
+        "peopleCount_immedate",
+        "peopleCount_near",
+        "peopleCount_far",
+        "peopleOccupancy_immedate",
+        "peopleOccupancy_near",
+        "peopleOccupancy_far",
+    ],
+)
+def test_attrs_sha256_keeps_each_stable_product_a_attribute(
+    attr_name: str,
+) -> None:
+    attrs = expected_product_a_attrs(flow_row(), place())
+    changed = deepcopy(attrs)
+    changed[attr_name]["value"] = f"changed-{attr_name}"
+
+    assert run_flow_module._attrs_sha256(attrs) != run_flow_module._attrs_sha256(
+        changed
+    )
+
+
+def test_attrs_sha256_keeps_identifcation_in_semantic_hash() -> None:
+    target = place()
+    attrs = expected_product_a_attrs(flow_row(), target)
+    changed_identity = deepcopy(attrs)
+    changed_identity["identifcation"]["value"] = f"{target.entity_id}.different"
+
+    assert run_flow_module._attrs_sha256(attrs) != run_flow_module._attrs_sha256(
+        changed_identity
+    )
+
+
+def test_run_flow_skips_prior_ok_when_only_date_retrieved_changes(
+    tmp_path: Path,
+) -> None:
+    row = flow_row()
+    target = place()
+    prior_attrs = expected_product_a_attrs(
+        row,
+        target,
+        transformed_at=NOW - timedelta(hours=1),
+    )
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260523_0900": window_record(
+                first_seen=NOW - timedelta(hours=1),
+                last_attempt=NOW - timedelta(hours=1),
+                status="complete",
+                targets={
+                    target.entity_id: target_record(
+                        status="ok",
+                        payload_sha256=run_flow_module._attrs_sha256(prior_attrs),
+                        last_attempt_at=NOW - timedelta(hours=1),
+                    )
+                },
+            )
+        },
+    )
+    store = WindowStateStore.load(path, now=Clock([NOW] * 10))
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: [row]}),
+        orion=orion,
+        metadata=[target],
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+        now=NOW,
+    )
+
+    assert result.exit_code == 0
+    assert orion.calls == []
+    record = store.target_record("per3600/20260523_0900", target.entity_id)
+    assert record is not None
+    assert record["last_payload_sha256"] == run_flow_module._attrs_sha256(prior_attrs)
 
 
 def test_run_flow_skips_unchanged_ok_target_and_keeps_window_complete(
@@ -1489,6 +1693,110 @@ def test_run_flow_reposts_drifted_ok_target_and_records_new_hash(
     assert drift[0].window == "per3600/20260523_0900"
     assert drift[0].prior_payload_sha256 == old_hash
     assert drift[0].computed_payload_sha256 == new_hash
+
+
+def test_run_flow_reposts_when_people_occupancy_far_changes_for_same_target(
+    tmp_path: Path,
+) -> None:
+    target = place()
+    prior_row = flow_row(stay_gt_m120=Decimal("1.0"))
+    revised_row = flow_row(stay_gt_m120=Decimal("2.5"))
+    prior_hash = run_flow_module._attrs_sha256(
+        expected_product_a_attrs(prior_row, target)
+    )
+    expected_new_hash = run_flow_module._attrs_sha256(
+        expected_product_a_attrs(revised_row, target)
+    )
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260523_0900": window_record(
+                first_seen=NOW - timedelta(hours=1),
+                last_attempt=NOW - timedelta(hours=1),
+                status="complete",
+                targets={
+                    target.entity_id: target_record(
+                        status="ok",
+                        payload_sha256=prior_hash,
+                        last_attempt_at=NOW - timedelta(hours=1),
+                    )
+                },
+            )
+        },
+    )
+    store = WindowStateStore.load(path, now=Clock([NOW] * 10))
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: [revised_row]}),
+        orion=orion,
+        metadata=[target],
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert result.exit_code == 0
+    [call] = orion.calls
+    assert call["entity_id"] == target.entity_id
+    assert call["attrs"]["peopleOccupancy_far"]["value"] == 2.5
+    record = store.target_record("per3600/20260523_0900", target.entity_id)
+    assert record is not None
+    assert record["last_payload_sha256"] == expected_new_hash
+    assert expected_new_hash != prior_hash
+
+
+def test_run_flow_posts_old_shape_hash_once_and_records_new_semantic_hash(
+    tmp_path: Path,
+) -> None:
+    target = place()
+    row = flow_row()
+    new_attrs = expected_product_a_attrs(row, target)
+    old_attrs = {
+        name: value
+        for name, value in new_attrs.items()
+        if name not in {"dateRetrieved", "identifcation", "peopleOccupancy_far"}
+    }
+    old_hash = run_flow_module._attrs_sha256(old_attrs)
+    expected_new_hash = run_flow_module._attrs_sha256(new_attrs)
+    path = tmp_path / "state" / "flow.json"
+    write_state(
+        path,
+        {
+            "per3600/20260523_0900": window_record(
+                first_seen=NOW - timedelta(hours=1),
+                last_attempt=NOW - timedelta(hours=1),
+                status="complete",
+                targets={
+                    target.entity_id: target_record(
+                        status="ok",
+                        payload_sha256=old_hash,
+                        last_attempt_at=NOW - timedelta(hours=1),
+                    )
+                },
+            )
+        },
+    )
+    store = WindowStateStore.load(path, now=Clock([NOW] * 10))
+    orion = FakeOrionClient()
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: [row]}),
+        orion=orion,
+        metadata=[target],
+        store=store,
+        settings=run_settings(tmp_path, send_mode="send"),
+    )
+
+    assert result.exit_code == 0
+    assert len(orion.calls) == 1
+    assert list(orion.calls[0]["attrs"]) == PRODUCT_A_ATTR_NAMES
+    record = store.target_record("per3600/20260523_0900", target.entity_id)
+    assert record is not None
+    assert record["last_payload_sha256"] == expected_new_hash
+    assert expected_new_hash != old_hash
 
 
 def test_run_flow_preserves_stored_target_when_unobserved_keeps_partial_without_warning(
@@ -2338,10 +2646,11 @@ def test_run_flow_sweeps_old_revised_window_missed_by_fresh_path(
         },
     )
 
+    orion = FakeOrionClient()
     result = run_once(
         tmp_path=tmp_path,
         db_connection=db_connection,
-        orion=FakeOrionClient(),
+        orion=orion,
         metadata=[target],
         settings=revision_flow_settings(tmp_path),
         now=REVISION_NOW,
@@ -2353,6 +2662,9 @@ def test_run_flow_sweeps_old_revised_window_missed_by_fresh_path(
         (5, "20260630_0715", "20260630_0915", 2),
         (60, "20260629_2100", "20260630_0900", 2),
     ]
+    assert orion.calls[0]["attrs"]["dateRetrieved"]["value"] == (
+        "2026-06-30T12:17:43+09:00"
+    )
 
 
 def test_run_flow_sweeps_five_min_revision_older_than_floor_younger_than_horizon(

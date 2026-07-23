@@ -7,15 +7,15 @@ NGSI type used in the runtime sensor metadata, inspects each entity body,
 and reports observed ``type`` values per attribute name next to the
 expected values:
 
-- ``dateObservedFrom``, ``dateObservedTo`` → ``DateTime``.
+- ``dateObservedFrom``, ``dateObservedTo``, ``dateRetrieved`` → ``DateTime``.
+- ``identifcation`` → ``Text``.
 - ``peopleCount_immedate``, ``peopleCount_near``, ``peopleCount_far``
   → ``"number"`` (lowercase string — that's what the live Sendai broker
   already carries; writing the NGSI v2 canonical ``Integer`` would change
   the recorded type and create mixed-type history in STH-Comet).
-- ``peopleOccupancy_immedate``, ``peopleOccupancy_near`` → ``"number"``
+- ``peopleOccupancy_immedate``, ``peopleOccupancy_near``,
+  ``peopleOccupancy_far`` → ``"number"``
   (same reasoning).
-- ``peopleCount_flow`` (Product B, sharing the same entity)
-  → ``StructuredValue``.
 
 Operator-run, not part of CI or any cron job. Usage from project root:
 
@@ -58,23 +58,28 @@ EXIT_INCONCLUSIVE = 2
 EXPECTED_TYPES: dict[str, str] = {
     "dateObservedFrom": "DateTime",
     "dateObservedTo": "DateTime",
+    "dateRetrieved": "DateTime",
+    "identifcation": "Text",
     "peopleCount_immedate": "number",
     "peopleCount_near": "number",
     "peopleCount_far": "number",
     "peopleOccupancy_immedate": "number",
     "peopleOccupancy_near": "number",
-    "peopleCount_flow": "StructuredValue",
+    "peopleOccupancy_far": "number",
 }
 
 REQUIRED_PRODUCT_A_ATTRS: frozenset[str] = frozenset(
     {
         "dateObservedFrom",
         "dateObservedTo",
+        "dateRetrieved",
+        "identifcation",
         "peopleCount_immedate",
         "peopleCount_near",
         "peopleCount_far",
         "peopleOccupancy_immedate",
         "peopleOccupancy_near",
+        "peopleOccupancy_far",
     }
 )
 

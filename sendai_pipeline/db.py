@@ -18,7 +18,7 @@ DIRECTION_METRICS_TABLE: str = "direction_metrics2_per_place2_agg"
 _FLOW_METRICS_SQL = f"""
 SELECT startdate, group_place_id, device_type, interval_min,
        flow_gt_m60, flow_gt_m80, flow_gt_m120,
-       stay_gt_m60, stay_gt_m80
+       stay_gt_m60, stay_gt_m80, stay_gt_m120
 FROM {FLOW_METRICS_TABLE}
 WHERE interval_min = %s
   AND startdate >= %s
@@ -30,7 +30,7 @@ ORDER BY startdate, group_place_id
 _FLOW_METRICS_FOR_STARTDATES_SQL_TEMPLATE = f"""
 SELECT startdate, group_place_id, device_type, interval_min,
        flow_gt_m60, flow_gt_m80, flow_gt_m120,
-       stay_gt_m60, stay_gt_m80
+       stay_gt_m60, stay_gt_m80, stay_gt_m120
 FROM {FLOW_METRICS_TABLE}
 WHERE interval_min = %s
   AND startdate IN ({{placeholders}})

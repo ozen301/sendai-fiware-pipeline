@@ -13,9 +13,10 @@ A scheduled Python job reads aggregated BLE sensor metrics from a private
 MySQL database and publishes them as NGSI v2 attributes to the Sendai FIWARE
 Orion broker. Two independent jobs use different target models:
 
-- **Product A (`run_flow`)** publishes per-place pedestrian counts and stay
-  times (the `peopleCount_immedate/near/far` and
-  `peopleOccupancy_immedate/near` attributes).
+- **Product A (`run_flow`)** publishes ten per-place attributes: source-window
+  and retrieval timestamps, exact entity identity,
+  `peopleCount_immedate/near/far`, and
+  `peopleOccupancy_immedate/near/far`.
 - **Product B (`run_direction`)** bundles one 60-minute inter-place flow
   ("回遊性") window into dynamic `peopleCount_flow_<N>` attributes and
   replaces one aggregate entity's full attribute set.
@@ -26,6 +27,9 @@ writes the exclusively owned aggregate entity `jp.sendai.Blesensor.flow` of
 type `Blesensor.flow` by default with replace-all `PUT /attrs`. The Product B
 target is configurable, but it remains one entity and must not contain
 unrelated attributes or receive writes from another owner.
+Product A exclusively owns product data on the per-sensor entities.
+Descriptive attributes such as `latitude`, `longitude`, `locationName`, and
+`status` may coexist there; they are sensor metadata, not Product B data.
 
 Downstream, Sendai's STH-Comet history service subscribes to Orion and
 stores every published value as a time series. The pipeline tags each
@@ -48,7 +52,8 @@ schedule, but Product B never sends 5-minute direction rows.
 MySQL (bleData2025d)
   ├── flow_metrics2_per_place2_agg_imputed ──► Product A (run_flow.py)
   │                                              publishes peopleCount_immedate/near/far
-  │                                              and peopleOccupancy_immedate/near
+  │                                              and peopleOccupancy_immedate/near/far,
+  │                                              with window/retrieval/identity attrs
   │
   └── direction_metrics2_per_place2_agg    ──► Product B (run_direction.py)
                                                  publishes one 60-min aggregate
@@ -182,8 +187,9 @@ publish targets. `TARGET_DIRECTION_BATCHES` gates Product B source inclusion
 and oldest-device-type selection; it does not select the aggregate Orion target.
 
 **`identifcation` (misspelled).** An NGSI attribute name preserved for platform
-compatibility. In every Product B aggregate package its value is exactly the
-configured aggregate entity id. Product A does not write it.
+compatibility. Product A writes the exact metadata-selected `entity_id` used in
+the request URL. It does not use the legacy metadata CSV column that has the
+same misspelled name. Product B writes its configured aggregate entity id.
 
 **State file.** A per-product JSON file under `state/`
 (`state/flow.json`, `state/direction.json`) recording every window's status and
@@ -307,7 +313,9 @@ The five stages in plain words:
    Product A; the from/to/device-type variants for Product B. Product A
    also applies the source-quality gate in SQL: only rows with
    `imputation_tier <= SOURCE_MAX_IMPUTATION_TIER` are fetched, defaulting
-   to tiers `0`, `1`, and `2`.
+   to tiers `0`, `1`, and `2`. Each fetched row carries
+   `flow_gt_m60/m80/m120` for counts and nullable
+   `stay_gt_m60/m80/m120` for occupancy.
 
 3. **Filter & map.** The run entry point loads `metadata/sensors.csv`
    once via `metadata.load_metadata()`; the transforms receive the
@@ -367,9 +375,11 @@ The five stages in plain words:
 
 5. **Record outcome.** Each write result is written back to the
    per-product state file with the entity id, HTTP status, and a SHA-256
-   of the payload's stable attributes, excluding volatile fields like
-   `dateRetrieved` (used to detect "would this re-send the
-   same value?" during retries). The window aggregate status (`pending`,
+   of the payload's stable attributes. Product A excludes only the top-level
+   `dateRetrieved` attribute and includes its other nine attributes. Product B
+   excludes top-level `dateRetrieved` and
+   `sourceQuality.value.evaluatedAt`. This hash detects "would this re-send the
+   same semantic value?" during retries. The window aggregate status (`pending`,
    `partial`, `complete`, `dead_letter`) is then recomputed against the
    window's `expected_target_ids`. The two products define that set
    differently:
@@ -396,6 +406,12 @@ The five stages in plain words:
    In both cases the window goes to `complete` once every id in its
    expected set has a recorded `ok`; otherwise it stays `partial`.
 
+Product A's STH-Comet subscription uses the same ten-attribute list for both
+its notification projection and its trigger. With metadata-change notification
+enabled, a semantic correction to any one of those attributes, including
+`peopleOccupancy_near`, notifies Comet. Every projected attribute carries the
+source-window start as `TimeInstant`.
+
 ### A row's life: worked example (Product A)
 
 A single 60-minute row in `flow_metrics2_per_place2_agg_imputed`:
@@ -410,6 +426,7 @@ flow_gt_m80       = 18                     # peopleCount_near
 flow_gt_m120      = 7                      # peopleCount_far
 stay_gt_m60       = 12.5                   # peopleOccupancy_immedate
 stay_gt_m80       = 3.1                    # peopleOccupancy_near
+stay_gt_m120      = 0.0                    # peopleOccupancy_far
 ```
 
 After filter & map:
@@ -421,12 +438,12 @@ After filter & map:
 - Metadata lookup `(place_number=105, interval_min=60)` returns
   `entity_id = jp.sendai.Blesensor.per3600.105`,
   `entity_type = Blesensor.per3600`, `batch = 2026`,
-  `expected_device_type = M5Stack`. The metadata also contains a per-place
-  `identifcation` value, which Product A does not write; Product B aggregate
-  packages use the configured aggregate entity id instead.
+  `expected_device_type = M5Stack`. Product A writes that exact `entity_id` as
+  the `identifcation` attribute; it does not use the legacy metadata CSV column
+  with the same misspelled name.
 - Device type matches (`M5Stack == M5Stack`).
 
-POST body sent to Orion (the `TimeInstant` metadata on each attribute
+Ten-attribute POST body sent to Orion (the `TimeInstant` metadata on each attribute
 tells STH-Comet to index this history record at the window's start time,
 2026-05-24 10:00 JST):
 
@@ -436,11 +453,14 @@ POST /orion/v2.0/entities/jp.sendai.Blesensor.per3600.105/attrs?type=Blesensor.p
   "dateObservedFrom": {"type": "DateTime", "value": "2026-05-24T10:00:00+09:00",
                        "metadata": {"TimeInstant": {"type": "DateTime", "value": "2026-05-24T10:00:00+09:00"}}},
   "dateObservedTo":   {"type": "DateTime", "value": "2026-05-24T11:00:00+09:00", "metadata": {…}},
+  "dateRetrieved":    {"type": "DateTime", "value": "2026-07-23T09:12:34+09:00", "metadata": {…}},
+  "identifcation":    {"type": "Text", "value": "jp.sendai.Blesensor.per3600.105", "metadata": {…}},
   "peopleCount_immedate":    {"type": "number", "value": 42,   "metadata": {…}},
   "peopleCount_near":        {"type": "number", "value": 18,   "metadata": {…}},
   "peopleCount_far":         {"type": "number", "value": 7,    "metadata": {…}},
   "peopleOccupancy_immedate":{"type": "number", "value": 12.5, "metadata": {…}},
-  "peopleOccupancy_near":    {"type": "number", "value": 3.1,  "metadata": {…}}
+  "peopleOccupancy_near":    {"type": "number", "value": 3.1,  "metadata": {…}},
+  "peopleOccupancy_far":     {"type": "number", "value": 0.0,  "metadata": {…}}
 }
 ```
 

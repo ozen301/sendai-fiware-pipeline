@@ -864,7 +864,7 @@ def test_show_data_default_type_overrides_inferred_entity_type(
     assert runtime.orion.calls[0]["entity_type"] == TYPE_300
 
 
-def test_show_data_flow_attrs_expands_to_seven_product_a_attributes(
+def test_show_data_flow_attrs_expands_to_ten_product_a_attributes(
     capsys: pytest.CaptureFixture[str],
     runtime: RuntimePatch,
 ) -> None:
@@ -877,11 +877,14 @@ def test_show_data_flow_attrs_expands_to_seven_product_a_attributes(
         [
             "dateObservedFrom",
             "dateObservedTo",
+            "dateRetrieved",
+            "identifcation",
             "peopleCount_immedate",
             "peopleCount_near",
             "peopleCount_far",
             "peopleOccupancy_immedate",
             "peopleOccupancy_near",
+            "peopleOccupancy_far",
         ]
     )
 
