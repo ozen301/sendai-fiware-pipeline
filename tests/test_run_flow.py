@@ -710,7 +710,46 @@ def test_run_flow_send_mode_posts_all_targets_and_completes_window(
     assert len(records(caplog, "window_complete")) == 1
 
 
-def test_process_send_window_default_saves_per_target(
+def test_run_flow_normal_publish_merges_result_and_owns_windows_seen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def publish_spy(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return run_flow_module.FlowWindowPublishResult(
+            windows_complete=1,
+            windows_partial=0,
+            windows_dead_letter=0,
+            posts_ok=2,
+            posts_failed=0,
+            rows_dropped=3,
+        )
+
+    monkeypatch.setattr(run_flow_module, "publish_flow_window", publish_spy)
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: [flow_row()]}),
+        orion=FakeOrionClient(),
+        metadata=[place()],
+        settings=run_settings(
+            tmp_path,
+            send_mode="send",
+            revision_sweep_enabled=False,
+        ),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["startdate"] == "20260523_0900"
+    assert result.windows_seen == 1
+    assert result.windows_complete == 1
+    assert result.posts_ok == 2
+    assert result.rows_dropped == 3
+
+
+def test_publish_flow_window_saves_per_target_and_returns_counts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -730,8 +769,7 @@ def test_process_send_window_default_saves_per_target(
 
     monkeypatch.setattr(store, "save", save_spy)
 
-    run_flow_module._process_send_window(
-        "per3600/20260523_0900",
+    result = run_flow_module.publish_flow_window(
         interval_min=60,
         startdate="20260523_0900",
         rows_for_window=cast(Any, rows),
@@ -741,15 +779,22 @@ def test_process_send_window_default_saves_per_target(
         interval_metadata=index_by_place_interval(
             active_places(targets, target_batches=["2026"])
         ),
-        expected_target_ids=(),
-        counts=run_flow_module._RunCounts(),
         transformed_at=NOW,
     )
 
     assert save_count == 2
+    assert result == run_flow_module.FlowWindowPublishResult(
+        windows_complete=1,
+        windows_partial=0,
+        windows_dead_letter=0,
+        posts_ok=2,
+        posts_failed=0,
+        rows_dropped=0,
+    )
+    assert not hasattr(result, "windows_seen")
 
 
-def test_process_send_window_no_persist_zero_in_loop_saves(
+def test_replay_flow_window_performs_no_in_loop_save(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -767,8 +812,7 @@ def test_process_send_window_no_persist_zero_in_loop_saves(
 
     monkeypatch.setattr(store, "save", save_spy)
 
-    run_flow_module._process_send_window(
-        "per3600/20260523_0900",
+    result = run_flow_module.replay_flow_window(
         interval_min=60,
         startdate="20260523_0900",
         rows_for_window=cast(Any, rows),
@@ -778,21 +822,24 @@ def test_process_send_window_no_persist_zero_in_loop_saves(
         interval_metadata=index_by_place_interval(
             active_places(targets, target_batches=["2026"])
         ),
-        expected_target_ids=(),
-        counts=run_flow_module._RunCounts(),
         transformed_at=NOW,
-        persist_each_target=False,
+        force=False,
     )
 
     window = store.as_dict()["windows"]["per3600/20260523_0900"]
     assert save_count == 0
+    assert result.windows_partial == 1
+    assert result.posts_ok == 1
+    assert result.posts_failed == 1
     assert window["status"] == "partial"
     assert sorted(window["targets"]) == sorted(entity_ids(targets))
     assert window["targets"][targets[0].entity_id]["status"] == "failed"
     assert window["targets"][targets[1].entity_id]["status"] == "ok"
 
 
-def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
+def test_publish_and_replay_flow_window_have_final_state_parity(
+    tmp_path: Path,
+) -> None:
     targets = [place(place_number=10), place(place_number=11)]
     rows = [
         flow_row(group_place_id="sendai202603.10"),
@@ -810,8 +857,7 @@ def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
         now=Clock([NOW] * 10),
     )
 
-    run_flow_module._process_send_window(
-        "per3600/20260523_0900",
+    run_flow_module.publish_flow_window(
         interval_min=60,
         startdate="20260523_0900",
         rows_for_window=cast(Any, rows),
@@ -819,14 +865,11 @@ def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
         state_store=default_store,
         filter_settings=filter_settings(),
         interval_metadata=interval_metadata,
-        expected_target_ids=(),
-        counts=run_flow_module._RunCounts(),
         transformed_at=NOW,
     )
     default_store.save()
 
-    run_flow_module._process_send_window(
-        "per3600/20260523_0900",
+    run_flow_module.replay_flow_window(
         interval_min=60,
         startdate="20260523_0900",
         rows_for_window=cast(Any, rows),
@@ -834,10 +877,8 @@ def test_process_send_window_final_state_parity(tmp_path: Path) -> None:
         state_store=deferred_store,
         filter_settings=filter_settings(),
         interval_metadata=interval_metadata,
-        expected_target_ids=(),
-        counts=run_flow_module._RunCounts(),
         transformed_at=NOW,
-        persist_each_target=False,
+        force=False,
     )
     deferred_store.save()
 
@@ -1428,17 +1469,11 @@ def test_run_flow_failed_post_records_partial_and_nonzero_exit(
     assert partials[0].window == "per3600/20260523_0900"
 
 
-def test_run_flow_force_resend_reposts_unchanged_ok_target(
+def test_replay_flow_window_force_reposts_unchanged_ok_target(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """force_resend=True must bypass the prior-ok hash-skip and re-POST.
-
-    Mirrors test_run_flow_skips_unchanged_ok_target_and_keeps_window_complete
-    but calls _process_send_window directly with force_resend=True and
-    asserts Orion is hit. Public surface (run_once) does not expose the
-    kwarg; the scripts/resend.py CLI is the only caller that flips it.
-    """
+    """A forced replay bypasses the prior-ok hash skip and posts again."""
     row = flow_row()
     target = place()
     hash_value = transformed_hash(row, [target])
@@ -1465,11 +1500,8 @@ def test_run_flow_force_resend_reposts_unchanged_ok_target(
     interval_metadata = index_by_place_interval(
         active_places([target], target_batches=("2026",))
     )
-    counts = run_flow_module._RunCounts()
-
     with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
-        run_flow_module._process_send_window(
-            "per3600/20260523_0900",
+        result = run_flow_module.replay_flow_window(
             interval_min=60,
             startdate="20260523_0900",
             rows_for_window=[row],
@@ -1481,12 +1513,11 @@ def test_run_flow_force_resend_reposts_unchanged_ok_target(
                 target_direction_batches=frozenset(),
             ),
             interval_metadata=interval_metadata,
-            expected_target_ids=[target.entity_id],
-            counts=counts,
             transformed_at=NOW,
-            force_resend=True,
+            force=True,
         )
 
+    assert result.posts_ok == 1
     assert len(orion.calls) == 1
     assert orion.calls[0]["entity_id"] == target.entity_id
     # No skip event should have fired.
@@ -2504,7 +2535,7 @@ def test_main_dry_run_smoke_configures_logging_after_lock_and_never_live_posts(
     monkeypatch.setattr(
         run_flow_module.orion_client,
         "OrionClient",
-        lambda _settings, *, auth: orion,
+        lambda _settings, **_kwargs: orion,
     )
     monkeypatch.setattr(
         run_flow_module.entity_map,
@@ -2543,7 +2574,7 @@ def test_main_writes_lifecycle_records_to_configured_log_file(
     monkeypatch.setattr(
         run_flow_module.orion_client,
         "OrionClient",
-        lambda _settings, *, auth: orion,
+        lambda _settings, **_kwargs: orion,
     )
     monkeypatch.setattr(
         run_flow_module.entity_map,

@@ -31,10 +31,11 @@ Exit codes:
   expected value.
 - ``1`` — at least one observed NGSI ``type`` disagrees with the
   expected value (mismatch).
-- ``2`` — inconclusive: an entity_type returned no live entities, or
-  none of the sampled entities carried an expected Product A attribute.
-  The probe deliberately does not pass in this case — a silent "OK"
-  on an empty broker would be worse than a loud "could not verify".
+- ``2`` — inconclusive: metadata has no active entity_type, an
+  entity_type returned no live entities, or none of the sampled entities
+  carried an expected Product A attribute. The probe deliberately does
+  not pass in this case — a silent "OK" on an empty broker would be
+  worse than a loud "could not verify".
 """
 
 import os

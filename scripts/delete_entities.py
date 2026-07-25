@@ -338,11 +338,11 @@ def _purge_comet_history(
     """Best-effort purge of Comet history for one entity.
 
     Returns:
-        True if the purge completed without errors. False on any HTTP
-        failure. Callers do not change the exit code based on this
-        return value: per the d9459b5 spec amendment, Comet purge is
-        best-effort and failures are surfaced in the summary but do not
-        fail the run when the Orion delete already succeeded.
+        True if the purge completed without errors, False on any HTTP
+        failure. Callers do not change the exit code based on this return
+        value: Comet purge is best-effort, so a failure is surfaced in
+        the summary but does not fail the run when the Orion delete
+        already succeeded.
     """
     try:
         if attrs is None:

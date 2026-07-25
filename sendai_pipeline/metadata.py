@@ -2,7 +2,8 @@
 
 import csv
 import logging
-from collections.abc import Iterable
+import os
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -23,6 +24,7 @@ _VALID_BATCHES: frozenset[str] = frozenset({"2023", "2026"})
 _VALID_DEVICE_TYPES: frozenset[str] = frozenset({"Pixel3aUT", "M5Stack"})
 _VALID_INTERVALS: frozenset[int] = frozenset({5, 60})
 _ENTITY_ID_PREFIX = "jp.sendai."
+_DEFAULT_METADATA_PATH = Path("metadata/sensors.csv")
 INTERVAL_BY_TYPE_SUFFIX: dict[str, int] = {"per300": 5, "per3600": 60}
 
 
@@ -30,12 +32,29 @@ class MetadataLoadError(RuntimeError):
     """Raised when sensor metadata cannot be loaded or validated."""
 
 
+def metadata_path_from_env(env: Mapping[str, str] | None = None) -> Path:
+    """Return the runtime sensor metadata path.
+
+    Args:
+        env: Optional mapping used in place of ``os.environ`` for tests.
+
+    Returns:
+        ``SENSOR_METADATA_PATH`` when non-empty, otherwise
+        ``metadata/sensors.csv``.
+    """
+    source = os.environ if env is None else env
+    value = source.get("SENSOR_METADATA_PATH")
+    if value is None or value == "":
+        return _DEFAULT_METADATA_PATH
+    return Path(value)
+
+
 @dataclass(frozen=True)
 class SensorPlace:
     """A validated sensor target row from runtime metadata.
 
     Attributes:
-        place_number: Numeric place identifier derived by the metadata producer.
+        place_number: Numeric identifier for this sensor place, read from metadata.
         batch: Sensor installation batch identifier.
         expected_device_type: Device type expected for rows from this place.
         interval_min: Aggregation interval in minutes.
@@ -233,9 +252,9 @@ def _parse_row(row: dict[str, str | None], row_number: int) -> SensorPlace:
 def _required_value(row: dict[str, str | None], column: str, row_number: int) -> str:
     """Return a required CSV value exactly as written.
 
-    Whitespace-only values are rejected the same way empty strings are —
-    but non-empty values are left intact because metadata strings such as
-    entity ids and types are authoritative inputs, not reconstructed targets.
+    Whitespace-only values are rejected the same way empty strings are, but
+    non-empty values are returned unchanged: entity ids and types must match
+    the platform's records verbatim, so this function never reformats them.
     """
     raw = row.get(column)
     stripped = raw.strip() if raw is not None else ""

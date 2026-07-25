@@ -10,6 +10,8 @@ import pymysql
 import pymysql.connections
 import pymysql.cursors
 
+from sendai_pipeline.settings_validation import optional_env
+
 logger = logging.getLogger(__name__)
 
 FLOW_METRICS_TABLE: str = "flow_metrics2_per_place2_agg_imputed"
@@ -136,7 +138,7 @@ class DbSettings:
                 10,
             ),
             read_timeout=_optional_int_env(values, "MYSQL_READ_TIMEOUT", 30),
-            charset=_optional_env(values, "MYSQL_CHARSET", "utf8mb4"),
+            charset=optional_env(values, "MYSQL_CHARSET", "utf8mb4"),
         )
 
 
@@ -300,17 +302,9 @@ def _required_env(env: Mapping[str, str], key: str) -> str:
     return value
 
 
-def _optional_env(env: Mapping[str, str], key: str, default: str) -> str:
-    """Return the env value if set and non-empty, otherwise the default."""
-    value = env.get(key)
-    if value is None or value == "":
-        return default
-    return value
-
-
 def _optional_int_env(env: Mapping[str, str], key: str, default: int) -> int:
     """Return an optional integer environment value."""
-    value = _optional_env(env, key, "")
+    value = optional_env(env, key, "")
     if value == "":
         return default
 

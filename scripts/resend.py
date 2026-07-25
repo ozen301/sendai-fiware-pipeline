@@ -22,41 +22,21 @@ from sendai_pipeline.metadata import (
     active_places,
     index_by_place_interval,
     load_metadata,
+    metadata_path_from_env,
     parse_entity_id,
 )
 from sendai_pipeline.run_direction import (
-    JST,
+    DirectionWindowPublishResult,
     RunDirectionSettings,
-)
-from sendai_pipeline.run_direction import (
-    _format_sql_window_bound as direction_sql_bound,
-)
-from sendai_pipeline.run_direction import (
-    _process_send_window as process_direction_window,
-)
-from sendai_pipeline.run_direction import (
-    _RunCounts as DirectionCounts,
-)
-from sendai_pipeline.run_direction import (
-    _window_key as direction_window_key,
+    replay_direction_window,
 )
 from sendai_pipeline.run_flow import (
-    _format_sql_window_bound as flow_sql_bound,
-)
-from sendai_pipeline.run_flow import (
-    _metadata_path_from_env as metadata_path_from_env,
-)
-from sendai_pipeline.run_flow import (
-    _process_send_window as process_flow_window,
-)
-from sendai_pipeline.run_flow import (
-    _RunCounts as FlowCounts,
-)
-from sendai_pipeline.run_flow import (
-    _window_key as flow_window_key,
+    FlowWindowPublishResult,
+    replay_flow_window,
 )
 from sendai_pipeline.state import WindowStateStore
 from sendai_pipeline.state_tools import PRODUCT_LOCK_PATHS, PRODUCT_STATE_PATHS
+from sendai_pipeline.windowing import JST, format_sql_window_bound, window_key
 
 logger = logging.getLogger("sendai_pipeline")
 
@@ -91,14 +71,9 @@ class ResendPlan:
     direction_settings: RunDirectionSettings | None = None
 
     @property
-    def expected_target_ids(self) -> list[str]:
-        """Return the entity ids expected for each requested source window."""
-        return [place.entity_id for place in self.interval_metadata.values()]
-
-    @property
     def target_count(self) -> int:
         """Return the number of Orion targets written per source window."""
-        return 1 if self.product == "direction" else len(self.expected_target_ids)
+        return 1 if self.product == "direction" else len(self.interval_metadata)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -317,19 +292,19 @@ def _dry_run(plan: ResendPlan) -> int:
     _log_requested(plan)
     target_count = plan.target_count
     for startdate in plan.windows:
-        window_key = _window_key(plan.product, plan.interval_min, startdate)
+        state_key = window_key(plan.interval_min, startdate)
         write_plan = (
             "would_put=1"
             if plan.product == "direction"
             else f"would_post={target_count}"
         )
         print(
-            f"DRY-RUN: would resend {plan.product} {window_key} "
+            f"DRY-RUN: would resend {plan.product} {state_key} "
             f"(target_count={target_count}, skipped_by_hash=0, {write_plan})"
         )
         _log_window_processed(
             plan,
-            window_key=window_key,
+            window_key=state_key,
             rows=0,
             writes_ok=0,
             writes_failed=0,
@@ -375,59 +350,52 @@ def _send_resend(plan: ResendPlan) -> int:
             auth=auth_client,
         )
         db_connection = _connect_db()
-        gc_cutoff = _resend_gc_cutoff(run_started_at)
+        gc_cutoff = _resend_gc_cutoff(plan.product, run_started_at)
 
         counter = 0
         try:
             for startdate in plan.windows:
-                counts = _counts_for_product(plan.product)
-                window_key = _window_key(plan.product, plan.interval_min, startdate)
+                state_key = window_key(plan.interval_min, startdate)
                 rows, db_connection = _select_rows_with_reconnect(
                     plan,
                     db_connection,
-                    window_key=window_key,
+                    window_key=state_key,
                     startdate=startdate,
                 )
                 if not rows:
                     windows_empty += 1
-                    _log_window_empty(plan, window_key=window_key)
+                    _log_window_empty(plan, window_key=state_key)
                     continue
 
-                _process_window(
+                result = _process_window(
                     plan,
-                    window_key=window_key,
                     startdate=startdate,
                     rows=rows,
                     orion=orion,
                     state_store=store,
                     filter_settings=filter_settings,
-                    counts=counts,
                     transformed_at=run_started_at,
                 )
-                if plan.product == "flow":
-                    writes_ok += counts.posts_ok
-                    writes_failed += counts.posts_failed
+                if isinstance(result, FlowWindowPublishResult):
+                    window_writes_ok = result.posts_ok
+                    window_writes_failed = result.posts_failed
                 else:
-                    writes_ok += counts.puts_ok
-                    writes_failed += counts.puts_failed
-                    windows_no_payload += counts.windows_no_payload
-                    windows_source_invalid += counts.windows_source_invalid
-                    windows_degraded += counts.windows_degraded
-                run_windows_partial += counts.windows_partial
-                run_windows_complete += counts.windows_complete
+                    window_writes_ok = result.puts_ok
+                    window_writes_failed = result.puts_failed
+                    windows_no_payload += result.windows_no_payload
+                    windows_source_invalid += result.windows_source_invalid
+                    windows_degraded += result.windows_degraded
+                writes_ok += window_writes_ok
+                writes_failed += window_writes_failed
+                run_windows_partial += result.windows_partial
+                run_windows_complete += result.windows_complete
                 _log_window_processed(
                     plan,
-                    window_key=window_key,
+                    window_key=state_key,
                     rows=len(rows),
-                    writes_ok=(
-                        counts.posts_ok if plan.product == "flow" else counts.puts_ok
-                    ),
-                    writes_failed=(
-                        counts.posts_failed
-                        if plan.product == "flow"
-                        else counts.puts_failed
-                    ),
-                    rows_dropped=counts.rows_dropped,
+                    writes_ok=window_writes_ok,
+                    writes_failed=window_writes_failed,
+                    rows_dropped=result.rows_dropped,
                     count_skipped=0,
                     count_would_create=plan.target_count,
                     dry_run=False,
@@ -476,18 +444,19 @@ def _abort_on_dead_letter_windows(
     """Abort live resend when requested windows include dead-letter state."""
     dead_letter_keys: list[str] = []
     for startdate in plan.windows:
-        window_key = _window_key(plan.product, plan.interval_min, startdate)
-        if store.window_status(window_key) == "dead_letter":
-            dead_letter_keys.append(window_key)
+        state_key = window_key(plan.interval_min, startdate)
+        if store.window_status(state_key) == "dead_letter":
+            dead_letter_keys.append(state_key)
     if dead_letter_keys:
         raise ResendConfigError(
             f"resend range contains dead-letter window(s): {_csv(dead_letter_keys)}"
         )
 
 
-def _resend_gc_cutoff(run_started_at: datetime) -> datetime:
-    """Return the stable complete-window GC cutoff for a resend run."""
-    max_hours = max(_max_lookback_hours(5), _max_lookback_hours(60))
+def _resend_gc_cutoff(product: str, run_started_at: datetime) -> datetime:
+    """Return the stable complete-window GC cutoff for one product resend."""
+    intervals = (5, 60) if product == "flow" else (60,)
+    max_hours = max(_max_lookback_hours(interval_min) for interval_min in intervals)
     horizon_hours = max(0, 2 * max_hours)
     return run_started_at - timedelta(hours=horizon_hours)
 
@@ -573,18 +542,15 @@ def _product_lock(product: str) -> Iterator[None]:
 def _process_window(
     plan: ResendPlan,
     *,
-    window_key: str,
     startdate: str,
     rows: list[Mapping[str, Any]],
     orion: Any,
     state_store: WindowStateStore,
     filter_settings: FilterSettings,
-    counts: Any,
     transformed_at: datetime,
-) -> None:
+) -> FlowWindowPublishResult | DirectionWindowPublishResult:
     if plan.product == "flow":
-        process_flow_window(
-            window_key,
+        return replay_flow_window(
             interval_min=plan.interval_min,
             startdate=startdate,
             rows_for_window=rows,
@@ -592,18 +558,13 @@ def _process_window(
             state_store=state_store,
             filter_settings=filter_settings,
             interval_metadata=plan.interval_metadata,
-            expected_target_ids=plan.expected_target_ids,
-            counts=counts,
             transformed_at=transformed_at,
-            force_resend=plan.force,
-            persist_each_target=False,
+            force=plan.force,
         )
-        return
 
     if plan.direction_settings is None:
         raise ResendConfigError("direction resend requires aggregate settings")
-    process_direction_window(
-        window_key,
+    return replay_direction_window(
         interval_min=plan.interval_min,
         startdate=startdate,
         rows_for_window=rows,
@@ -612,9 +573,8 @@ def _process_window(
         settings=plan.direction_settings,
         filter_settings=filter_settings,
         interval_metadata=plan.interval_metadata,
-        counts=counts,
         transformed_at=transformed_at,
-        force_resend=plan.force,
+        force=plan.force,
     )
 
 
@@ -627,7 +587,6 @@ def _select_rows(
     max_imputation_tier: int | None,
 ) -> list[Mapping[str, Any]]:
     source_start = _parse_window_arg(startdate, flag="window")
-    sql_bound = flow_sql_bound if product == "flow" else direction_sql_bound
     if product == "flow":
         if max_imputation_tier is None:
             raise ResendConfigError("flow resend requires an imputation-tier ceiling")
@@ -635,8 +594,8 @@ def _select_rows(
             db.select_flow_metrics(
                 db_connection,
                 interval_min=interval_min,
-                lower_bound=sql_bound(source_start),
-                upper_bound=sql_bound(source_start),
+                lower_bound=format_sql_window_bound(source_start),
+                upper_bound=format_sql_window_bound(source_start),
                 max_imputation_tier=max_imputation_tier,
             )
         )
@@ -644,8 +603,8 @@ def _select_rows(
         db.select_direction_metrics(
             db_connection,
             interval_min=interval_min,
-            lower_bound=sql_bound(source_start),
-            upper_bound=sql_bound(source_start),
+            lower_bound=format_sql_window_bound(source_start),
+            upper_bound=format_sql_window_bound(source_start),
         )
     )
 
@@ -720,14 +679,8 @@ def _close_db_connection(db_connection: Any) -> None:
 
 
 def _connect_db() -> Any:
-    try:
-        settings = db.DbSettings.from_env()
-    except db.DbConfigError as exc:
-        try:
-            return db.connect(cast("Any", None))
-        except Exception:
-            raise exc
-    return db.connect(settings)
+    """Connect using the configured MySQL settings."""
+    return db.connect(db.DbSettings.from_env())
 
 
 def _non_negative_int(value: str) -> int:
@@ -738,16 +691,6 @@ def _non_negative_int(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("must be non-negative")
     return parsed
-
-
-def _counts_for_product(product: str) -> Any:
-    return FlowCounts() if product == "flow" else DirectionCounts()
-
-
-def _window_key(product: str, interval_min: int, startdate: str) -> str:
-    if product == "flow":
-        return flow_window_key(interval_min, startdate)
-    return direction_window_key(interval_min, startdate)
 
 
 def _parse_window_arg(value: str, *, flag: str) -> datetime:

@@ -262,21 +262,55 @@ or purged during the aggregate cutover.
 | Schedule | Cron (or systemd timer), every 5 minutes. |
 | Source stability delay | Process windows whose `startdate` is at or before `now − SOURCE_STABILITY_DELAY_HOURS` (default 3h). Separate from the 72h retry horizon. |
 | Fresh-path catch-up | Each run reprocesses a rolling `startdate` lookback against the per-window state store. Missed or failed targets are picked up on the next run while their window is still inside the lookback. The lookback widens to cover open windows already in state, but only up to `MAX_LOOKBACK_HOURS_*` (72h by default). The fresh path cannot reach a window it never saw once that window ages past the reprocess floor (`REPROCESS_HOURS_*`). |
-| Revision-sweep catch-up | A second catch-up path is independent of the normal `startdate` lookback. It scans each source table by `aggregated_at` to discover older `(interval_min, startdate)` windows whose source rows were inserted or revised at or after the sweep cursor, then sends the current payload for those windows. Because it selects by `aggregated_at` rather than by recency, the sweep also recovers such missed windows: their `aggregated_at` is at or after the cursor, so the sweep discovers and resends them. When the sweep is disabled (`REVISION_SWEEP_ENABLED=false`) it does not run at all — no scan, no resend — and even when enabled it cannot reach windows whose `aggregated_at` predates the cursor's starting point. In those cases, republish the affected windows per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). |
+| Revision-sweep catch-up | A second catch-up path, independent of the `startdate` lookback, scans each source table by `aggregated_at` to discover `(interval_min, startdate)` windows inserted or revised at or after the sweep cursor, then sends their current payload; this reaches windows too old for the rolling lookback. `REVISION_SWEEP_ENABLED=false` disables it entirely (no scan, no resend). It cannot reach windows whose `aggregated_at` predates the cursor's starting point; recover those per "Resuming after a planned downtime longer than `REPROCESS_HOURS_*`" in [tools_and_troubleshooting.md](tools_and_troubleshooting.md). The precise recovery guarantee and its limits are stated after this table. |
 | Revision cursor | `last_aggregated_at` is a per-product, forward-only watermark: automatic discovery considers revisions at or after this value, while revisions below it are outside the sweep. It lives at the top of that product's state JSON (`state/flow.json` or `state/direction.json`) and advances forward once per run. A failed send does not hold it back; failures are remembered in the per-window state store and retried from there. To re-sweep from an earlier point, edit that product's cursor in its state file. |
 | Retry | Exponential backoff on `5xx` and network errors (1s, 2s, 4s, 8s, 16s). On `429`, the client honors a `Retry-After` header when present and otherwise falls back to the same backoff. Single `401` triggers a forced token refresh and one extra retry within the retry budget (a `401` arriving on the final attempt is not retried further). Other `4xx` is fatal for that write. |
 | Token refresh | OAuth2 client-credentials; proactive on expiry and on `401`. |
 | Logging | One structured line per Orion write in `logs/{product}.log` (rotating). The line carries the target entity id, HTTP status, and a payload hash + byte count. Whether the full request/response bodies are also logged is controlled by `LOG_PAYLOAD_MODE`: `hash` (always hash only), `failure` (default: hash on success, body excerpt on failure), or `full` (always body). |
 
-Revision cursor comparisons depend on the MySQL session time zone.
-`last_aggregated_at` is stored as a JST ISO timestamp, then formatted
-as a second-resolution `YYYY-MM-DD HH:MM:SS` SQL bound. The source
-`aggregated_at` columns are MySQL `timestamp` columns, so MySQL compares
-and returns them in the current session time zone. Runtime DB sessions
-used by the runners must therefore resolve to JST (`+09:00`), for
-example `@@session.time_zone = 'SYSTEM'` only when
-`@@system_time_zone = 'JST'`. A non-JST session can shift revision
-cursor ranges and cause the sweep to skip or repeat revised windows.
+Automatic revision recovery applies when a product runs in send mode, has
+target batches configured, has `REVISION_SWEEP_ENABLED=true`, and has a current
+revision cursor. Under those conditions, an eligible source insert or revision
+is selected by the first successful run whose discovery upper bound passes its
+`aggregated_at` value. The source transaction must be committed and visible
+before discovery, and the capped work selection must reach that window. The
+soft `REVISION_SWEEP_MAX_WINDOWS` limit expands to keep every discovery from
+one `aggregated_at` second together. This includes source windows too old for
+the rolling lookback. A write failure can require a later retry from window
+state. A transaction that becomes visible only after the sweep query, with an
+`aggregated_at` value already behind the advanced cursor, is outside this
+guarantee because discovery has no overlap or safety lag.
+
+During an initial cursor drain or a backlog larger than the per-run cap, there
+is no fixed wall-clock recovery target. Each successful send-mode run scans at
+most six hours of `aggregated_at` time and applies the soft work limit. A run
+can exceed that limit to keep one `aggregated_at` second together; otherwise it
+leaves the cursor at the first deferred second and reports the cap-deferred
+discovery count in `revision_sweep_summary`. Subsequent runs continue draining
+only while they complete successfully with the product and sweep enabled in
+send mode. Retrying previously failed old windows starts only at steady state
+and uses capacity left after newly discovered work, so it also has no fixed
+completion target while a backlog is draining. Changes whose `aggregated_at`
+predates the initial cursor are outside automatic recovery and require explicit
+replay.
+
+The cursor field may be missing or JSON `null`, which represents no stored
+cursor and invokes the product-specific initialization behavior described
+below. A non-null cursor must be an ISO datetime string. A wrong JSON type or
+malformed string is corrupt state and must fail during state loading, before
+the runner reads MySQL or writes Orion. A timezone-naive string is interpreted
+as JST; an aware string is converted to JST for comparisons. Cursor values
+written by the pipeline when it initializes or advances the sweep are JST
+timestamps with an explicit `+09:00` offset.
+
+Revision cursor comparisons depend on the MySQL session time zone. The runner
+normalizes `last_aggregated_at` to JST, then formats it as a second-resolution
+`YYYY-MM-DD HH:MM:SS` SQL bound. The source `aggregated_at` columns are MySQL
+`timestamp` columns, so MySQL compares and returns them in the current session
+time zone. Runtime DB sessions used by the runners must therefore resolve to
+JST (`+09:00`), for example `@@session.time_zone = 'SYSTEM'` only when
+`@@system_time_zone = 'JST'`. A non-JST session can shift revision cursor ranges
+and cause the sweep to skip or repeat revised windows.
 
 The fresh-path and revision-sweep catch-ups split work by window age, at
 the lookback's lower bound (i.e., the oldest `startdate` the fresh path
@@ -284,11 +318,11 @@ reprocesses this run). The fresh path owns windows whose `startdate` is
 at or after that bound (the more recent windows, inside the lookback);
 the sweep owns windows whose `startdate` is strictly before it (the
 older windows). No window is processed by both paths in one run.
-§2.9's payload-hash check collapses redundant writes on the fresh path
-and on sweep *retry* items, but a sweep *discovery* force-sends the
-current payload without a hash-skip, so during an initial cursor drain a
-window the fresh path already re-sent can be re-sent once more as an
-additional corrective history row.
+§2.9's payload-hash check collapses redundant writes on the fresh path and on
+sweep *retry* items. Product A also hash-skips an unchanged prior-success
+payload during sweep discovery. Product B force-sends a sweep discovery, so
+during its cursor processing a window the fresh path already re-sent can be
+sent once more as an additional corrective history row.
 
 When a send-mode Product B revision sweep has no stored cursor, it initializes
 `last_aggregated_at` to the run's start time, truncated to whole seconds. The
@@ -508,8 +542,7 @@ Load-bearing columns:
 Apply these rules before constructing the aggregate package:
 
 1. Keep only `interval_min = 60`. Five-minute direction rows never produce a
-   Product B write, even when `REPROCESS_HOURS_PER300` or
-   `MAX_LOOKBACK_HOURS_PER300` is configured.
+   Product B write. Product B uses the 60-minute timing settings only.
 2. Drop a row if either place id matches `IGNORED_PLACE_PREFIXES`. The literal
    `'ALL'` is exempt because it is a source total key.
 3. Resolve every non-`ALL` endpoint through active metadata. Its source batch
@@ -518,21 +551,16 @@ Apply these rules before constructing the aggregate package:
 4. Select the expected device type from the oldest targeted active batch for
    interval 60. Keep a row only when both device-type fields match it.
 
-Self-loop rows are retained. A surviving `N→N` row is a real movement route,
-not a duplicate to discard. Cross-batch pairs are also valid when both places
-resolve and the row passes the selected device-type filter.
-
-Cross-batch direction pairs are valid Product B observations. The same
-selected device type is used for pairwise rows and `'ALL'` rows so the
-inter-place values and the pre-computed deduplicated totals come from
-the same source device population.
-
-The source table stores parallel pairwise and `'ALL'` rows under both
-`(Pixel3aUT, Pixel3aUT)` and `(M5Stack, M5Stack)` for every place. Mixed
-`(Pixel3aUT, M5Stack)` pairings do not occur. The device-type filter is a
-required disambiguator, not just a cross-batch exclusion. Adding a batch to
-`TARGET_DIRECTION_BATCHES` can change the oldest selected device type for all
-included places; this city-wide filter is part of the contract.
+Self-loop `N→N` rows are retained as real routes, and cross-batch pairs are
+valid when both places resolve and pass the device-type filter. The source
+stores parallel pairwise and `'ALL'` rows under both `(Pixel3aUT, Pixel3aUT)`
+and `(M5Stack, M5Stack)` for every place; mixed `(Pixel3aUT, M5Stack)` pairings
+do not occur. The single selected device type is applied to both pairwise and
+`'ALL'` rows so the inter-place values and the deduplicated totals come from the
+same source population. It is therefore a required disambiguator, not just a
+cross-batch exclusion. Adding a batch to `TARGET_DIRECTION_BATCHES` can change
+the oldest selected device type for all included places; this city-wide filter
+is part of the contract.
 
 ### 4.3 Attribute mapping (request body)
 
@@ -935,12 +963,11 @@ not make disjoint entities reachable. A missing type, type pattern, malformed
 selector, or other non-canonical selector fails closed.
 
 Subscription creation keeps `options=skipInitialNotification` when
-`STH_SUBSCRIPTION_SKIP_INITIAL=true`. The body contains no `throttling` field.
+`STH_SUBSCRIPTION_SKIP_INITIAL=true`. The all-attribute subscription is safe
+only because Product B exclusively owns the entity and replaces all attributes
+on every write.
 
-The all-attribute subscription is safe only because Product B exclusively owns
-the entity and replaces all attributes on every write.
-
-Neither product's subscription sets `throttling`; per-subscription throttling
+Neither product's subscription sets `throttling`: per-subscription throttling
 can silently discard burst notifications, including Product A bursts and
 Product B backlog or revision writes.
 

@@ -167,7 +167,7 @@ def refresh_metadata(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point. Returns a fixed exit code matrix.
+    """CLI entry point. Returns one of a fixed set of exit codes.
 
     Exit codes:
         0 on success.
@@ -264,8 +264,8 @@ def _read_stable_keys(path: Path) -> set[tuple[int, int]]:
 def _read_staged_rows(path: Path) -> list[dict[str, str]]:
     """Read the staged refreshable CSV and rename ``ID`` to ``identifcation``.
 
-    The staged header must carry every canonical column except
-    ``identifcation`` is replaced by ``ID``; missing columns are rejected
+    The staged header must carry every canonical column, with
+    ``identifcation`` replaced by ``ID``; missing columns are rejected
     even when the file has zero data rows so an operator typo is caught
     before stable rows alone are written as the runtime metadata. ``ID``
     values are whitespace-trimmed so the combined output already carries

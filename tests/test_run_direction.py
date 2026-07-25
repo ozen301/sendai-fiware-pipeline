@@ -6,7 +6,7 @@ from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -290,9 +290,7 @@ def settings(tmp_path: Path, **overrides: Any) -> RunDirectionSettings:
     values: dict[str, Any] = {
         "send_mode": "send",
         "reprocess_hours_per3600": 12,
-        "reprocess_hours_per300": 2,
         "max_lookback_hours_per3600": 72,
-        "max_lookback_hours_per300": 72,
         "source_stability_delay_hours": 3,
         "revision_sweep_enabled": False,
         "state_path": tmp_path / "state" / "direction.json",
@@ -447,6 +445,184 @@ def test_run_direction_result_uses_put_counters_and_no_write_window_counters() -
     ]
 
 
+def test_publish_and_replay_direction_window_preserve_hash_skip_and_force(
+    tmp_path: Path,
+) -> None:
+    state_store = store(tmp_path)
+    orion = FakeOrionClient()
+    common = {
+        "interval_min": 60,
+        "startdate": "20260715_0900",
+        "rows_for_window": sendable_window(),
+        "orion": orion,
+        "state_store": state_store,
+        "settings": settings(tmp_path),
+        "filter_settings": filters(),
+        "interval_metadata": {(10, 60): place(10)},
+        "transformed_at": NOW,
+    }
+
+    published = run_direction_module.publish_direction_window(**common)
+    skipped = run_direction_module.replay_direction_window(**common, force=False)
+    forced = run_direction_module.replay_direction_window(**common, force=True)
+
+    assert published == run_direction_module.DirectionWindowPublishResult(
+        windows_complete=1,
+        windows_partial=0,
+        windows_dead_letter=0,
+        puts_ok=1,
+        puts_failed=0,
+        windows_degraded=0,
+        windows_no_payload=0,
+        windows_source_invalid=0,
+        rows_dropped=0,
+    )
+    assert skipped.puts_ok == 0
+    assert skipped.windows_complete == 1
+    assert forced.puts_ok == 1
+    assert len(orion.replace_calls) == 2
+    assert not hasattr(published, "windows_seen")
+
+
+def test_publish_direction_window_returns_no_payload_without_state(
+    tmp_path: Path,
+) -> None:
+    state_store = store(tmp_path)
+
+    result = run_direction_module.publish_direction_window(
+        interval_min=60,
+        startdate="20260715_0900",
+        rows_for_window=[
+            direction_row(
+                from_group_place_id="quick.10",
+                to_group_place_id="sendai202603.10",
+            )
+        ],
+        orion=FakeOrionClient(),
+        state_store=state_store,
+        settings=settings(tmp_path),
+        filter_settings=filters(),
+        interval_metadata={(10, 60): place(10)},
+        transformed_at=NOW,
+    )
+
+    assert result.windows_no_payload == 1
+    assert result.puts_ok == 0
+    assert "per3600/20260715_0900" not in state_store.as_dict()["windows"]
+
+
+def test_replay_direction_window_performs_no_in_loop_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_store = store(tmp_path)
+    save_count = 0
+
+    def save_spy() -> None:
+        nonlocal save_count
+        save_count += 1
+
+    monkeypatch.setattr(state_store, "save", save_spy)
+
+    result = run_direction_module.replay_direction_window(
+        interval_min=60,
+        startdate="20260715_0900",
+        rows_for_window=cast(Any, sendable_window()),
+        orion=FakeOrionClient([{"status": 502, "ok": False}]),
+        state_store=state_store,
+        settings=settings(tmp_path),
+        filter_settings=filters(),
+        interval_metadata={(10, 60): place(10)},
+        transformed_at=NOW,
+        force=False,
+    )
+
+    assert save_count == 0
+    assert result.windows_partial == 1
+    assert result.puts_failed == 1
+    assert state_store.window_status("per3600/20260715_0900") == "partial"
+
+
+def test_publish_direction_window_retains_pre_recompute_save_order(
+    tmp_path: Path,
+) -> None:
+    state_store = store(tmp_path)
+
+    result = run_direction_module.publish_direction_window(
+        interval_min=60,
+        startdate="20260715_0900",
+        rows_for_window=cast(Any, sendable_window()),
+        orion=FakeOrionClient([{"status": 204, "ok": True}]),
+        state_store=state_store,
+        settings=settings(tmp_path),
+        filter_settings=filters(),
+        interval_metadata={(10, 60): place(10)},
+        transformed_at=NOW,
+    )
+
+    reloaded = WindowStateStore.load(state_store.path)
+    assert result.windows_complete == 1
+    assert state_store.window_status("per3600/20260715_0900") == "complete"
+    assert reloaded.window_status("per3600/20260715_0900") == "pending"
+
+
+def test_publish_and_replay_direction_window_have_final_state_parity(
+    tmp_path: Path,
+) -> None:
+    normal_store = WindowStateStore(
+        tmp_path / "normal" / "direction.json",
+        now=Clock([NOW] * 30),
+    )
+    replay_store = WindowStateStore(
+        tmp_path / "replay" / "direction.json",
+        now=Clock([NOW] * 30),
+    )
+    common = {
+        "interval_min": 60,
+        "startdate": "20260715_0900",
+        "rows_for_window": sendable_window(),
+        "settings": settings(tmp_path),
+        "filter_settings": filters(),
+        "interval_metadata": {(10, 60): place(10)},
+        "transformed_at": NOW,
+    }
+
+    run_direction_module.publish_direction_window(
+        **common,
+        orion=FakeOrionClient([{"status": 502, "ok": False}]),
+        state_store=normal_store,
+    )
+    normal_store.save()
+    run_direction_module.replay_direction_window(
+        **common,
+        orion=FakeOrionClient([{"status": 502, "ok": False}]),
+        state_store=replay_store,
+        force=False,
+    )
+    replay_store.save()
+
+    assert json.loads(normal_store.path.read_text(encoding="utf-8")) == json.loads(
+        replay_store.path.read_text(encoding="utf-8")
+    )
+
+
+def test_publish_direction_window_rejects_five_minute_interval(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="Product B supports only 60-minute"):
+        run_direction_module.publish_direction_window(
+            interval_min=5,
+            startdate="20260715_0900",
+            rows_for_window=[],
+            orion=FakeOrionClient(),
+            state_store=store(tmp_path),
+            settings=settings(tmp_path),
+            filter_settings=filters(),
+            interval_metadata={},
+            transformed_at=NOW,
+        )
+
+
 def test_run_direction_empty_batch_gate_is_safe_no_op(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -582,6 +758,42 @@ def test_run_direction_groups_each_source_window_before_transform_and_put(
     assert len(orion.replace_calls) == 3
     assert {call["entity_id"] for call in orion.replace_calls} == {AGGREGATE_ID}
     assert orion.update_calls == []
+
+
+def test_run_direction_normal_publish_merges_result_and_owns_windows_seen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def publish_spy(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return run_direction_module.DirectionWindowPublishResult(
+            windows_complete=1,
+            windows_partial=0,
+            windows_dead_letter=0,
+            puts_ok=2,
+            puts_failed=0,
+            windows_degraded=0,
+            windows_no_payload=0,
+            windows_source_invalid=0,
+            rows_dropped=3,
+        )
+
+    monkeypatch.setattr(run_direction_module, "publish_direction_window", publish_spy)
+
+    result = run_once(
+        tmp_path=tmp_path,
+        db_connection=FakeDbConnection({60: sendable_window()}),
+        orion=FakeOrionClient(),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["startdate"] == "20260715_0900"
+    assert result.windows_seen == 1
+    assert result.windows_complete == 1
+    assert result.puts_ok == 2
+    assert result.rows_dropped == 3
 
 
 def test_run_direction_204_put_records_one_aggregate_target_ok(
@@ -982,6 +1194,74 @@ def test_run_direction_revision_sweep_discovers_only_60_and_refetches_full_windo
         "to": {"10": 0, "11": 0, "all": 5},
     }
     assert orion.update_calls == []
+
+
+def test_run_direction_revision_saves_completed_attempt_before_later_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first_startdate = "20260701_0900"
+    second_startdate = "20260701_1000"
+    old_cursor = "2026-07-15T12:00:00+09:00"
+    path = tmp_path / "state" / "direction.json"
+    write_state(path, {}, last_aggregated_at=old_cursor)
+    state_store = WindowStateStore.load(path, now=Clock([NOW] * 30))
+    db_connection = FakeDbConnection(
+        {60: []},
+        startdate_rows_by_interval={
+            60: [
+                *sendable_window(first_startdate),
+                *sendable_window(second_startdate),
+            ]
+        },
+        discovery_rows_by_interval={
+            60: [
+                revision_row(first_startdate, "2026-07-15 12:01:00"),
+                revision_row(second_startdate, "2026-07-15 12:02:00"),
+            ]
+        },
+    )
+    orion = FakeOrionClient()
+    real_replace = orion.replace_attrs
+    replace_count = 0
+
+    def replace_then_fail(
+        entity_id: str,
+        entity_type: str | None,
+        attrs: Mapping[str, Any],
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        nonlocal replace_count
+        replace_count += 1
+        if replace_count == 2:
+            raise RuntimeError("later revision failed")
+        return real_replace(
+            entity_id,
+            entity_type,
+            attrs,
+            dry_run=dry_run,
+        )
+
+    monkeypatch.setattr(orion, "replace_attrs", replace_then_fail)
+
+    with pytest.raises(RuntimeError, match="later revision failed"):
+        run_once(
+            tmp_path=tmp_path,
+            db_connection=db_connection,
+            orion=orion,
+            state_store=state_store,
+            run_settings=settings(tmp_path, revision_sweep_enabled=True),
+        )
+
+    reloaded = WindowStateStore.load(path)
+    first_key = f"per3600/{first_startdate}"
+    first_target = reloaded.target_record(first_key, AGGREGATE_ID)
+    assert first_target is not None
+    assert first_target["status"] == "ok"
+    assert reloaded.window_status(first_key) == "pending"
+    assert f"per3600/{second_startdate}" not in reloaded.as_dict()["windows"]
+    assert reloaded.revision_cursor() == datetime.fromisoformat(old_cursor)
 
 
 def test_run_direction_revision_resends_unchanged_complete_window_with_new_retrieval(

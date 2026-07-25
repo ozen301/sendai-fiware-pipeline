@@ -118,6 +118,21 @@ def _write_state(path: Path, windows: dict[str, dict[str, object]]) -> None:
     )
 
 
+def _write_revision_cursor_state(path: Path, cursor: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": state_module.SCHEMA_VERSION,
+                "last_aggregated_at": cursor,
+                "windows": {},
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_load_missing_file_returns_empty_store(tmp_path: Path) -> None:
     path = _state_path(tmp_path)
 
@@ -210,6 +225,66 @@ def test_revision_cursor_absent_key_loads_as_none(tmp_path: Path) -> None:
 
     assert store.revision_cursor() is None
     assert store.as_dict()["last_aggregated_at"] is None
+
+
+def test_revision_cursor_explicit_null_loads_as_none(tmp_path: Path) -> None:
+    path = _state_path(tmp_path)
+    _write_revision_cursor_state(path, None)
+
+    store = WindowStateStore.load(path, now=Clock([T0]))
+
+    assert store.revision_cursor() is None
+    assert store.as_dict()["last_aggregated_at"] is None
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        "2026-07-24T12:00:00",
+        "2026-07-23T23:00:00-04:00",
+    ],
+    ids=["naive", "non-jst-aware"],
+)
+def test_revision_cursor_valid_iso_string_preserves_loaded_value(
+    tmp_path: Path,
+    cursor: str,
+) -> None:
+    path = _state_path(tmp_path)
+    _write_revision_cursor_state(path, cursor)
+
+    store = WindowStateStore.load(path, now=Clock([T0]))
+
+    assert store.revision_cursor() == datetime.fromisoformat(cursor)
+    assert store.as_dict()["last_aggregated_at"] == cursor
+
+
+@pytest.mark.parametrize(
+    "cursor",
+    [0, False, [], {}, "", "not-a-datetime", "2026-02-30T12:00:00"],
+    ids=[
+        "number",
+        "boolean",
+        "array",
+        "object",
+        "empty-string",
+        "non-date-string",
+        "invalid-date-string",
+    ],
+)
+def test_revision_cursor_invalid_value_fails_during_load(
+    tmp_path: Path,
+    cursor: object,
+) -> None:
+    path = _state_path(tmp_path)
+    _write_revision_cursor_state(path, cursor)
+
+    with pytest.raises(
+        StateLoadError,
+        match="last_aggregated_at must be an ISO datetime string",
+    ) as excinfo:
+        WindowStateStore.load(path, now=Clock([T0]))
+
+    assert str(path) in str(excinfo.value)
 
 
 def test_revision_cursor_round_trips_through_load_and_save(tmp_path: Path) -> None:

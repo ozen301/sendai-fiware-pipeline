@@ -20,8 +20,9 @@ Two independent pipelines run every five minutes and write to separate
 FIWARE entities. Product A publishes per-place counts to one entity per
 place and interval, at both 5-minute and 60-minute aggregation. Product B
 publishes inter-place flow to a single aggregate entity, at 60-minute
-aggregation only. Both feed the FIWARE platform's time-series history service so that
-values are available as both "current" (via *Orion API*) and "historical" (via *STH-Comet API*).
+aggregation only. Both feed the FIWARE platform's time-series history service, so values are
+available both as "current" (via the *Orion API*) and as history (via the
+*STH-Comet API*).
 Source schemas, entity ids, batch names, and deployment procedures intentionally match
 the Sendai environment; runtime configuration, real sensor metadata,
 logs, state, and local reference material are not included.

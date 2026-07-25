@@ -1,7 +1,61 @@
-"""Shared validation for environment-backed settings."""
+"""Validation and default handling for environment-backed settings."""
 
 import unicodedata
 from collections.abc import Mapping
+
+
+def optional_env(
+    env: Mapping[str, str],
+    key: str,
+    default: str,
+) -> str:
+    """Return the environment value, treating only missing or empty as unset.
+
+    Empty ``KEY=`` placeholders in ``.env`` files use the documented default.
+    Non-empty values are returned unchanged, including surrounding whitespace;
+    callers may normalize them after reading.
+    """
+    value = env.get(key)
+    if value is None or value == "":
+        return default
+    return value
+
+
+def parse_int_env(
+    env: Mapping[str, str],
+    key: str,
+    default: int,
+    error_type: type[Exception],
+) -> int:
+    """Parse an optional integer, raising the supplied configuration error."""
+    value = optional_env(env, key, "")
+    if value == "":
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise error_type(f"environment variable must be an integer: {key}") from exc
+
+
+def validate_non_negative_settings(
+    values: Mapping[str, int],
+    error_type: type[Exception],
+) -> None:
+    """Reject negative integer settings with their environment names."""
+    for key, value in values.items():
+        if value < 0:
+            raise error_type(f"environment variable must be non-negative: {key}")
+
+
+def validate_lookback_ceiling(
+    name: str,
+    reprocess_hours: int,
+    max_hours: int,
+    error_type: type[Exception],
+) -> None:
+    """Reject a maximum lookback below its matching reprocess floor."""
+    if max_hours < reprocess_hours:
+        raise error_type(f"MAX_LOOKBACK_HOURS_{name} must be >= REPROCESS_HOURS_{name}")
 
 
 def parse_exact_env_value(

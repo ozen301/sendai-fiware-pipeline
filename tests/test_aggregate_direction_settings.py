@@ -125,3 +125,15 @@ def test_settings_from_env_ignores_direction_revision_cursor_seed(
     assert settings_with_seed == settings_without_seed
     field_names = {field.name for field in fields(settings_with_seed)}
     assert not any("revision" in name and "seed" in name for name in field_names)
+
+
+def test_runner_settings_ignore_product_a_five_minute_timing_settings() -> None:
+    settings_without_product_a_values = RunDirectionSettings.from_env({})
+    settings_with_product_a_values = RunDirectionSettings.from_env(
+        {
+            "REPROCESS_HOURS_PER300": "not-an-integer",
+            "MAX_LOOKBACK_HOURS_PER300": "also-not-an-integer",
+        }
+    )
+
+    assert settings_with_product_a_values == settings_without_product_a_values

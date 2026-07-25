@@ -8,7 +8,7 @@ import os
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -22,9 +22,33 @@ from sendai_pipeline.metadata import (
     active_places,
     index_by_place_interval,
     load_metadata,
+    metadata_path_from_env,
+)
+from sendai_pipeline.revision_sweep import (
+    RevisionWorkItem,
+    revision_retry_items,
+    split_discovered_revisions,
+)
+from sendai_pipeline.settings_validation import (
+    optional_env,
+    parse_int_env,
+    validate_lookback_ceiling,
+    validate_non_negative_settings,
 )
 from sendai_pipeline.state import WindowStateStore
 from sendai_pipeline.transform_flow import transform_flow_rows
+from sendai_pipeline.windowing import (
+    JST,
+    coerce_jst_datetime,
+    eligible_source_cutoff,
+    format_mysql_timestamp,
+    format_sql_window_bound,
+    parse_revision_aggregated_at,
+    parse_source_window_start,
+)
+from sendai_pipeline.windowing import (
+    window_key as make_window_key,
+)
 
 logger = logging.getLogger(__name__)
 # Under ``python -m sendai_pipeline.run_flow``, ``__name__`` is ``"__main__"``.
@@ -32,17 +56,14 @@ logger = logging.getLogger(__name__)
 # the rotating file handler and keep a stable JSON ``logger`` field.
 _lifecycle_logger = logging.getLogger("sendai_pipeline")
 
-JST = timezone(timedelta(hours=9))
-
 _INTERVALS: tuple[int, ...] = (5, 60)
 _INTERVAL_PREFIXES: dict[int, str] = {5: "per300", 60: "per3600"}
 _VALID_SEND_MODES: frozenset[str] = frozenset({"dry-run", "send"})
-_DEFAULT_METADATA_PATH = Path("metadata/sensors.csv")
 _DEFAULT_SOURCE_STABILITY_DELAY_HOURS = 3
 _DEFAULT_REVISION_SWEEP_MAX_WINDOWS = 2000
 
-# Revision cursor state is stored as a JST ISO datetime.  Discovery crosses the
-# MySQL boundary as second-resolution wall-clock strings in the JST session.
+# The cursor persists as a JST ISO datetime.  When a discovery query reaches
+# MySQL, that same instant is passed as a second-resolution wall-clock string.
 REVISION_CURSOR_SEED = datetime(2026, 6, 23, 0, 0, 0, tzinfo=JST)
 # Keep each discovery scan small enough for the MySQL read timeout; the
 # max-window setting controls POST volume separately from this time span.
@@ -53,11 +74,14 @@ _PostResult = Mapping[str, Any]
 
 __all__ = [
     "FilterConfigError",
+    "FlowWindowPublishResult",
     "JST",
     "RunFlowConfigError",
     "RunFlowResult",
     "RunFlowSettings",
     "main",
+    "publish_flow_window",
+    "replay_flow_window",
     "run_flow",
 ]
 
@@ -106,8 +130,8 @@ class RunFlowSettings:
         reprocess_hours_per300: Minimum 5-minute lookback.
         max_lookback_hours_per3600: Maximum 60-minute lookback.
         max_lookback_hours_per300: Maximum 5-minute lookback.
-        source_stability_delay_hours: Hours to wait after source windows end
-            before they become eligible for publication.
+        source_stability_delay_hours: Minimum age of a source window's start
+            time before it becomes eligible for publication.
         revision_sweep_enabled: Whether to scan old windows by revision time.
         revision_sweep_max_windows: Maximum revision-sweep windows per run.
         state_path: JSON state file path.
@@ -130,24 +154,27 @@ class RunFlowSettings:
             raise RunFlowConfigError(
                 f"invalid FLOW_SEND_MODE {self.send_mode!r}; expected dry-run or send"
             )
-        _validate_non_negative_hours(
+        validate_non_negative_settings(
             {
                 "REPROCESS_HOURS_PER3600": self.reprocess_hours_per3600,
                 "REPROCESS_HOURS_PER300": self.reprocess_hours_per300,
                 "MAX_LOOKBACK_HOURS_PER3600": self.max_lookback_hours_per3600,
                 "MAX_LOOKBACK_HOURS_PER300": self.max_lookback_hours_per300,
                 "SOURCE_STABILITY_DELAY_HOURS": self.source_stability_delay_hours,
-            }
+            },
+            RunFlowConfigError,
         )
-        _validate_lookback_ceiling(
+        validate_lookback_ceiling(
             "PER3600",
             self.reprocess_hours_per3600,
             self.max_lookback_hours_per3600,
+            RunFlowConfigError,
         )
-        _validate_lookback_ceiling(
+        validate_lookback_ceiling(
             "PER300",
             self.reprocess_hours_per300,
             self.max_lookback_hours_per300,
+            RunFlowConfigError,
         )
         if self.revision_sweep_max_windows < 1:
             raise RunFlowConfigError("REVISION_SWEEP_MAX_WINDOWS must be positive")
@@ -167,27 +194,45 @@ class RunFlowSettings:
         """
         source = os.environ if env is None else env
         return cls(
-            send_mode=_optional_env(source, "FLOW_SEND_MODE", "dry-run")
-            .strip()
-            .lower(),
-            reprocess_hours_per3600=_int_env(source, "REPROCESS_HOURS_PER3600", 12),
-            reprocess_hours_per300=_int_env(source, "REPROCESS_HOURS_PER300", 2),
-            max_lookback_hours_per3600=_int_env(
-                source, "MAX_LOOKBACK_HOURS_PER3600", 72
+            send_mode=optional_env(source, "FLOW_SEND_MODE", "dry-run").strip().lower(),
+            reprocess_hours_per3600=parse_int_env(
+                source,
+                "REPROCESS_HOURS_PER3600",
+                12,
+                RunFlowConfigError,
             ),
-            max_lookback_hours_per300=_int_env(source, "MAX_LOOKBACK_HOURS_PER300", 72),
-            source_stability_delay_hours=_int_env(
+            reprocess_hours_per300=parse_int_env(
+                source,
+                "REPROCESS_HOURS_PER300",
+                2,
+                RunFlowConfigError,
+            ),
+            max_lookback_hours_per3600=parse_int_env(
+                source,
+                "MAX_LOOKBACK_HOURS_PER3600",
+                72,
+                RunFlowConfigError,
+            ),
+            max_lookback_hours_per300=parse_int_env(
+                source,
+                "MAX_LOOKBACK_HOURS_PER300",
+                72,
+                RunFlowConfigError,
+            ),
+            source_stability_delay_hours=parse_int_env(
                 source,
                 "SOURCE_STABILITY_DELAY_HOURS",
                 _DEFAULT_SOURCE_STABILITY_DELAY_HOURS,
+                RunFlowConfigError,
             ),
             revision_sweep_enabled=auth._parse_bool(
-                _optional_env(source, "REVISION_SWEEP_ENABLED", "true")
+                optional_env(source, "REVISION_SWEEP_ENABLED", "true")
             ),
-            revision_sweep_max_windows=_int_env(
+            revision_sweep_max_windows=parse_int_env(
                 source,
                 "REVISION_SWEEP_MAX_WINDOWS",
                 _DEFAULT_REVISION_SWEEP_MAX_WINDOWS,
+                RunFlowConfigError,
             ),
             state_path=Path("state/flow.json"),
             lock_path=Path("state/flow.lock"),
@@ -228,6 +273,157 @@ class RunFlowResult:
     exit_code: int
 
 
+@dataclass(frozen=True)
+class FlowWindowPublishResult:
+    """Publishing counters produced for one Product A source window.
+
+    Run-level window selection is intentionally excluded; orchestration owns
+    ``windows_seen``.
+
+    Attributes:
+        windows_complete: ``1`` if the window ended complete, otherwise ``0``.
+        windows_partial: ``1`` if the window ended partial, otherwise ``0``.
+        windows_dead_letter: ``1`` if the window ended dead-lettered,
+            otherwise ``0``.
+        posts_ok: Orion attribute updates that succeeded.
+        posts_failed: Orion attribute updates that failed.
+        rows_dropped: Source rows omitted during transformation.
+    """
+
+    windows_complete: int
+    windows_partial: int
+    windows_dead_letter: int
+    posts_ok: int
+    posts_failed: int
+    rows_dropped: int
+
+
+def publish_flow_window(
+    *,
+    interval_min: int,
+    startdate: str,
+    rows_for_window: list[_FlowRow],
+    orion: _OrionForFlow,
+    state_store: WindowStateStore,
+    filter_settings: FilterSettings,
+    interval_metadata: Mapping[tuple[int, int], SensorPlace],
+    transformed_at: datetime,
+) -> FlowWindowPublishResult:
+    """Publish one Product A window under normal runner policy.
+
+    State is saved after each attempted target and unchanged prior-success
+    payloads are skipped.
+
+    Args:
+        interval_min: Source aggregation interval in minutes.
+        startdate: Source window start in ``YYYYMMDD_HHMM`` format.
+        rows_for_window: Complete Product A source rows for the window.
+        orion: Orion writer for per-target attribute updates.
+        state_store: Delivery state store to update and persist.
+        filter_settings: Source-row filters used by the transform.
+        interval_metadata: Active target metadata for this interval.
+        transformed_at: Timestamp used for retrieval metadata.
+
+    Returns:
+        Immutable counters for this window, excluding ``windows_seen``.
+    """
+    return _publish_flow_window(
+        interval_min=interval_min,
+        startdate=startdate,
+        rows_for_window=rows_for_window,
+        orion=orion,
+        state_store=state_store,
+        filter_settings=filter_settings,
+        interval_metadata=interval_metadata,
+        transformed_at=transformed_at,
+        force_resend=False,
+        persist_each_target=True,
+    )
+
+
+def replay_flow_window(
+    *,
+    interval_min: int,
+    startdate: str,
+    rows_for_window: list[_FlowRow],
+    orion: _OrionForFlow,
+    state_store: WindowStateStore,
+    filter_settings: FilterSettings,
+    interval_metadata: Mapping[tuple[int, int], SensorPlace],
+    transformed_at: datetime,
+    force: bool,
+) -> FlowWindowPublishResult:
+    """Replay one Product A window under operator-requested policy.
+
+    The caller owns persistence cadence. ``force`` bypasses the unchanged
+    prior-success hash skip.
+
+    Args:
+        interval_min: Source aggregation interval in minutes.
+        startdate: Source window start in ``YYYYMMDD_HHMM`` format.
+        rows_for_window: Complete Product A source rows for the window.
+        orion: Orion writer for per-target attribute updates.
+        state_store: Delivery state store to update without saving in-loop.
+        filter_settings: Source-row filters used by the transform.
+        interval_metadata: Active target metadata selected for this replay.
+        transformed_at: Timestamp used for retrieval metadata.
+        force: Whether to rewrite unchanged prior-success payloads.
+
+    Returns:
+        Immutable counters for this window, excluding ``windows_seen``.
+    """
+    return _publish_flow_window(
+        interval_min=interval_min,
+        startdate=startdate,
+        rows_for_window=rows_for_window,
+        orion=orion,
+        state_store=state_store,
+        filter_settings=filter_settings,
+        interval_metadata=interval_metadata,
+        transformed_at=transformed_at,
+        force_resend=force,
+        persist_each_target=False,
+    )
+
+
+def _publish_flow_window(
+    *,
+    interval_min: int,
+    startdate: str,
+    rows_for_window: list[_FlowRow],
+    orion: _OrionForFlow,
+    state_store: WindowStateStore,
+    filter_settings: FilterSettings,
+    interval_metadata: Mapping[tuple[int, int], SensorPlace],
+    transformed_at: datetime,
+    force_resend: bool,
+    persist_each_target: bool,
+) -> FlowWindowPublishResult:
+    counts = _RunCounts()
+    _process_send_window(
+        make_window_key(interval_min, startdate),
+        interval_min=interval_min,
+        startdate=startdate,
+        rows_for_window=rows_for_window,
+        orion=orion,
+        state_store=state_store,
+        filter_settings=filter_settings,
+        interval_metadata=interval_metadata,
+        counts=counts,
+        transformed_at=transformed_at,
+        force_resend=force_resend,
+        persist_each_target=persist_each_target,
+    )
+    return FlowWindowPublishResult(
+        windows_complete=counts.windows_complete,
+        windows_partial=counts.windows_partial,
+        windows_dead_letter=counts.windows_dead_letter,
+        posts_ok=counts.posts_ok,
+        posts_failed=counts.posts_failed,
+        rows_dropped=counts.rows_dropped,
+    )
+
+
 def run_flow(
     *,
     db_connection: _DbConnection,
@@ -261,7 +457,7 @@ def run_flow(
         partial windows, failed POSTs, or open windows remain after the
         run; ``0`` otherwise (including dry-run).
     """
-    run_started_at = _coerce_jst_datetime(now())
+    run_started_at = coerce_jst_datetime(now())
     target_batches = sorted(filter_settings.target_flow_batches)
 
     if target_batches:
@@ -400,15 +596,17 @@ def main(argv: list[str] | None = None) -> int:
         orion = orion_client.OrionClient(
             orion_client.OrionSettings.from_env(),
             auth=auth_client,
+            payload_mode=logging_settings.payload_mode,
+            payload_max_bytes=logging_settings.payload_max_bytes,
+            response_max_bytes=logging_settings.response_max_bytes,
         )
-        _copy_payload_logging_settings(orion, logging_settings)
 
         db_connection = db.connect(db.DbSettings.from_env())
         try:
             result = run_flow(
                 db_connection=db_connection,
                 orion=orion,
-                metadata=load_metadata(_metadata_path_from_env()),
+                metadata=load_metadata(metadata_path_from_env()),
                 state_store=WindowStateStore.load(
                     settings.state_path,
                     now=lambda: datetime.now(JST),
@@ -434,29 +632,6 @@ class _RunCounts:
     posts_ok: int = 0
     posts_failed: int = 0
     rows_dropped: int = 0
-
-
-@dataclass(frozen=True)
-class _RevisionWorkItem:
-    """One revision-sweep unit of work.
-
-    Attributes:
-        interval_min: Aggregation interval for the source window.
-        startdate: Source ``startdate`` string, for example
-            ``"20260629_1200"``.
-        window_key: State key for the source window, for example
-            ``"per300/20260629_1200"``.
-        aggregated_at: Cursor key for discovered windows.  Retry items come
-            from state, not discovery rows, so this is ``None`` for retries.
-        retry: ``False`` for windows discovered by ``aggregated_at`` in this
-            run; ``True`` for old open windows retried from state.
-    """
-
-    interval_min: int
-    startdate: str
-    window_key: str
-    aggregated_at: datetime | None = None
-    retry: bool = False
 
 
 def _validate_orion_targets(
@@ -491,7 +666,7 @@ def _process_interval(
     counts: _RunCounts,
 ) -> None:
     """Fetch and publish all source windows for one aggregation interval."""
-    cutoff = _eligible_source_cutoff(
+    cutoff = eligible_source_cutoff(
         run_started_at,
         interval_min,
         source_stability_delay_hours=settings.source_stability_delay_hours,
@@ -500,19 +675,17 @@ def _process_interval(
     rows = db.select_flow_metrics(
         db_connection,
         interval_min=interval_min,
-        lower_bound=_format_sql_window_bound(normal_lower_bound),
-        upper_bound=_format_sql_window_bound(cutoff),
+        lower_bound=format_sql_window_bound(normal_lower_bound),
+        upper_bound=format_sql_window_bound(cutoff),
         max_imputation_tier=filter_settings.source_max_imputation_tier,
     )
     interval_metadata = _metadata_index_for_interval(metadata_index, interval_min)
 
     for startdate, rows_for_window in _group_rows_by_startdate(rows):
-        window_key = _window_key(interval_min, startdate)
         counts.windows_seen += 1
 
         if settings.send_mode == "send":
-            _process_send_window(
-                window_key,
+            result = publish_flow_window(
                 interval_min=interval_min,
                 startdate=startdate,
                 rows_for_window=rows_for_window,
@@ -520,10 +693,14 @@ def _process_interval(
                 state_store=state_store,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata,
-                expected_target_ids=(),
-                counts=counts,
                 transformed_at=run_started_at,
             )
+            counts.windows_complete += result.windows_complete
+            counts.windows_partial += result.windows_partial
+            counts.windows_dead_letter += result.windows_dead_letter
+            counts.posts_ok += result.posts_ok
+            counts.posts_failed += result.posts_failed
+            counts.rows_dropped += result.rows_dropped
         else:
             _process_dry_run_window(
                 rows_for_window=rows_for_window,
@@ -567,7 +744,6 @@ def _process_send_window(
     state_store: WindowStateStore,
     filter_settings: FilterSettings,
     interval_metadata: Mapping[tuple[int, int], SensorPlace],
-    expected_target_ids: Iterable[str],
     counts: _RunCounts,
     transformed_at: datetime,
     force_resend: bool = False,
@@ -578,12 +754,10 @@ def _process_send_window(
 
     Flow windows derive their expected target set from targets observed in
     transformed source rows unioned with any stored snapshot for the same
-    window. The ``expected_target_ids`` argument is accepted to keep this
-    helper's call surface aligned with Product B, but Product A does not use it
-    to shrink or expand state; callers filter ``interval_metadata`` to control
-    which payloads are built.
+    window. Callers filter ``interval_metadata`` to control which payloads are
+    built.
     """
-    source_start = _parse_source_window_start(startdate)
+    source_start = parse_source_window_start(startdate)
     payloads = transform_flow_rows(
         rows_for_window,
         interval_metadata,
@@ -732,7 +906,6 @@ def _process_supplemental_complete_windows(
             state_store=state_store,
             filter_settings=filter_settings,
             interval_metadata=interval_metadata,
-            expected_target_ids=(),
             counts=counts,
             transformed_at=transformed_at,
             skip_if_no_new_target=True,
@@ -771,10 +944,11 @@ def _process_revision_sweep(
         filter_settings: Runtime filters, including the imputation-tier gate.
         metadata_index: Active ``(place_number, interval_min)`` -> metadata map.
         lookback_hours_used: Per-interval lookback the fresh path applied this
-            run.  Its lower bound is the sweep's ``startdate`` upper bound, so
-            the two paths never process the same window.
-        run_started_at: Run start; floored to seconds it bounds the discovery
-            chunk's upper edge.
+            run.  The fresh path's lower bound equals the sweep's
+            ``startdate`` upper bound, so the two paths never process the
+            same window.
+        run_started_at: Run start, floored to seconds; it bounds the
+            discovery chunk's upper edge.
         counts: Mutable per-run counters updated by this sweep.
 
     Returns:
@@ -788,19 +962,19 @@ def _process_revision_sweep(
     cursor = (state_store.revision_cursor() or REVISION_CURSOR_SEED).replace(
         microsecond=0
     )
-    cursor = _coerce_jst_datetime(cursor)
+    cursor = coerce_jst_datetime(cursor)
     run_upper = run_started_at.replace(microsecond=0)
     span_upper = cursor + REVISION_SWEEP_DISCOVERY_SPAN
     aggregated_at_upper = min(run_upper, span_upper)
     chunk_binds = span_upper < run_upper
-    aggregated_at_lower_sql = _format_mysql_timestamp(cursor)
-    aggregated_at_upper_sql = _format_mysql_timestamp(aggregated_at_upper)
+    aggregated_at_lower_sql = format_mysql_timestamp(cursor)
+    aggregated_at_upper_sql = format_mysql_timestamp(aggregated_at_upper)
     interval_metadata_by_interval = {
         interval_min: _metadata_index_for_interval(metadata_index, interval_min)
         for interval_min in _INTERVALS
     }
     startdate_upper_by_interval: dict[int, datetime] = {}
-    discovered: list[_RevisionWorkItem] = []
+    discovered: list[RevisionWorkItem] = []
 
     _lifecycle_logger.info(
         "flow revision sweep started",
@@ -816,7 +990,7 @@ def _process_revision_sweep(
     # fresh path's lower bound; the sweep handles only older windows that the
     # normal rolling lookback will not publish in this run.
     for interval_min in _INTERVALS:
-        cutoff = _eligible_source_cutoff(
+        cutoff = eligible_source_cutoff(
             run_started_at,
             interval_min,
             source_stability_delay_hours=settings.source_stability_delay_hours,
@@ -828,17 +1002,17 @@ def _process_revision_sweep(
             interval_min=interval_min,
             aggregated_at_lower=aggregated_at_lower_sql,
             aggregated_at_upper=aggregated_at_upper_sql,
-            startdate_upper=_format_sql_window_bound(startdate_upper),
+            startdate_upper=format_sql_window_bound(startdate_upper),
             max_imputation_tier=filter_settings.source_max_imputation_tier,
         )
         for row in rows:
             startdate = str(row["startdate"])
             discovered.append(
-                _RevisionWorkItem(
+                RevisionWorkItem(
                     interval_min=interval_min,
                     startdate=startdate,
-                    window_key=_window_key(interval_min, startdate),
-                    aggregated_at=_parse_revision_aggregated_at(row["win_agg"]),
+                    window_key=make_window_key(interval_min, startdate),
+                    aggregated_at=parse_revision_aggregated_at(row["win_agg"]),
                 )
             )
 
@@ -852,12 +1026,12 @@ def _process_revision_sweep(
             item.interval_min,
         )
     )
-    discovered_to_process, discovered_deferred = _split_discovered_revisions(
+    discovered_to_process, discovered_deferred = split_discovered_revisions(
         discovered,
         settings.revision_sweep_max_windows,
     )
     discovered_keys = {item.window_key for item in discovered}
-    retry_items: list[_RevisionWorkItem] = []
+    retry_items: list[RevisionWorkItem] = []
     # The retry pass re-sends old open (pending/partial) windows the fresh
     # path's lookback can no longer reach (typically one whose earlier send
     # failed).  It runs only at steady state, never during the initial drain,
@@ -892,7 +1066,7 @@ def _process_revision_sweep(
             0,
             settings.revision_sweep_max_windows - len(discovered_to_process),
         )
-        retry_items = _revision_retry_items(
+        retry_items = revision_retry_items(
             state_store,
             startdate_upper_by_interval=startdate_upper_by_interval,
             excluded_window_keys=discovered_keys,
@@ -936,7 +1110,6 @@ def _process_revision_sweep(
                 state_store=state_store,
                 filter_settings=filter_settings,
                 interval_metadata=interval_metadata_by_interval[item.interval_min],
-                expected_target_ids=(),
                 counts=counts,
                 transformed_at=run_started_at,
             )
@@ -986,93 +1159,9 @@ def _process_revision_sweep(
     return {item.window_key for item in work_items}
 
 
-def _split_discovered_revisions(
-    discovered: list[_RevisionWorkItem],
-    max_windows: int,
-) -> tuple[list[_RevisionWorkItem], list[_RevisionWorkItem]]:
-    """Split cursor-ordered discoveries into a capped batch and a deferred rest.
-
-    Args:
-        discovered: Discovered work items, sorted by the cursor key
-            (``aggregated_at`` then ``startdate``).
-        max_windows: Soft per-run cap on how many windows to process.
-
-    Returns:
-        A ``(to_process, deferred)`` pair.  ``to_process`` is the first
-        ``max_windows`` items, extended forward to include every item that
-        shares the last one's ``aggregated_at`` second; ``deferred`` is the
-        remainder, left for a later run.  Keeping a whole second together lets
-        the next cursor point at the first deferred second and rediscover those
-        windows cleanly, instead of splitting one second across two runs.
-    """
-    if len(discovered) <= max_windows:
-        return discovered, []
-
-    boundary = discovered[max_windows - 1].aggregated_at
-    split_at = max_windows
-    while split_at < len(discovered) and discovered[split_at].aggregated_at == boundary:
-        split_at += 1
-    return discovered[:split_at], discovered[split_at:]
-
-
-def _revision_retry_items(
-    state_store: WindowStateStore,
-    *,
-    startdate_upper_by_interval: Mapping[int, datetime],
-    excluded_window_keys: set[str],
-    limit: int,
-) -> list[_RevisionWorkItem]:
-    """Return old open windows for the sweep's retry pass to re-send.
-
-    These are ``pending`` or ``partial`` windows whose source start is older
-    than the fresh path's lower bound: too old for the rolling lookback to
-    reach, yet still owed a retry.  Windows that discovery surfaced this run
-    (processed or cap-deferred) are skipped, so discovery and retry never act
-    on the same window in one run.
-
-    Args:
-        state_store: Persistent window-state store to scan for open windows.
-        startdate_upper_by_interval: Per-interval fresh-path lower bound; only
-            windows whose source start is strictly older are eligible.
-        excluded_window_keys: Window keys discovered this run (processed or
-            cap-deferred), which this pass skips.
-        limit: Maximum number of windows to return (the sweep's remaining
-            per-run capacity).
-
-    Returns:
-        Retry work items, each flagged ``retry=True``.
-    """
-    if limit <= 0:
-        return []
-
-    items: list[_RevisionWorkItem] = []
-    for window_key, window in state_store.iter_open_windows():
-        if window_key in excluded_window_keys:
-            continue
-        interval_min = _interval_from_window_key(window_key)
-        if interval_min is None:
-            continue
-        if (
-            state_store.source_window_start(window_key, window)
-            >= (startdate_upper_by_interval[interval_min])
-        ):
-            continue
-        items.append(
-            _RevisionWorkItem(
-                interval_min=interval_min,
-                startdate=_startdate_from_window_key(window_key),
-                window_key=window_key,
-                retry=True,
-            )
-        )
-        if len(items) >= limit:
-            break
-    return items
-
-
 def _select_revision_flow_rows(
     db_connection: _DbConnection,
-    work_items: Iterable[_RevisionWorkItem],
+    work_items: Iterable[RevisionWorkItem],
     *,
     max_imputation_tier: int,
 ) -> dict[tuple[int, str], list[_FlowRow]]:
@@ -1188,8 +1277,8 @@ def _lookback_hours_by_interval(
 ) -> dict[int, float]:
     """Return the lookback hours used by each interval this run.
 
-    The value is what the SQL ``lower_bound`` will subtract from each
-    interval's cutoff.
+    Each interval's SQL ``lower_bound`` equals its cutoff minus this many
+    hours.
     """
     return {
         interval_min: _lookback_hours(
@@ -1362,94 +1451,6 @@ def _attrs_sha256(attrs: Mapping[str, Any]) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-def _window_key(interval_min: int, startdate: str) -> str:
-    """Return the state key for one source aggregation window."""
-    return f"{_INTERVAL_PREFIXES[interval_min]}/{startdate}"
-
-
-def _parse_source_window_start(startdate: str) -> datetime:
-    """Parse the MySQL source-window key into a JST datetime."""
-    return datetime.strptime(startdate, "%Y%m%d_%H%M").replace(tzinfo=JST)
-
-
-def _eligible_source_cutoff(
-    run_started_at: datetime,
-    interval_min: int,
-    *,
-    source_stability_delay_hours: int,
-) -> datetime:
-    """Return the newest source window eligible for publication.
-
-    Recent aggregate windows can still receive late writes. The stability delay
-    keeps those windows out of the publishing range until their source data has
-    had time to settle.
-    """
-    return _floor_datetime(
-        run_started_at - timedelta(hours=source_stability_delay_hours),
-        interval_min,
-    )
-
-
-def _floor_datetime(value: datetime, interval_min: int) -> datetime:
-    """Round a datetime down to the nearest interval boundary."""
-    return value - timedelta(
-        minutes=value.minute % interval_min,
-        seconds=value.second,
-        microseconds=value.microsecond,
-    )
-
-
-def _format_sql_window_bound(value: datetime) -> str:
-    """Format a source-window timestamp for the MySQL ``startdate`` column."""
-    return value.strftime("%Y%m%d_%H%M")
-
-
-def _format_mysql_timestamp(value: datetime) -> str:
-    """Format a cursor datetime for MySQL ``aggregated_at`` comparisons.
-
-    State stores cursor values as JST ISO datetimes.  Discovery SQL compares
-    against MySQL wall-clock strings in the JST session, floored to whole
-    seconds: ``"YYYY-MM-DD HH:MM:SS"``.
-    """
-    return (
-        _coerce_jst_datetime(value).replace(microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-    )
-
-
-def _parse_revision_aggregated_at(value: Any) -> datetime:
-    """Parse a MySQL ``aggregated_at`` value into the cursor representation.
-
-    The DB driver may return a ``datetime`` or a string.  The runner normalizes
-    either form to a JST datetime floored to whole seconds so it can be stored
-    back into the ISO cursor field without mixing precisions.
-    """
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        text = str(value)
-        if "T" in text:
-            parsed = datetime.fromisoformat(text)
-        else:
-            parsed = datetime.strptime(text, "%Y-%m-%d %H:%M:%S")
-    return _coerce_jst_datetime(parsed).replace(microsecond=0)
-
-
-def _interval_from_window_key(window_key: str) -> int | None:
-    """Return the aggregation interval encoded in a state window key."""
-    prefix, separator, _startdate = window_key.partition("/")
-    if not separator:
-        return None
-    for interval_min, expected_prefix in _INTERVAL_PREFIXES.items():
-        if prefix == expected_prefix:
-            return interval_min
-    return None
-
-
-def _startdate_from_window_key(window_key: str) -> str:
-    """Return the source startdate encoded in a state window key."""
-    return window_key.partition("/")[2]
-
-
 def _reprocess_hours(settings: RunFlowSettings, interval_min: int) -> int:
     """Return the configured minimum reprocess span for one interval."""
     if interval_min == 5:
@@ -1462,84 +1463,6 @@ def _max_lookback_hours(settings: RunFlowSettings, interval_min: int) -> int:
     if interval_min == 5:
         return settings.max_lookback_hours_per300
     return settings.max_lookback_hours_per3600
-
-
-def _parse_state_datetime(value: str) -> datetime:
-    """Parse an ISO timestamp from state and normalize it to JST."""
-    return _coerce_jst_datetime(datetime.fromisoformat(value))
-
-
-def _coerce_jst_datetime(value: datetime) -> datetime:
-    """Return ``value`` as a JST-aware datetime.
-
-    Attaches JST when ``value`` is naive; converts when ``value`` is
-    already timezone-aware.
-    """
-    if value.tzinfo is None:
-        return value.replace(tzinfo=JST)
-    return value.astimezone(JST)
-
-
-def _metadata_path_from_env(env: Mapping[str, str] | None = None) -> Path:
-    """Return the runtime metadata path from the environment."""
-    source = os.environ if env is None else env
-    value = source.get("SENSOR_METADATA_PATH")
-    if value is None or value == "":
-        return _DEFAULT_METADATA_PATH
-    return Path(value)
-
-
-def _copy_payload_logging_settings(
-    orion: _OrionForFlow,
-    settings: LoggingSettings,
-) -> None:
-    """Copy the payload-logging fields from ``LoggingSettings`` onto ``orion``.
-
-    Keeps ``payload_mode`` / ``payload_max_bytes`` / ``response_max_bytes``
-    in sync between the entry-point logging config and the Orion client that
-    formats per-POST log records.
-    """
-    for name in ("payload_mode", "payload_max_bytes", "response_max_bytes"):
-        if hasattr(orion, name):
-            setattr(orion, name, getattr(settings, name))
-
-
-def _optional_env(env: Mapping[str, str], key: str, default: str) -> str:
-    """Return an environment value or a default when unset or empty."""
-    value = env.get(key)
-    if value is None or value == "":
-        return default
-    return value
-
-
-def _int_env(env: Mapping[str, str], key: str, default: int) -> int:
-    """Parse an optional integer environment variable."""
-    value = _optional_env(env, key, "")
-    if value == "":
-        return default
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise RunFlowConfigError(
-            f"environment variable must be an integer: {key}"
-        ) from exc
-
-
-def _validate_non_negative_hours(values: Mapping[str, int]) -> None:
-    """Reject negative hour settings."""
-    for key, value in values.items():
-        if value < 0:
-            raise RunFlowConfigError(
-                f"environment variable must be non-negative: {key}"
-            )
-
-
-def _validate_lookback_ceiling(name: str, reprocess_hours: int, max_hours: int) -> None:
-    """Reject a max lookback that is lower than its reprocess floor."""
-    if max_hours < reprocess_hours:
-        raise RunFlowConfigError(
-            f"MAX_LOOKBACK_HOURS_{name} must be >= REPROCESS_HOURS_{name}"
-        )
 
 
 if __name__ == "__main__":

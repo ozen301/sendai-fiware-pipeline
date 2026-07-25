@@ -64,7 +64,7 @@ class HistoryQuery:
 
 
 class CometClient:
-    """Read historical NGSI attribute values from STH-Comet."""
+    """Read and delete historical NGSI attribute values via STH-Comet."""
 
     def __init__(
         self,
@@ -253,7 +253,10 @@ def _required_env(env: Mapping[str, str], name: str) -> str:
 
 
 def _optional_env(env: Mapping[str, str], name: str, default: str) -> str:
-    """Return an optional environment value with blank treated as default."""
+    """Return an optional value, defaulting missing or whitespace-only input.
+
+    Nonblank values are returned unchanged, including surrounding whitespace.
+    """
     value = env.get(name)
     if value is None or value.strip() == "":
         return default

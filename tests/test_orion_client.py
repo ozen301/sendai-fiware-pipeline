@@ -484,6 +484,24 @@ def test_rate_limit_retry_after_header_controls_retry_sleep() -> None:
     assert sleep.delays == [7]
 
 
+def test_rate_limit_retry_after_does_not_advance_exponential_backoff() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(429, text="slow down", headers={"Retry-After": "7"}),
+            FakeResponse(503, text="unavailable"),
+            FakeResponse(204),
+        ]
+    )
+    sleep = FakeSleep()
+    client = make_client(session, sleep=sleep)
+
+    result = client.update_attrs("entity-1", "Blesensor.per300", sample_attrs())
+
+    assert result["ok"] is True
+    assert result["attempts"] == 3
+    assert sleep.delays == [7, 1]
+
+
 def test_rate_limit_without_retry_after_uses_standard_backoff() -> None:
     session = FakeSession([FakeResponse(429, text="slow down"), FakeResponse(204)])
     sleep = FakeSleep()
@@ -586,7 +604,19 @@ def test_dry_run_logs_would_send_without_calling_session(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     session = FakeSession([FakeResponse(204)])
-    client = make_client(session, payload_mode="full")
+    auth = FakeAuth()
+    sleep = FakeSleep()
+
+    def fail_clock() -> float:
+        raise AssertionError("dry-run must not read the clock")
+
+    client = make_client(
+        session,
+        auth=auth,
+        sleep=sleep,
+        now=fail_clock,
+        payload_mode="full",
+    )
 
     with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
         result = client.update_attrs(
@@ -605,6 +635,8 @@ def test_dry_run_logs_would_send_without_calling_session(
         "dry_run": True,
     }
     assert session.calls == []
+    assert auth.calls == []
+    assert sleep.delays == []
     records = post_records(caplog, "post_succeeded")
     assert len(records) == 1
     assert records[0].levelno == logging.INFO
@@ -708,6 +740,22 @@ def test_non_finite_retry_after_falls_back_to_standard_backoff() -> None:
     # first slot of the standard backoff sequence — same path as 429
     # without a Retry-After header.
     assert sleep.delays == [1]
+
+
+def test_update_attrs_unexpected_request_error_propagates_without_terminal_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession([requests.exceptions.InvalidURL("invalid URL")])
+    client = make_client(session)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"),
+        pytest.raises(requests.exceptions.InvalidURL, match="invalid URL"),
+    ):
+        client.update_attrs("entity-1", "Blesensor.per300", sample_attrs())
+
+    assert post_records(caplog, "post_succeeded") == []
+    assert post_records(caplog, "post_failed") == []
 
 
 def test_list_entities_sends_fiware_service_header() -> None:
@@ -816,7 +864,18 @@ def test_replace_attrs_dry_run_skips_network_and_logs_full_payload(
     attrs = sample_aggregate_attrs()
     session = FakeSession([FakeResponse(204)])
     auth = FakeAuth()
-    client = make_client(session, auth=auth, payload_mode="hash")
+    sleep = FakeSleep()
+
+    def fail_clock() -> float:
+        raise AssertionError("dry-run must not read the clock")
+
+    client = make_client(
+        session,
+        auth=auth,
+        sleep=sleep,
+        now=fail_clock,
+        payload_mode="hash",
+    )
 
     with caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"):
         result = client.replace_attrs(
@@ -836,6 +895,7 @@ def test_replace_attrs_dry_run_skips_network_and_logs_full_payload(
     }
     assert session.calls == []
     assert auth.calls == []
+    assert sleep.delays == []
     records = post_records(caplog, "put_succeeded")
     assert len(records) == 1
     record = records[0]
@@ -962,6 +1022,30 @@ def test_replace_attrs_unauthorized_refreshes_once_then_succeeds() -> None:
     ]
 
 
+def test_replace_attrs_unauthorized_does_not_advance_exponential_backoff() -> None:
+    session = FakeSession(
+        [
+            FakeResponse(401, text="expired"),
+            FakeResponse(503, text="unavailable"),
+            FakeResponse(204),
+        ]
+    )
+    auth = FakeAuth(tokens=["expired-token"], refresh_tokens=["fresh-token"])
+    sleep = FakeSleep()
+    client = make_client(session, auth=auth, sleep=sleep)
+
+    result = client.replace_attrs(
+        "jp.sendai.Blesensor.flow",
+        "Blesensor.flow",
+        sample_aggregate_attrs(),
+    )
+
+    assert result["ok"] is True
+    assert result["attempts"] == 3
+    assert auth.calls == [False, True, False]
+    assert sleep.delays == [1]
+
+
 def test_replace_attrs_second_unauthorized_is_terminal() -> None:
     session = FakeSession(
         [FakeResponse(401, text="expired"), FakeResponse(401, text="still expired")]
@@ -1002,6 +1086,26 @@ def test_replace_attrs_terminal_client_error_does_not_retry() -> None:
     assert result["body_excerpt"] == "invalid aggregate"
     assert sleep.delays == []
     assert len(session.calls) == 1
+
+
+def test_replace_attrs_unexpected_request_error_propagates_without_terminal_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    session = FakeSession([requests.exceptions.InvalidURL("invalid URL")])
+    client = make_client(session)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="sendai_pipeline.orion_client"),
+        pytest.raises(requests.exceptions.InvalidURL, match="invalid URL"),
+    ):
+        client.replace_attrs(
+            "jp.sendai.Blesensor.flow",
+            "Blesensor.flow",
+            sample_aggregate_attrs(),
+        )
+
+    assert post_records(caplog, "put_succeeded") == []
+    assert post_records(caplog, "put_failed") == []
 
 
 def test_replace_attrs_exhausts_retry_budget_and_logs_failure(

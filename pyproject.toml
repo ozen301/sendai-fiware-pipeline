@@ -34,6 +34,8 @@ testpaths = ["tests"]
 [tool.pyright]
 pythonVersion = "3.13"
 typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
 include = ["sendai_pipeline", "scripts", "tests"]
 exclude = [".venv", "logs", "metadata", "ref_docs", "state", "**/node_modules", "**/__pycache__", "**/.*"]
 

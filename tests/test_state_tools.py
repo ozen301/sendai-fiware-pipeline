@@ -9,14 +9,12 @@ from pathlib import Path
 import pytest
 
 from sendai_pipeline.state import StateValidationError, WindowStateStore
+from sendai_pipeline.state_report import load_sensor_labels, state_report_to_pretty
 from sendai_pipeline.state_tools import (
     build_state_report,
     diagnose_state,
-    diagnoses_to_json,
-    load_sensor_labels,
     migrate_flow_state,
     repair_state,
-    state_report_to_pretty,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -130,9 +128,6 @@ def test_diagnose_state_categorizes_open_windows_deterministically(
     assert diagnoses[0].failed_http_statuses == (400,)
     assert diagnoses[3].failed_target_ids == (ENTITY_2,)
     assert diagnoses[3].failed_target_http_statuses == (502,)
-    first_json_row = json.loads(diagnoses_to_json(diagnoses))[0]
-    assert first_json_row["window"] == all_failed
-    assert first_json_row["expected_target_source"] == "stored"
 
 
 def test_diagnose_state_marks_legacy_expected_targets_as_derived(
@@ -153,10 +148,6 @@ def test_diagnose_state_marks_legacy_expected_targets_as_derived(
 
     assert diagnosis.expected_target_source == "derived"
     assert diagnosis.target_status_category == "all_ok"
-    assert (
-        json.loads(diagnoses_to_json([diagnosis]))[0]["expected_target_source"]
-        == "derived"
-    )
 
 
 def test_diagnose_state_retry_reachable_uses_source_window_and_config(

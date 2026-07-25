@@ -342,6 +342,16 @@ def test_state_doctor_cli_reports_clean_config_error(
     )
 
 
+def test_state_doctor_direction_ignores_product_a_five_minute_horizon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MAX_LOOKBACK_HOURS_PER300", "not-an-integer")
+
+    assert state_doctor.main(["direction"]) == 0
+
+
 def test_migrate_flow_state_cli_dry_run_reports_plan_without_mutating_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

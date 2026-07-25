@@ -65,7 +65,7 @@ uv run python scripts/create_entities.py --send \
 ### `create_sth_subscriptions.py`
 
 Create the Orion subscriptions that drive STH-Comet history. See
-[pipeline_spec.md §5](pipeline_spec.md) for what the subscription
+[pipeline_spec.md §5](pipeline_spec.md#5-orion-endpoints-and-sth-comet-subscriptions) for what the subscription
 bodies contain.
 
 ```
@@ -207,7 +207,7 @@ uv run python scripts/show_data.py
 | Flag / arg | Purpose |
 |---|---|
 | `--source orion` / `comet` | Read current Orion entity JSON or STH-Comet history. |
-| `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Canonical `jp.sendai.Blesensor.per300/per3600.<N>` ids infer the type; append `:ENTITY_TYPE` per id or supply `--type` for custom ids or overrides. The `:ENTITY_TYPE` suffix splits on the *last* colon. So a colon-bearing entity id (e.g. a URN-style id) must be given *with* a colon-free inline type, like `urn:ngsi-ld:Foo:Bar:SomeType`; it cannot be passed bare, and `--type` alone will not fix it (the trailing segment is taken as the type first). The configured Product B aggregate id is exempt: it is matched as a whole before any split and works bare. A colon-bearing type cannot be given inline; pass it with `--type`, which works only for a colon-free id or the aggregate id. |
+| `ENTITY_ID[:ENTITY_TYPE]`, `--entity-id` | Explicit entity target. Canonical `jp.sendai.Blesensor.per300/per3600.<N>` ids infer the type; append `:ENTITY_TYPE` per id or supply `--type` for custom ids or overrides. A colon-bearing id (e.g. a URN) needs special handling — see below. |
 | `--place N` | Resolve place numbers through metadata. With `--interval-min`, selects that interval; without it, selects every active interval for the place. Mutually exclusive with explicit entity ids. |
 | `--attrs LIST` | Comma-separated attributes. Required for non-aggregate Comet reads. On `--source comet`, for the configured Product B aggregate id, omitting it enumerates the contract scalars plus `peopleCount_flow_<place_number>` for every active interval-60 metadata row. Use an explicit list to inspect inactive or historical dynamic attributes. |
 | `--flow-attrs` | Shortcut for all ten Product A attributes: `dateObservedFrom`, `dateObservedTo`, `dateRetrieved`, `identifcation`, `peopleCount_immedate`, `peopleCount_near`, `peopleCount_far`, `peopleOccupancy_immedate`, `peopleOccupancy_near`, and `peopleOccupancy_far`. |
@@ -215,6 +215,20 @@ uv run python scripts/show_data.py
 | `--h-limit` / `--h-offset` | STH-Comet pagination passthrough. |
 | `--aggr-method` / `--aggr-period` | STH-Comet aggregation passthrough. |
 | `--pretty` | Render a compact `entity / attr / value / time` table instead of raw JSON. |
+
+**Parsing a colon-bearing entity id.** An `ENTITY_ID[:ENTITY_TYPE]` spec
+splits on its *last* colon, so a bare id that itself contains colons (for
+example a URN) is mis-split: `urn:ngsi-ld:Foo:Bar` passed bare splits into id
+`urn:ngsi-ld:Foo` and type `Bar`, and `--type` cannot override that split
+because the trailing segment is always taken as the type first. Give such an
+id a colon-free inline type instead, e.g. `urn:ngsi-ld:Foo:Bar:SomeType`,
+which splits into the full id `urn:ngsi-ld:Foo:Bar` and type `SomeType`. The
+same reasoning means a *type* that itself contains a colon cannot be given
+inline. Pass it with `--type` when the id is colon-free; a non-aggregate
+colon-bearing id and colon-bearing type cannot be represented together by
+this syntax. One id is exempt from all of this: the configured Product B
+aggregate id is matched as a whole before any split, so it works bare even if
+it contains colons and can take a colon-bearing type through `--type`.
 
 Default output is the raw Orion or STH-Comet JSON response, pretty
 printed once per entity or entity/attribute pair. A 404 prints a
@@ -263,9 +277,10 @@ uv run python scripts/show_subscriptions.py [SUBSCRIPTION_ID ...] [--json]
 
 With no ids it lists every subscription; with ids it shows only those
 exact ones (24-char lowercase hex). Output is unredacted — endpoint
-URLs, custom headers, and broker credentials are all shown, since the
-tool runs on internal hosts for authorized operators; the one rule is
-that credentials are never written to the log file. The default is a
+URLs and any notification-transport credentials stored on the
+subscription (custom headers, MQTT user/password) are shown as-is,
+since the tool runs on internal hosts for authorized operators; the
+one rule is that credentials are never written to the log file. The default is a
 human-readable summary; `--json` emits the raw broker objects as a JSON
 array on stdout (diagnostics and the count line go to stderr, so the
 array pipes cleanly into `jq`).
@@ -313,6 +328,12 @@ selector to purge the whole Comet entity history. `--attrs` remains
 available for an explicitly reviewed partial purge; deleting a contract
 scalar can make historical rows harder to interpret.
 
+The tool deletes Orion first, then purges Comet only after Orion reports
+deleted or already absent. This stops future publications before history is
+removed. A Comet purge failure is reported as a warning but does not turn a
+successful Orion deletion into a failed command; an Orion deletion failure
+does make the command fail and skips that entity's Comet purge.
+
 ### `delete_history.py`
 
 Delete STH-Comet history for selected entities or attributes. Dry-run
@@ -338,6 +359,11 @@ overrides.
 For the dedicated Product B aggregate entity, whole-entity deletion is
 the normal operation. An explicit `--attrs` list is still accepted when
 the intended scope is narrower.
+
+The tool deliberately exposes neither a service-wide delete nor date-range
+deletion. The supported Comet API deletes one complete entity history or one
+complete attribute series. A broader endpoint would make one argument error
+capable of deleting the whole configured service.
 
 ### `delete_subscriptions.py`
 
@@ -400,13 +426,22 @@ run's start time, truncated to whole seconds, and begins scanning forward from
 there on later runs. (A dry-run neither initializes nor persists the cursor.)
 For an existing cursor, both runners keep it forward-only.
 
-Revision discovery is paced by two controls:
-`REVISION_SWEEP_DISCOVERY_SPAN` bounds each MySQL discovery scan, and
-`REVISION_SWEEP_MAX_WINDOWS` sets a soft cap on how many discovered or
-old-open windows are processed in one run; a run may exceed it to keep one
-`aggregated_at` second together. These controls drain Product A's initial
-backlog and bound later scans for both products. Once a cursor is current,
-each cron tick scans only revisions since the prior run.
+Revision discovery is paced by two controls: a fixed six-hour code-level
+discovery span (`REVISION_SWEEP_DISCOVERY_SPAN` in `run_flow.py` /
+`run_direction.py`, not an environment variable) bounds each MySQL scan, and
+the configurable `REVISION_SWEEP_MAX_WINDOWS` softly caps how many windows one
+run processes. Once the cursor is current, each cron tick scans
+only revisions since the prior run; a larger backlog drains over several runs
+with no fixed completion target, and previously failed old windows are retried
+only after the cursor is current, using capacity left after new discoveries.
+The full recovery contract — the enablement, visibility, and cursor conditions
+under which a revision is eventually picked up — is
+[pipeline_spec.md §2.10](pipeline_spec.md#210-scheduling-and-retry).
+
+A missing cursor or JSON `null` is a valid no-cursor state; any other value
+must be an ISO datetime string (§2.10 covers the accepted forms and JST
+handling). A wrong type or malformed string is corrupt state and stops the
+runner before it reads MySQL.
 
 Because `aggregated_at` is a MySQL `timestamp`, the sweep cursor must be
 compared in a JST (`+09:00`) MySQL session. Check the runtime connection
@@ -619,14 +654,17 @@ uv run python scripts/resend.py {flow|direction}
 Resend writes to the same `window_key` as the original publication
 because it's a retry of the original business window, not a synthetic
 replacement. By default, unchanged prior-`ok` targets are skipped, while
-drifted prior-`ok` targets are written through the same shared
-`_process_send_window` path used by the live runners; `scripts/resend.py`
-does not carry separate drift logic. Pass `--force` when the intent is to
-redeliver unchanged targets too. For a wide range this matters: without
-`--force`, unchanged recent in-state windows are skipped while drifted
-or GC-reclaimed windows are written, so the result can be non-uniform
-even though the run exits 0 (see ["I need to resend a large range without
-dropping live data"](#i-need-to-resend-a-large-range-without-dropping-live-data)).
+drifted prior-`ok` targets are written through the public
+`replay_flow_window` or `replay_direction_window` function. The cron
+runners use the corresponding `publish_*_window` function, and both
+public paths share the same private delivery logic, so `scripts/resend.py`
+does not carry separate drift handling. Pass `--force` when the intent is
+to redeliver unchanged targets too. For a wide range this matters:
+without `--force`, unchanged recent in-state windows are skipped while
+drifted or GC-reclaimed windows are written, so the result can be
+non-uniform even though the run exits 0 (see ["I need to resend a large
+range without dropping live
+data"](#i-need-to-resend-a-large-range-without-dropping-live-data)).
 
 Product B uses the same shared direction path, but each non-empty
 60-minute source window produces either one clean or degraded aggregate PUT, a
@@ -644,6 +682,28 @@ built and POSTed, but it does not shrink a retained window's
 `expected_target_ids`; completion remains `stored ∪ observed`. Product B
 does not accept target filters; every attempted write uses the
 configured aggregate id and type.
+
+Windows with no source rows are skipped without creating state. Product A exits
+`1` when a POST fails. A window can still remain `partial` and exit `0` when an
+expected target has source rows but produces no payload; check the
+`window_partial` warning and `resend_summary.windows_partial`. Product B's
+quality and delivery exit behavior is described above.
+
+Live resend batches state persistence every 100 processed source-row windows
+and flushes again at the end. A handled abort makes a best-effort final flush.
+A hard kill can lose the recorded progress since the last batch, so re-running
+that chunk may repeat successful Orion writes and append duplicate Comet rows.
+Resend also reclaims old complete windows using the same retention horizon as
+the corresponding live runner; partial and dead-letter windows remain.
+
+There is no age limit on a replay range. Dry-run is the size and scope
+guardrail: review its per-window plan before adding `--send`.
+
+The main structured records are `resend_requested`,
+`resend_window_processed`, `resend_window_empty`, `resend_gc`,
+`resend_db_reconnect`, `resend_db_reconnect_exhausted`, and `resend_summary`.
+They report selected scope, per-window progress, state cleanup, reconnects, and
+the final product-specific counts without logging credentials.
 
 Examples:
 
@@ -722,22 +782,16 @@ These signals mean different things:
    and response-error records; do not treat it as evidence about source-data
    quality.
 
-For a degraded package, each emitted place's `from` and `to` dictionaries
-contain all emitted places. If the source has no movement row between two
-emitted places, the value is `0`. An excluded place appears in an emitted
-place's dictionary only when the source recorded that movement; the recorded
-value is kept exactly, including `0`. With emitted place 3 and excluded place
-5, a recorded `5 → 3` count is kept as
-`peopleCount_flow_3.value.from["5"]`. If that row is absent, the `"5"` entry is
-absent too, and `peopleCount_flow_5` is not published.
+How a degraded package fills its `from`/`to` dictionaries — every emitted
+place present, `0` for an unobserved pair between emitted places, and an
+excluded-place key only where the source recorded that exact movement — is
+[pipeline_spec.md §4.3](pipeline_spec.md#43-attribute-mapping-request-body).
 
-An old window can produce `direction_window_degraded` during the automatic
-revision sweep. A newly discovered revision is a forced resend, so it attempts
-the PUT and reports degradation again even when the package has not changed.
-An ordinary sweep retry uses the normal prior-status check. Outside the forced
-path, an unchanged prior-`ok` degraded package is skipped with
-`direction_window_degraded_unchanged` at DEBUG level: there is no warning,
-counter increase, or nonzero-exit effect.
+The same WARNING can fire during the automatic revision sweep. A newly
+discovered revision is force-sent, so it re-reports degradation even when the
+package has not changed; an unchanged prior-`ok` package outside that forced
+path is a `direction_window_degraded_unchanged` DEBUG no-op with no counter or
+exit effect.
 
 ### "A window is stuck `partial` and not clearing"
 
@@ -785,6 +839,13 @@ shutdown, that floor isn't wide enough to discover the windows that
 elapsed during downtime; dynamic lookback only widens for windows
 the state file already knows about, not for never-seen ones.
 
+When the revision sweep is enabled and its stored cursor predates the outage,
+it automatically discovers eligible inserts from the gap, but a long outage
+can take multiple runs to drain under the six-hour discovery span and soft work
+limit. Temporarily widening the reprocess floor gives a faster, predictable
+catch-up. It is required when revision discovery is disabled or its cursor does
+not cover the gap.
+
 For an outage of `D` hours, temporarily widen the reprocess floor
 before restarting:
 
@@ -797,23 +858,22 @@ before restarting:
 4. Restore the steady-state values once `state_doctor.py` shows the
    gap windows tracked as `pending` / `partial` / `complete`.
 
-The 72h `MAX_LOOKBACK_HOURS_*` ceilings already permit this without
-changes. Outages longer than 72h need either a higher ceiling for the
-duration of the recovery, or explicit `resend.py … --send` runs for
-each lost window.
+The 72h `MAX_LOOKBACK_HOURS_*` ceilings permit this floor-widening procedure
+without changes for outages up to 72 hours. For a longer outage, rely on a
+revision sweep whose cursor covers the gap, temporarily raise the ceiling, or
+use explicit `resend.py … --send` runs for the affected windows.
 
 ### "I need to resend a large range without dropping live data"
 
 `resend.py --send` holds the per-product lock (`state/<product>.lock`)
 for the whole run. While it runs, every live 5-minute tick for that
 product no-ops: it takes the lock non-blocking and fails. This is
-**operationally identical to live-cron downtime**: live windows that
-elapse during the run are permanently unpublished once they age past the
-reprocess floor (`REPROCESS_HOURS_PER300` / `REPROCESS_HOURS_PER3600`,
-default 2h / 12h). See "Resuming after a planned downtime longer than
-`REPROCESS_HOURS_*`" above for why these never-seen windows are not
-auto-recovered: the danger
-threshold is the reprocess floor, *not* the 72h `MAX_LOOKBACK_HOURS_*`.
+**operationally identical to live-cron downtime**: live windows can age past
+the fresh-path reprocess floor (`REPROCESS_HOURS_PER300` /
+`REPROCESS_HOURS_PER3600`, default 2h / 12h). An enabled revision sweep whose
+cursor covers the gap can recover them later, but recovery may take multiple
+runs. Use the floor-widening procedure above when the live catch-up must be
+immediate and predictable.
 The same caution applies to any long-running tool that holds the
 per-product lock, such as `state_repair.py … --apply`.
 

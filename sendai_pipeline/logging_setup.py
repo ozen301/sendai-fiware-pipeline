@@ -33,6 +33,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Self
 
+from sendai_pipeline.settings_validation import optional_env
+
 PACKAGE_LOGGER_NAME = "sendai_pipeline"
 
 JST = timezone(timedelta(hours=9))
@@ -243,16 +245,16 @@ class LoggingSettings:
         """Build logging settings from environment variables."""
         values = os.environ if env is None else env
         return cls(
-            level=_optional_env(values, "LOG_LEVEL", "INFO"),
-            format=_optional_env(values, "LOG_FORMAT", "json"),
-            payload_mode=_optional_env(values, "LOG_PAYLOAD_MODE", "failure"),
+            level=optional_env(values, "LOG_LEVEL", "INFO"),
+            format=optional_env(values, "LOG_FORMAT", "json"),
+            payload_mode=optional_env(values, "LOG_PAYLOAD_MODE", "failure"),
             payload_max_bytes=int(
-                _optional_env(values, "LOG_PAYLOAD_MAX_BYTES", "16384")
+                optional_env(values, "LOG_PAYLOAD_MAX_BYTES", "16384")
             ),
             response_max_bytes=int(
-                _optional_env(values, "LOG_RESPONSE_MAX_BYTES", "2048")
+                optional_env(values, "LOG_RESPONSE_MAX_BYTES", "2048")
             ),
-            log_dir=Path(_optional_env(values, "LOG_DIR", "logs")),
+            log_dir=Path(optional_env(values, "LOG_DIR", "logs")),
         )
 
 
@@ -283,7 +285,7 @@ class SecretsFilter(logging.Filter):
 
 
 def _redact(value: Any) -> Any:
-    """Return a redacted copy of *value* (mutating dicts/lists structurally)."""
+    """Return a redacted copy of *value*, recursing into dicts, lists, and tuples."""
     if isinstance(value, str):
         return _BEARER_RE.sub(_BEARER_REPLACEMENT, value)
     if isinstance(value, Mapping):
@@ -530,20 +532,6 @@ def payload_log_fields(
         fields["response_excerpt"] = _truncate(response_text, response_max_bytes)
 
     return fields
-
-
-def _optional_env(env: Mapping[str, str], key: str, default: str) -> str:
-    """Return the env value if set and non-empty, otherwise *default*.
-
-    Matches the helper of the same name in :mod:`sendai_pipeline.auth`:
-    ``.env`` placeholders such as ``LOG_LEVEL=`` should fall back to
-    the documented default rather than producing an empty string that
-    later fails validation.
-    """
-    value = env.get(key)
-    if value is None or value == "":
-        return default
-    return value
 
 
 def _truncate(text: str, limit: int) -> str:

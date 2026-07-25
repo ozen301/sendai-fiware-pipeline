@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any, Protocol, Self
+from typing import Any, Protocol, Self, cast
 
 import requests
 
@@ -59,26 +59,6 @@ PRODUCT_B_STABLE_WRITE_ATTRS: tuple[str, ...] = (
     "dateRetrieved",
     "identifcation",
     "sourceQuality",
-)
-
-
-@dataclass(frozen=True)
-class _ProductSpec:
-    """Per-product values that vary between Product A and Product B."""
-
-    label: str
-    description_prefix: str
-    entity_types: tuple[str, ...]
-    history_attrs: tuple[str, ...]
-    trigger_attrs: tuple[str, ...]
-
-
-_PRODUCT_A_SPEC = _ProductSpec(
-    label="Product A",
-    description_prefix=_PRODUCT_A_DESCRIPTION_PREFIX,
-    entity_types=PRODUCT_A_ENTITY_TYPES,
-    history_attrs=PRODUCT_A_HISTORY_ATTRS,
-    trigger_attrs=PRODUCT_A_TRIGGER_ATTRS,
 )
 
 
@@ -191,26 +171,26 @@ class StHSubscriptionResult:
         return 1 if self.failed > 0 else 0
 
 
-def _build_product_a_subscription_body(
-    spec: _ProductSpec,
+def build_product_a_subscription_body(
     settings: StHSubscriptionSettings,
     *,
     redact_url: bool = False,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    """Build the Orion subscription body for Product A STH-Comet history."""
     description_time = now or datetime.now(tz=JST)
     body: dict[str, Any] = {
         "description": (
-            f"{spec.description_prefix} set at "
+            f"{_PRODUCT_A_DESCRIPTION_PREFIX} set at "
             f"{description_time.isoformat(timespec='seconds')}"
         ),
         "subject": {
             "entities": [
                 {"idPattern": ".*", "type": entity_type}
-                for entity_type in spec.entity_types
+                for entity_type in PRODUCT_A_ENTITY_TYPES
             ],
             "condition": {
-                "attrs": list(spec.trigger_attrs),
+                "attrs": list(PRODUCT_A_TRIGGER_ATTRS),
                 "notifyOnMetadataChange": True,
             },
         },
@@ -219,25 +199,13 @@ def _build_product_a_subscription_body(
                 "url": "<COMET_NOTIFY_URL>" if redact_url else settings.comet_notify_url
             },
             "attrsFormat": "legacy",
-            "attrs": list(spec.history_attrs),
+            "attrs": list(PRODUCT_A_HISTORY_ATTRS),
             "metadata": ["TimeInstant"],
         },
     }
     if settings.expires:
         body["expires"] = settings.expires
     return body
-
-
-def build_product_a_subscription_body(
-    settings: StHSubscriptionSettings,
-    *,
-    redact_url: bool = False,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    """Build the Orion subscription body for Product A STH-Comet history."""
-    return _build_product_a_subscription_body(
-        _PRODUCT_A_SPEC, settings, redact_url=redact_url, now=now
-    )
 
 
 def build_product_b_subscription_body(
@@ -284,7 +252,12 @@ def fetch_subscription_inventory(
     auth: TokenProvider,
     session: Any = None,
 ) -> list[dict[str, Any]]:
-    """Read and validate Orion's complete counted subscription inventory."""
+    """Read and validate Orion's complete counted subscription inventory.
+
+    Raises:
+        SubscriptionInventoryError: If a page request fails, or a page is
+            malformed, incomplete, or inconsistent with the reported total.
+    """
     http = requests.Session() if session is None else session
     url = f"{settings.base_url}/orion/v2.0/subscriptions"
     subscriptions: list[dict[str, Any]] = []
@@ -413,9 +386,12 @@ def _create_sth_subscription(
     peer_label: str,
     peer_description_prefixes: tuple[str, ...],
     body_builder: Callable[[StHSubscriptionSettings], dict[str, Any]],
-    subscription_matcher: Callable[[StHSubscriptionSettings, Any], tuple[str, ...]],
+    subscription_matcher: Callable[
+        [StHSubscriptionSettings, list[dict[str, Any]]], tuple[str, ...]
+    ],
     stale_subscription_finder: (
-        Callable[[StHSubscriptionSettings, Any], tuple[str, ...]] | None
+        Callable[[StHSubscriptionSettings, list[dict[str, Any]]], tuple[str, ...]]
+        | None
     ),
     settings: StHSubscriptionSettings,
     auth: TokenProvider | None,
@@ -447,14 +423,15 @@ def _create_sth_subscription(
             subscription triggers on any of these (or triggers on everything),
             since that peer would then fire on this product's own updates.
         own_entity_selectors: Builds the entity selectors for this product's
-            writes. The peer guard uses them to prove canonical peer selectors
-            disjoint before allowing a shared attribute name.
+            writes. The peer guard uses them to prove that a peer's canonical
+            selectors are disjoint from these before allowing a shared
+            attribute name.
         peer_label: The other product's name, used in log messages.
         peer_description_prefixes: Description prefixes that identify the peer
             product's subscriptions during the stale-peer check.
         body_builder: Builds the subscription body to POST for this product.
         subscription_matcher: Returns the ids of existing subscriptions that
-            already match this product's contract; drives the step-4 skip.
+            already match this product's contract; drives the step-5 skip.
         stale_subscription_finder: Returns ids of recognized same-product
             subscriptions whose behavior does not match the current contract.
             Such subscriptions require operator removal before creation.
@@ -735,10 +712,9 @@ def delete_subscription(
 
     Settings is structurally typed; see :func:`get_subscription`.
 
-    Returns 204 on success and 204/404 are the only success-shaped
-    outcomes (404 means another operator already removed it). 401
-    triggers one forced-refresh retry. Any other status raises
-    ``requests.HTTPError``.
+    204 and 404 are both returned as success (404 means another operator
+    already removed the subscription). 401 triggers one forced-refresh
+    retry. Any other status raises ``requests.HTTPError``.
     """
     http = session or requests.Session()
     url = f"{settings.base_url}/orion/v2.0/subscriptions/{subscription_id}"
@@ -911,13 +887,11 @@ def _entity_selector_pair_may_overlap(
     right_id = right.get("id")
     if left_id is not None and right_id is not None:
         return left_id == right_id
-    if left.get("idPattern") == ".*" or right.get("idPattern") == ".*":
-        return True
     return True
 
 
 def _find_unsafe_peer_subscription(
-    subscriptions: Any,
+    subscriptions: list[dict[str, Any]],
     *,
     settings: StHSubscriptionSettings,
     own_written_attrs: tuple[str, ...],
@@ -940,19 +914,11 @@ def _find_unsafe_peer_subscription(
     selector. Broad or malformed triggers and non-canonical selectors fail
     closed.
     """
-    if not isinstance(subscriptions, list):
-        return None
     own_written = set(own_written_attrs)
     for subscription in subscriptions:
-        if not isinstance(subscription, dict):
-            continue
-        subscription_id = subscription.get("id")
+        subscription_id = cast(str, subscription["id"])
         description = subscription.get("description")
-        if (
-            not isinstance(subscription_id, str)
-            or not subscription_id
-            or not isinstance(description, str)
-        ):
+        if not isinstance(description, str):
             continue
         if not description.startswith(peer_description_prefixes):
             continue
@@ -973,7 +939,7 @@ def _find_unsafe_peer_subscription(
         ):
             return peer_label, subscription_id, []
 
-        condition_attrs = list(raw_condition_attrs)
+        condition_attrs = cast(list[str], raw_condition_attrs)
         if not set(condition_attrs) & own_written:
             continue
 
@@ -988,63 +954,45 @@ def _find_unsafe_peer_subscription(
         ):
             continue
 
-        if set(condition_attrs) & own_written:
-            return peer_label, subscription_id, condition_attrs
+        return peer_label, subscription_id, condition_attrs
     return None
 
 
 def _matching_product_a_subscription_ids(
-    settings: StHSubscriptionSettings, subscriptions: Any
+    settings: StHSubscriptionSettings,
+    subscriptions: list[dict[str, Any]],
 ) -> tuple[str, ...]:
     """Return ids for active subscriptions matching Product A's exact contract."""
-    if not isinstance(subscriptions, list):
-        return ()
     return tuple(
-        subscription["id"]
+        cast(str, subscription["id"])
         for subscription in subscriptions
-        if isinstance(subscription, dict)
-        and isinstance(subscription.get("id"), str)
-        and bool(subscription["id"])
-        and _has_product_a_shape(settings, subscription)
+        if _has_product_a_shape(settings, subscription)
     )
 
 
 def _stale_product_a_subscription_ids(
-    settings: StHSubscriptionSettings, subscriptions: Any
+    settings: StHSubscriptionSettings,
+    subscriptions: list[dict[str, Any]],
 ) -> tuple[str, ...]:
     """Return ids for recognized Product A subscriptions with stale behavior."""
-    if not isinstance(subscriptions, list):
-        return ()
     return tuple(
-        subscription["id"]
+        cast(str, subscription["id"])
         for subscription in subscriptions
-        if isinstance(subscription, dict)
-        and isinstance(subscription.get("id"), str)
-        and bool(subscription["id"])
-        and _is_product_a_subscription_candidate(subscription)
+        if _is_product_a_subscription_candidate(subscription)
         and not _has_product_a_shape(settings, subscription)
     )
 
 
 def _matching_product_b_subscription_ids(
-    settings: StHSubscriptionSettings, subscriptions: Any
+    settings: StHSubscriptionSettings,
+    subscriptions: list[dict[str, Any]],
 ) -> tuple[str, ...]:
     """Return ids for subscriptions matching the aggregate Product B shape."""
-    if not isinstance(subscriptions, list):
-        return ()
-
-    matches: list[str] = []
-    for subscription in subscriptions:
-        if not isinstance(subscription, dict):
-            continue
-        subscription_id = subscription.get("id")
-        if (
-            isinstance(subscription_id, str)
-            and subscription_id
-            and _has_product_b_aggregate_shape(settings, subscription)
-        ):
-            matches.append(subscription_id)
-    return tuple(matches)
+    return tuple(
+        cast(str, subscription["id"])
+        for subscription in subscriptions
+        if _has_product_b_aggregate_shape(settings, subscription)
+    )
 
 
 def _notification_behavior_fields(
@@ -1078,7 +1026,7 @@ def _has_product_b_aggregate_shape(
     Matches only the exact redesigned shape: the Product B aggregate
     description prefix, the configured aggregate entity id/type, a
     ``dateRetrieved`` metadata-change trigger, legacy format, ``TimeInstant``
-    metadata, and the configured notify URL. Two checks are subtle:
+    metadata, and the configured notify URL. Three checks are subtle:
 
     - ``notification.attrs``: the builder omits it so Orion notifies the full
       replaced entity. Orion echoes an omitted ``attrs`` as ``[]`` on read, so
@@ -1159,7 +1107,14 @@ def _has_product_b_aggregate_shape(
 def _is_product_a_subscription_candidate(
     subscription: Mapping[str, Any],
 ) -> bool:
-    """Return whether a subscription is recognizable as Product A."""
+    """Return whether a subscription is recognizable as Product A.
+
+    A description starting with Product A's prefix always counts; one
+    starting with either Product B prefix (current or legacy) never does,
+    even if its entity selectors happen to match. Any other subscription —
+    for example, one written before subscriptions carried a description —
+    falls back to an exact match on Product A's canonical entity selectors.
+    """
     description = subscription.get("description")
     if isinstance(description, str):
         if description.startswith(_PRODUCT_A_DESCRIPTION_PREFIX):
@@ -1315,7 +1270,7 @@ def _required_env(env: Mapping[str, str], key: str) -> str:
 
 
 def _optional_env(env: Mapping[str, str], key: str, default: str) -> str:
-    """Return the env value if set and non-empty, otherwise *default*."""
+    """Return a stripped optional value, defaulting missing or whitespace-only input."""
     value = env.get(key)
     if value is None or value.strip() == "":
         return default

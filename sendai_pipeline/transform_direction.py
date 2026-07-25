@@ -234,7 +234,7 @@ def transform_direction_window(
             rows_dropped += 1
             continue
 
-        # Drop rows unless both device types match the oldest active batch's.
+        # Drop rows unless both device types match the oldest active batch's type.
         if expected_device_type is None:
             rows_dropped += 1
             continue

@@ -72,7 +72,7 @@ place_number,batch,expected_device_type,interval_min,entity_type,entity_id,ident
 And per-column rules are in [pipeline_spec.md §2](pipeline_spec.md).
 
 For daily operations, if the sensor metadata does not change often,
-we recommend you simply maintain the full `sensors.csv` file by hand.
+the simplest approach is to maintain the full `sensors.csv` file by hand.
 Otherwise, you can use the optional refresh workflow:
 keep `metadata/sensors_stable.csv` plus
 `metadata/sensors_refreshable.csv.staged` and run
@@ -257,8 +257,10 @@ time.
 
 ## 8. Schedule the runners (cron)
 
-Both runners are designed to be invoked every five minutes so the
-5-minute aggregates are republished promptly. Each takes a
+Both runners are designed to be invoked every five minutes: Product A
+republishes its 5-minute aggregates promptly, and Product B uses the same
+cadence to pick up newly eligible 60-minute windows and retry failures
+without waiting a full hour. Each takes a
 non-blocking `fcntl` lock on its own lock file (`state/flow.lock` /
 `state/direction.lock`) before doing work; the two products use
 separate locks and can run concurrently. A run that overlaps a still-

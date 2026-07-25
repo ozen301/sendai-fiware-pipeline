@@ -95,20 +95,20 @@ not run `scripts/refresh_metadata.py`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SOURCE_STABILITY_DELAY_HOURS` | `3` | Wait this many hours before publishing a source window, to give the source aggregator time to finish. Separate from the retry horizon. |
+| `SOURCE_STABILITY_DELAY_HOURS` | `3` | Require a source window's `startdate` to be at least this many hours old before publishing it, giving the source aggregator time to finish. Separate from the retry horizon. |
 | `REPROCESS_HOURS_PER3600` | `12` | Normal-run rolling lookback floor for 60-minute windows. |
-| `REPROCESS_HOURS_PER300` | `2` | Normal-run rolling lookback floor for 5-minute windows. |
-| `MAX_LOOKBACK_HOURS_PER3600` | `72` | Maximum age at which an open 60-minute window is still retried. Both intervals default to 72h because source rows can arrive at MySQL up to 3 days late. |
-| `MAX_LOOKBACK_HOURS_PER300` | `72` | Same for 5-minute windows. |
+| `REPROCESS_HOURS_PER300` | `2` | Product A normal-run rolling lookback floor for 5-minute windows. |
+| `MAX_LOOKBACK_HOURS_PER3600` | `72` | Maximum age at which the fresh path still retries an open 60-minute window. Both intervals default to 72h because source rows can arrive at MySQL up to 3 days late. |
+| `MAX_LOOKBACK_HOURS_PER300` | `72` | Product A maximum age at which the fresh path still retries an open 5-minute window. |
 | `REVISION_SWEEP_ENABLED` | `true` | Shared off-switch for both product runners. Set to `false` to pause the revision sweep without affecting normal fresh sends. |
-| `REVISION_SWEEP_MAX_WINDOWS` | `2000` | Shared per-run cap on total revision-sweep work: newly discovered windows plus retried old open windows. Keep it comfortably above the number of windows revised per cron interval so normal revision work does not accumulate; the default is ample and should not be made tiny. |
+| `REVISION_SWEEP_MAX_WINDOWS` | `2000` | Shared soft per-run limit on total revision-sweep work: newly discovered windows plus retried old open windows. A run can exceed it to keep all discoveries from one `aggregated_at` second together. Keep it comfortably above the number of windows revised per cron interval so normal revision work does not accumulate; the default is ample and should not be made tiny. |
 
-`MAX_LOOKBACK_HOURS_*` must be ≥ `REPROCESS_HOURS_*` for the same
-interval, or the run aborts at startup.
+Each product requires its `MAX_LOOKBACK_HOURS_*` value to be ≥ its
+`REPROCESS_HOURS_*` value for the same interval, or the run aborts at startup.
 
-The `PER300` lookback settings still govern Product A's 5-minute windows and
-shared timing validation. They do not enable Product B 5-minute publishing;
-Product B source selection remains fixed at `interval_min = 60`.
+The `PER300` lookback settings govern Product A's 5-minute windows only.
+Product B reads the `PER3600` settings and source selection remains fixed at
+`interval_min = 60`.
 
 Each product's `last_aggregated_at` cursor lives in its own state file
 (`state/flow.json` or `state/direction.json`). When a send-mode Product B

@@ -11,6 +11,7 @@ from sendai_pipeline.metadata import (
     active_places,
     index_by_place_interval,
     load_metadata,
+    metadata_path_from_env,
     parse_entity_id,
 )
 
@@ -57,6 +58,19 @@ def _header() -> str:
 def test_load_metadata_returns_all_rows_from_minimal_fixture() -> None:
     places = load_metadata(FIXTURE_PATH)
     assert len(places) == 5
+
+
+@pytest.mark.parametrize("env", [{}, {"SENSOR_METADATA_PATH": ""}])
+def test_metadata_path_from_env_uses_default_for_missing_or_empty_value(
+    env: dict[str, str],
+) -> None:
+    assert metadata_path_from_env(env) == Path("metadata/sensors.csv")
+
+
+def test_metadata_path_from_env_uses_configured_path() -> None:
+    assert metadata_path_from_env(
+        {"SENSOR_METADATA_PATH": "runtime/custom-sensors.csv"}
+    ) == Path("runtime/custom-sensors.csv")
 
 
 @pytest.mark.parametrize(

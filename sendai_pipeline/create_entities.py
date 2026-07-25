@@ -19,6 +19,7 @@ from typing import Any, Self
 import requests
 
 from sendai_pipeline.orion_client import TokenProvider
+from sendai_pipeline.settings_validation import optional_env
 
 logger = logging.getLogger(__name__)
 
@@ -88,9 +89,9 @@ class CreateEntitiesSettings:
         values = os.environ if env is None else env
         return cls(
             base_url=_required_env(values, "FIWARE_BASE_URL").rstrip("/"),
-            service=_optional_env(values, "FIWARE_SERVICE", ""),
-            service_path=_optional_env(values, "FIWARE_SERVICE_PATH", "/"),
-            verify_tls=_parse_bool(_optional_env(values, "FIWARE_VERIFY_TLS", "true")),
+            service=optional_env(values, "FIWARE_SERVICE", ""),
+            service_path=optional_env(values, "FIWARE_SERVICE_PATH", "/"),
+            verify_tls=_parse_bool(optional_env(values, "FIWARE_VERIFY_TLS", "true")),
             timeout=_parse_float(values, "FIWARE_TIMEOUT_SECONDS", 10.0),
             entities=(),
             dry_run=True,
@@ -326,7 +327,7 @@ def parse_entity_specs(values: Iterable[str]) -> tuple[EntitySpec, ...]:
 
 def _parse_float(env: Mapping[str, str], key: str, default: float) -> float:
     """Parse an optional float environment variable or return *default*."""
-    raw = _optional_env(env, key, "")
+    raw = optional_env(env, key, "")
     if raw == "":
         return default
     try:
@@ -342,14 +343,6 @@ def _required_env(env: Mapping[str, str], key: str) -> str:
     value = env.get(key)
     if value is None or value == "":
         raise CreateEntitiesError(f"missing required environment variable: {key}")
-    return value
-
-
-def _optional_env(env: Mapping[str, str], key: str, default: str) -> str:
-    """Return the env value if set and non-empty, otherwise *default*."""
-    value = env.get(key)
-    if value is None or value == "":
-        return default
     return value
 
 

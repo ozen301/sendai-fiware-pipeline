@@ -321,7 +321,7 @@ def _orion_subscription_path(subscription_id: str) -> str:
 
 
 def _history_path(config: ProbeConfig) -> str:
-    """Return the deployed STH history path used by current dev helpers."""
+    """Return the STH-Comet v1.0 history path for the probe's attribute."""
     return (
         "/comet/v1.0/contextEntities/type/"
         f"{quote(config.entity_type, safe='')}/id/{quote(config.entity_id, safe='')}"
@@ -533,7 +533,11 @@ def _run_live(config: ProbeConfig, client: ProbeClient) -> int:
                 report["subscription_after_update"]["body"] = subscription.json()
 
         if config.probe_delete:
-            report["delete_history_probe"] = _probe_history_delete(client, config)
+            report["delete_history_probe"] = _probe_history_delete(
+                client,
+                config,
+                history_before=len(after_values),
+            )
 
     except Exception as exc:
         report["error"] = {
@@ -606,17 +610,89 @@ def _parse_utc_datetime(value: str) -> datetime | None:
 def _probe_history_delete(
     client: ProbeClient,
     config: ProbeConfig,
-) -> list[dict[str, Any]]:
-    """Try safe attribute-level STH DELETE endpoint variants."""
-    results: list[dict[str, Any]] = []
+    *,
+    history_before: int,
+) -> dict[str, Any]:
+    """Try safe STH DELETE variants, then verify their effect with a GET."""
+    attempts: list[dict[str, Any]] = []
+    final_response: requests.Response | None = None
     for path in _delete_probe_paths(config):
         response = client.request("DELETE", path)
         summary = _response_summary(response)
         summary["path"] = path
-        results.append(summary)
+        attempts.append(summary)
+        final_response = response
         if response.ok:
             break
-    return results
+
+    if final_response is None:
+        raise RuntimeError("no STH DELETE probe path is configured")
+
+    after_response = client.request(
+        "GET",
+        _history_path(config),
+        params=_history_params(config),
+    )
+    verification = _history_delete_verification(
+        after_response,
+        history_before=history_before,
+    )
+    return {
+        "attempts": attempts,
+        "interpretation": _delete_status_interpretation(
+            final_response.status_code,
+            final_response.text,
+        ),
+        "verification": verification,
+    }
+
+
+def _delete_status_interpretation(status: int, body: str) -> str:
+    """Classify the gateway or backend outcome of an STH DELETE attempt."""
+    if status in {200, 204}:
+        return "delete_succeeded"
+    if status == 404 and "am:fault" in body:
+        return "gateway_route_missing"
+    if status == 404:
+        return "backend_not_found"
+    if status == 405:
+        return "gateway_method_not_allowed"
+    if status == 403:
+        return "backend_forbidden"
+    return "unexpected_status"
+
+
+def _history_delete_verification(
+    response: requests.Response,
+    *,
+    history_before: int,
+) -> dict[str, Any]:
+    """Summarize whether a post-DELETE history read confirms removal."""
+    summary = _response_summary(response)
+    summary["values_before"] = history_before
+
+    if response.status_code == 404:
+        values_after = 0
+    elif response.ok:
+        try:
+            values_after = len(_history_values(response.json()))
+        except ValueError:
+            summary["effect"] = "inconclusive_invalid_history_json"
+            return summary
+    else:
+        summary["effect"] = "inconclusive_history_read_failed"
+        return summary
+
+    summary["values_after"] = values_after
+    if history_before <= 0:
+        summary["effect"] = "inconclusive_no_prior_history"
+    elif values_after == 0:
+        summary["effect"] = "verified_removed"
+    elif values_after < history_before:
+        summary["effect"] = "verified_reduced"
+    else:
+        summary["effect"] = "verified_not_removed"
+    return summary
 
 
 def _client(auth_settings: AuthSettings) -> ProbeClient:

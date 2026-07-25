@@ -151,7 +151,8 @@ def _extract_ids(entities: Iterable[dict[str, Any]]) -> set[str]:
     """Return the set of ``id`` values from an Orion list response.
 
     Entries without an ``id`` field are skipped silently. Orion always
-    returns ``id`` on entity objects, so a missing key indicates a
-    response shape the caller does not need to act on here.
+    returns ``id`` on entity objects, so a missing key would mean an
+    unexpected response shape; this function ignores that case rather
+    than raising.
     """
     return {entity["id"] for entity in entities if "id" in entity}

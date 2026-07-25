@@ -1,10 +1,12 @@
 """Dev probe: one-shot sanity check of the source MySQL tables.
 
-Prints row counts, distinct ``interval_min`` values, distinct
-``group_place_id`` counts (with a small sample), ``startdate`` min/max
-boundaries, and a count of the ``'ALL'``-keyed rows in the direction table.
-This script exists to verify the assumptions in the spec against real data
-once at setup time — it is operator-run, not part of CI or any cron job.
+Prints row counts, distinct ``interval_min`` values, distinct counts for
+each place-id column (``group_place_id`` in the flow table;
+``from_group_place_id`` and ``to_group_place_id`` in the direction table,
+each with a small sample), ``startdate`` min/max boundaries, and a count
+of the ``'ALL'``-keyed rows in the direction table. This script exists to
+verify the assumptions in the spec against real data once at setup time —
+it is operator-run, not part of CI or any cron job.
 
 Usage from project root:
 

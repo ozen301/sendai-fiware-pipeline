@@ -14,6 +14,8 @@ from typing import Any, Self
 
 import requests
 
+from sendai_pipeline.settings_validation import optional_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,8 +36,10 @@ class AuthSettings:
     """Configuration for OAuth2 client-credentials token requests.
 
     Attributes:
-        base_url: Canonical Sendai platform base URL. This currently derives the
-            default token URL and is retained for downstream FIWARE clients.
+        base_url: Canonical Sendai platform base URL, used to derive the
+            default token URL when ``FIWARE_TOKEN_URL`` is unset. Some
+            developer tooling also reads this field directly off the
+            settings object instead of reading the environment again.
     """
 
     base_url: str
@@ -58,7 +62,7 @@ class AuthSettings:
         values = os.environ if env is None else env
         base_url = _required_env(values, "FIWARE_BASE_URL").rstrip("/")
         token_url = (
-            _optional_env(values, "FIWARE_TOKEN_URL", "") or f"{base_url}/oauth2/token"
+            optional_env(values, "FIWARE_TOKEN_URL", "") or f"{base_url}/oauth2/token"
         )
 
         return cls(
@@ -66,15 +70,15 @@ class AuthSettings:
             consumer_key=_required_env(values, "FIWARE_CONSUMER_KEY"),
             consumer_secret=_required_env(values, "FIWARE_CONSUMER_SECRET"),
             token_url=token_url,
-            token_scope=_optional_env(values, "FIWARE_TOKEN_SCOPE", "default"),
+            token_scope=optional_env(values, "FIWARE_TOKEN_SCOPE", "default"),
             token_cache_path=Path(
-                _optional_env(values, "FIWARE_TOKEN_CACHE_PATH", "state/token.json")
+                optional_env(values, "FIWARE_TOKEN_CACHE_PATH", "state/token.json")
             ),
             refresh_margin_seconds=int(
-                _optional_env(values, "FIWARE_TOKEN_REFRESH_MARGIN_SECONDS", "60")
+                optional_env(values, "FIWARE_TOKEN_REFRESH_MARGIN_SECONDS", "60")
             ),
-            timeout=float(_optional_env(values, "FIWARE_TOKEN_TIMEOUT_SECONDS", "10")),
-            verify_tls=_parse_bool(_optional_env(values, "FIWARE_VERIFY_TLS", "true")),
+            timeout=float(optional_env(values, "FIWARE_TOKEN_TIMEOUT_SECONDS", "10")),
+            verify_tls=_parse_bool(optional_env(values, "FIWARE_VERIFY_TLS", "true")),
         )
 
 
@@ -132,14 +136,20 @@ class AuthClient:
             return token_record["access_token"]
 
     def _is_cache_usable(self, record: dict[str, Any]) -> bool:
-        """Return whether a cached token is outside the refresh margin."""
+        """Return whether a cached token still has more than the refresh margin left."""
         return (
             self.now()
             < float(record["expires_at"]) - self.settings.refresh_margin_seconds
         )
 
     def _read_cache(self) -> dict[str, Any] | None:
-        """Read a usable token cache record, ignoring missing or invalid files."""
+        """Read and structurally validate a token cache record.
+
+        Returns ``None`` for a missing file, invalid JSON, or a malformed
+        record (not a dict, a non-string ``access_token``, or an
+        ``expires_at`` that cannot convert to a float). Does not check
+        whether the token is still fresh — see :meth:`_is_cache_usable`.
+        """
         path = self.settings.token_cache_path
         if not path.exists():
             return None
@@ -256,21 +266,13 @@ def _required_env(env: Mapping[str, str], key: str) -> str:
     return value
 
 
-def _optional_env(env: Mapping[str, str], key: str, default: str) -> str:
-    """Return the env value if set and non-empty, otherwise *default*.
-
-    ``.env`` files commonly carry ``KEY=`` placeholders for optional
-    settings; ``os.environ.get(key, default)`` would return the empty
-    string in that case, not the default. Treat empty as missing.
-    """
-    value = env.get(key)
-    if value is None or value == "":
-        return default
-    return value
-
-
 def _parse_bool(value: str) -> bool:
-    """Parse opt-out boolean strings used by environment variables."""
+    """Parse an environment-style boolean that defaults to true.
+
+    Only ``"0"``, ``"false"``, ``"no"``, or ``"off"`` (case-insensitive)
+    parse as ``False``; every other value, including malformed input, is
+    ``True``.
+    """
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 

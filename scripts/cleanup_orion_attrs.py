@@ -2,8 +2,8 @@
 
 This standalone operator command is dry-run by default and performs one Orion
 DELETE request per explicitly named attribute when ``--send`` is supplied. It
-never scans for stale attributes and has no STH-Comet dependency. Contract
-scalar deletion is supported for exceptional recovery, but operators
+never scans for stale attributes and has no STH-Comet dependency. Deleting a
+stable scalar attribute is supported for exceptional recovery, but operators
 should normally preserve ``dateObservedFrom``, ``dateObservedTo``,
 ``dateRetrieved``, and ``identifcation``.
 """

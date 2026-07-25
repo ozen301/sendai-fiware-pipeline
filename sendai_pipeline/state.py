@@ -66,7 +66,7 @@ class WindowStateStore:
             Loaded or empty store.
 
         Raises:
-            StateLoadError: If the file exists but cannot be read or parsed.
+            StateLoadError: If the file cannot be read or has invalid state content.
         """
         store = cls(path, now=now)
         if not store.path.exists():
@@ -100,7 +100,8 @@ class WindowStateStore:
         store._state = {
             "schema_version": schema_version,
             "last_aggregated_at": _loaded_revision_cursor_value(
-                data.get("last_aggregated_at")
+                data.get("last_aggregated_at"),
+                path=store.path,
             ),
             "windows": dict(windows),
         }
@@ -119,11 +120,16 @@ class WindowStateStore:
 
         The persisted representation is the top-level ``last_aggregated_at``
         ISO string in the product state file, normalized by runners to JST.
-        Missing legacy state files use ``None`` until the first send-mode sweep
-        stores a cursor.
+        State files written before this field existed have no cursor and
+        read as ``None`` until the first send-mode sweep stores one.
 
         Returns:
             Parsed cursor datetime, or ``None`` when no cursor is stored.
+
+        Raises:
+            StateValidationError: If the stored value's type is not
+                ``None``, ``datetime``, or ``str``.
+            ValueError: If a live string value is not a valid ISO datetime.
         """
         value = self._state.get("last_aggregated_at")
         if value is None:
@@ -201,6 +207,11 @@ class WindowStateStore:
                 the stored snapshot.  A non-empty iterable replaces the stored
                 snapshot on a retry, so callers that want to expand the
                 expected set should pass the full new set explicitly.
+
+        Raises:
+            StateValidationError: If missing metadata cannot be derived from
+                ``window_key``, or the window is already ``"dead_letter"`` and
+                cannot be retried.
         """
         timestamp = self._now().isoformat()
         windows = self._windows()
@@ -621,17 +632,21 @@ def _without_microseconds(value: datetime) -> datetime:
     return value.replace(microsecond=0)
 
 
-def _loaded_revision_cursor_value(value: Any) -> str | None:
-    """Return the persisted revision cursor value from loaded JSON state.
-
-    The in-memory state keeps the cursor in the same shape as persisted JSON:
-    a JST ISO string or ``None``.  Non-string values are treated like absent
-    legacy state so a malformed optional cursor cannot block loading otherwise
-    usable window state.
-    """
-    if isinstance(value, str):
-        return value
-    return None
+def _loaded_revision_cursor_value(value: Any, *, path: Path) -> str | None:
+    """Validate and return a persisted revision cursor value."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise StateLoadError(
+            f"state file last_aggregated_at must be an ISO datetime string: {path}"
+        )
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise StateLoadError(
+            f"state file last_aggregated_at must be an ISO datetime string: {path}"
+        ) from exc
+    return value
 
 
 def _derive_source_window_metadata(window_key: str) -> dict[str, Any]:
