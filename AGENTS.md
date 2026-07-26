@@ -7,45 +7,65 @@ the full documentation index.
 
 Do not commit **excluded content**: credentials, private hostnames,
 restricted reference material, `ref_docs/`, runtime output, logs,
-state, metadata snapshots, token caches, or `.env` / `*.env` files. Private local
-reference material may exist under `ref_docs/` (gitignored, possibly
-absent in another checkout); ask the user for specific documents if
-you need one.
+state, metadata snapshots, token caches, or `.env` / `*.env` files.
+Private local reference material may exist under `ref_docs/`
+(gitignored, possibly absent in another checkout); ask the user for
+specific documents if you need one.
 
-## Development Rules
+## Repository Conventions
 
-- Python is managed with [`uv`](https://docs.astral.sh/uv/) (`uv run`,
-  `uv sync`, `uv add`, etc.). Don't activate `.venv` directly.
-- Dependencies live in `pyproject.toml`.
-- Prefer production code under `sendai_pipeline/`; operator CLI shims
-  go under `scripts/`.
-- Keep implementation aligned with [docs/pipeline_spec.md](docs/pipeline_spec.md),
-  the canonical data contract. The spec is authoritative for that data
-  contract; the code is authoritative for *how* it is implemented. If
-  they disagree on the contract itself, treat it as a defect: decide
-  deliberately which side is right and fix the other, rather than
-  letting the drift persist.
-- AI agents should not commit without explicit authorization. Leave
-  changes for the user to review and commit manually.
+- Base conclusions on the current repository, its tests, and command
+  output rather than memory or planning discussions.
+- Preserve unrelated work and operational safeguards.
+- AI agents must not commit without explicit authorization.
+- Manage Python with [`uv`](https://docs.astral.sh/uv/) (`uv run`,
+  `uv sync`, `uv add`, etc.); do not activate `.venv` directly.
+- Keep dependencies in `pyproject.toml`.
+- Put production code under `sendai_pipeline/` and operator CLI shims
+  under `scripts/`.
+- Keep implementation aligned with
+  [docs/pipeline_spec.md](docs/pipeline_spec.md), the canonical data
+  contract. The spec defines the contract; the code defines how it is
+  implemented. If they disagree about the contract, resolve the defect
+  deliberately and update both sides in the same change.
 
 ## Workflow
 
-New features follow Spec → Tests → Implementation → CI validation →
-drift prevention:
+For new features and behavior changes, follow Spec → Tests →
+Implementation → Validation → Drift prevention:
 
-1. **Spec:** Write or update the behavioral/architectural contract.
-   Human reviews before implementation.
-2. **Tests:** Write tests from the spec. Tests are the implementation
+1. **Spec:** Establish the intended behavioral or architectural
+   contract and obtain human review before implementation. If the user
+   supplies a reviewed spec or plan, treat it as the starting contract.
+2. **Tests:** Express the reviewed behavior in tests, including
+   important boundaries and failure modes. Tests are the implementation
    contract.
-3. **Implementation:** Implement against reviewed tests in a fresh
-   context. Human reviews before committing.
-4. **CI validation:** Automated checks confirm the contract still
-   holds.
+3. **Implementation:** Implement against the reviewed spec and tests
+   in a fresh context. Obtain human review before committing.
+4. **Validation:** Run the relevant automated checks and inspect the
+   resulting diff.
 5. **Drift prevention:** When a change touches a documented contract
    (a column→attribute mapping, payload shape, filter rule, or
    entity-id convention), update `docs/pipeline_spec.md` in the same
-   change so code and spec do not silently diverge. Human or cross-agent
-   review should verify they still agree.
+   change.
+
+### Validation
+
+After changing code, tests, or configuration, run:
+
+```sh
+uv run ruff format .
+uv run ruff check .
+uv run pyright
+uv run pytest -q
+git diff --check
+```
+
+If the environment prevents a check, report the exact command and
+reason instead of describing the change as fully validated. For a
+documentation-only change, `git diff --check` plus verification of the
+changed claims and references is sufficient unless the documentation
+affects executable tooling.
 
 ### Cross-Agent Validation
 
@@ -56,16 +76,16 @@ through review as readily as an implementation. Documentation
 explaining subtle behavior counts too: a read-only check of docstrings
 and comments against the code catches inaccuracy and drift. The more
 consequential or non-obvious the work is, the stronger the case for a
-second model's review before you commit to a direction. Prefer cross-model
-validation when both Codex and Claude Code are available.
+second model's review before committing to a direction. Prefer
+cross-model validation when both Codex and Claude Code are available.
+The user may waive cross-agent validation for a particular task.
 
 The process uses three roles:
 
 - **Author:** produces the artifact under review.
 - **Reviewer:** critiques the artifact and returns findings.
 - **Commander:** holds authority over the final hand-off to the human.
-  This is usually the Author or the Reviewer, not a separate third
-  agent.
+  This is usually the Author or Reviewer, not a separate third agent.
 
 Two guardrails apply: never ask an agent to review its own artifact,
 and avoid recursive agent delegation. A delegated Author or Reviewer
@@ -80,37 +100,35 @@ Review is **iterative, not single-pass**. Each round:
 3. The Commander sends the updated artifact back for the next round.
 
 Continue the existing Reviewer session across rounds when one is
-available, so it keeps prior context instead of re-exploring the repo;
-re-review stays read-only, so resuming is safe.
+available, so it retains prior context instead of re-exploring the
+repository. Keep re-review read-only.
 
-Repeat this process until the Reviewer raises no new substantive
-issues. Converge in a bounded number of rounds (to cut trivial
-back-and-forth, not real concerns); if findings are not settling, stop
-and surface the disagreement to the human rather than looping
-indefinitely. The goal is a robust artifact, not fast convergence.
-Never set aside a material concern such as a better alternative or an
-unresolved risk to make the review settle sooner, even if it arrives
-late or reopens a settled question.
+Repeat until the Reviewer raises no new substantive issues. Keep the
+number of rounds bounded to avoid trivial back-and-forth, but do not
+set aside a material concern merely to make the review converge. If
+findings do not settle, surface the disagreement to the user. The goal
+is a robust artifact, not fast convergence.
 
-Whenever you send diffs or files to another agent, send only ordinary
-source code, tests, documentation, and configuration. Do **not** send
-any of the excluded content listed above. If a diff mixes ordinary
-code with excluded content, send only a minimized subset.
+Whenever sending diffs or files to another agent, send only the minimum
+relevant source code, tests, documentation, and configuration. Never
+send excluded content. If a diff mixes ordinary code with excluded
+content, send only a minimized subset.
 
 When working with Codex:
 
 - Choose reasoning effort explicitly: **medium** for routine,
-  well-understood tasks; **high** for non-obvious logic, debugging,
-  API integration, or extra-care reviews; **xhigh** for architecture
-  decisions, multi-step planning, or work with significant
-  consequences if wrong.
+  well-understood tasks; **high** for non-obvious logic, debugging, API
+  integration, or extra-care reviews; and **xhigh** for architecture,
+  multi-step planning, or work with significant consequences if wrong.
 - A Codex thread's sandbox is fixed when the thread is created
-  (reasoning effort can be chosen per call): a read-only thread (e.g. a
-  review pass) that later needs to write can't be resumed into write
-  mode — start a fresh write thread.
-- To continue a review across rounds, invoke `codex:codex-rescue` with
-  `--resume` (not `SendMessage` to the wrapper, which cold-starts a fresh
-  Codex session each round).
+  (reasoning effort can be chosen per call): a read-only review thread
+  that later needs to write cannot be resumed into write mode. Start a
+  fresh write-capable thread.
+- To continue a review across rounds, pass `--resume` in the request to
+  the `codex:codex-rescue` subagent, or run `/codex:rescue --resume`.
+  Do not resume by sending `SendMessage` to the wrapper: it cold-starts
+  a new Codex session and discards the Reviewer's context. Invoking
+  `codex:rescue` through the Skill tool hangs the session.
 
 ### Implementation Delegation
 
@@ -121,20 +139,6 @@ and the permitted edit area. Do not include your implementation
 approach: independent authoring is the goal.
 
 ## Code Style
-
-### Formatting, Linting, and Type Checking
-
-Use `ruff` for formatting and linting, and `pyright` for static type
-checking.
-
-```sh
-uv run ruff format .
-uv run ruff check .
-uv run pyright
-```
-
-Configuration is in `pyproject.toml`. Run all three before reporting an
-implementation complete; they must be clean.
 
 ### Typing
 
@@ -147,46 +151,25 @@ implementation complete; they must be clean.
 
 ### Docstrings and Comments
 
-Write for a developer seeing this code for the first time, who does
-not hold the design in their head and has only the committed
-repository. Avoid terms and context that come from planning documents
-or discussions the reader cannot see (e.g. agent sessions); the
-goal is not to record all you know but to move that reader to
-understanding by the shortest clear path.
-Before calling a docstring or comment done, read it once cold: does it
-state what the code does up front, follow a logical order, and say only
-what the reader needs? If not, revise, judging the whole docstring or
-comment rather than a single phrase.
-
-These principles, apart from the code-specific mechanics below, apply
-to documentation files as well.
+Write for a developer who has only the committed repository, not the
+planning discussion. These principles also apply to documentation
+files, apart from the docstring mechanics:
 
 - Use Google-style docstrings for public modules, classes, and
-  functions. State what the code does first; let the "why", if
-  necessary, follow as a short note. Do not dwell on what the code must
-  *not* do.
-- For subtle logic, explain the mechanism step by step, not just
-  the conclusion; a concrete example often helps. Stay within this
-  code's behavior; stating unrelated paths or another product's behavior
-  pulls the reader off track.
-- Match the level of detail to the reader: `Args`/`Returns` are the
-  caller's contract, not the internal step sequence — cut anything that
-  doesn't affect how the code is used. Document a `dict`/`list`/tuple
-  shape (with a short example) or a private helper when it is not already
-  obvious.
-- Keep claims accurate: details such as execution order, key order,
-  input→output mappings, and any "always/never" must match the code.
-  Verify, don't recall. Re-check each claim when copying a
-  docstring between parallel functions. Avoid absolutes unless literally
-  true, and describe current behavior, not change history.
-- Keep references and terms unambiguous: the reader should be able to
-  tell what every name points to; no word should carry a second reading
-  in context; metaphors should not need decoding; and pronouns and
-  connectives ("because", "so") should resolve and hold.
-- Keep prose ESL-friendly (clear structure, accessible wording) for a
-  technically fluent reader (terms used directly, no padding); a longer
-  well-structured sentence is fine, and precise terms beat vaguer ones.
-  Reference a `docs/` file when it genuinely helps.
+  functions. Begin with what the code does; add the reason only when it
+  helps the reader.
+- Keep `Args` and `Returns` focused on the caller's contract. Document
+  non-obvious collection shapes and private helpers, but omit internal
+  steps that do not affect use.
+- Explain subtle mechanisms in execution order; use a short concrete
+  example when it clarifies the behavior.
+- Verify claims about ordering, mappings, failure handling, and
+  "always" or "never" against the implementation and tests. Describe
+  current behavior, not change history. Re-check each claim when
+  copying a docstring between parallel functions.
+- Use precise, unambiguous, ESL-friendly prose. Read the whole passage
+  once cold and remove context, repetition, or detail the reader does
+  not need.
 
 ### Configuration
 
@@ -236,9 +219,8 @@ permission.
 - Use fake objects (`FakeSession`, `FakeAuth`, `FakeResponse`) instead
   of mocks.
 
-The default suite must run with no live MySQL, FIWARE, or `.env`.
-Gate any test that needs a real backend with
-`@pytest.mark.integration` + `RUN_INTEGRATION_TESTS=1`. Committed
+The default suite must run without a live MySQL server, a live FIWARE
+backend, or a `.env` file, so it is safe to run repeatedly. Committed
 fixtures must be small and sanitized: no credentials, private
 hostnames, or restricted reference content.
 
