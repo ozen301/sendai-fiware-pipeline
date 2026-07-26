@@ -555,7 +555,7 @@ sendai-fiware-pipeline/
 │   ├── pipeline_spec.md     # canonical data contract
 │   ├── source_schema_reference.md  # MySQL DESC snapshots
 │
-├── tests/                   # pytest suite (one file per module)
+├── tests/                   # module and cross-cutting contract/integration tests
 ├── metadata/                # runtime sensor metadata (gitignored)
 ├── state/                   # window state + token cache (gitignored)
 ├── logs/                    # rotating runtime logs (gitignored)

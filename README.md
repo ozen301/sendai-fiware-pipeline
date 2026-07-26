@@ -91,7 +91,8 @@ Full per-script reference in
 - `scripts/`: operator-facing CLI shims (entity bootstrap, state
   inspection, repair, replay).
 - `docs/`: the docs linked above.
-- `tests/`: pytest suite (one file per module).
+- `tests/`: pytest suite with module-focused and cross-cutting
+  contract/integration tests.
 - `metadata/`, `state/`, `logs/`, `ref_docs/`, `.env`:
   **gitignored.** Runtime data, credentials, and local-only reference
   material. Do not commit.

@@ -1,3 +1,4 @@
+import fcntl
 import hashlib
 import json
 import logging
@@ -18,6 +19,9 @@ from sendai_pipeline.run_direction import (
     RunDirectionResult,
     RunDirectionSettings,
     run_direction,
+)
+from sendai_pipeline.run_direction import (
+    main as run_direction_main,
 )
 from sendai_pipeline.state import WindowStateStore
 from sendai_pipeline.transform_direction import (
@@ -129,9 +133,13 @@ class FakeDbConnection:
         self.fresh_queries: list[tuple[int, str, str]] = []
         self.startdate_queries: list[tuple[int, tuple[str, ...]]] = []
         self.discovery_queries: list[tuple[int, str, str, str]] = []
+        self.close_calls = 0
 
     def cursor(self) -> FakeDbCursor:
         return FakeDbCursor(self)
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class FakeOrionClient:
@@ -425,6 +433,21 @@ def forbid_state_mutation(
 
 def revision_row(startdate: str, aggregated_at: str) -> dict[str, str]:
     return {"startdate": startdate, "win_agg": aggregated_at}
+
+
+def set_required_main_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("DIRECTION_SEND_MODE", "dry-run")
+    monkeypatch.setenv("TARGET_DIRECTION_BATCHES", "2026")
+    monkeypatch.setenv(
+        "SENSOR_METADATA_PATH", str(tmp_path / "metadata" / "sensors.csv")
+    )
+    monkeypatch.setenv("MYSQL_HOST", "db.example.test")
+    monkeypatch.setenv("MYSQL_USER", "reader")
+    monkeypatch.setenv("MYSQL_PASSWORD", "secret")
+    monkeypatch.setenv("MYSQL_DATABASE", "bleData2025d")
+    monkeypatch.setenv("FIWARE_BASE_URL", "https://fiware.example.test")
+    monkeypatch.setenv("FIWARE_CONSUMER_KEY", "key")
+    monkeypatch.setenv("FIWARE_CONSUMER_SECRET", "secret")
 
 
 def test_run_direction_result_uses_put_counters_and_no_write_window_counters() -> None:
@@ -2010,3 +2033,146 @@ def test_run_direction_logging_allowlist_carries_aggregate_contract_fields() -> 
         "missing_from_all_place_numbers",
         "missing_to_all_place_numbers",
     } <= _ALLOWED_EXTRA_KEYS
+
+
+def test_main_dry_run_smoke_configures_logging_after_lock_and_never_live_puts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    set_required_main_env(monkeypatch, tmp_path)
+    events: list[str] = []
+    db_connection = FakeDbConnection({60: sendable_window()})
+    orion = FakeOrionClient()
+
+    def load_dotenv() -> None:
+        events.append("dotenv")
+
+    def configure_logging(_settings: Any, *, product: str) -> None:
+        assert product == "direction"
+        events.append("logging")
+
+    def flock(_file: Any, flags: int) -> None:
+        assert flags == fcntl.LOCK_EX | fcntl.LOCK_NB
+        events.append("lock")
+
+    class FakeAuthClient:
+        def __init__(self, _settings: Any) -> None:
+            pass
+
+    monkeypatch.setattr(run_direction_module, "load_dotenv", load_dotenv)
+    monkeypatch.setattr(run_direction_module, "configure_logging", configure_logging)
+    monkeypatch.setattr(run_direction_module.fcntl, "flock", flock)
+    monkeypatch.setattr(
+        run_direction_module,
+        "load_metadata",
+        lambda _path: [place(10)],
+    )
+    monkeypatch.setattr(
+        run_direction_module.db,
+        "connect",
+        lambda _settings: db_connection,
+    )
+    monkeypatch.setattr(run_direction_module.auth, "AuthClient", FakeAuthClient)
+    monkeypatch.setattr(
+        run_direction_module.orion_client,
+        "OrionClient",
+        lambda _settings, **_kwargs: orion,
+    )
+
+    code = run_direction_main(argv=[])
+
+    assert code == 0
+    assert events.index("dotenv") < events.index("lock") < events.index("logging")
+    assert events.count("logging") == 1
+    assert [call["dry_run"] for call in orion.replace_calls] == [True]
+    assert db_connection.close_calls == 1
+
+
+def test_main_writes_lifecycle_records_to_configured_log_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    set_required_main_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    db_connection = FakeDbConnection({60: sendable_window()})
+    orion = FakeOrionClient()
+
+    class FakeAuthClient:
+        def __init__(self, _settings: Any) -> None:
+            pass
+
+    monkeypatch.setattr(run_direction_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(
+        run_direction_module,
+        "load_metadata",
+        lambda _path: [place(10)],
+    )
+    monkeypatch.setattr(
+        run_direction_module.db,
+        "connect",
+        lambda _settings: db_connection,
+    )
+    monkeypatch.setattr(run_direction_module.auth, "AuthClient", FakeAuthClient)
+    monkeypatch.setattr(
+        run_direction_module.orion_client,
+        "OrionClient",
+        lambda _settings, **_kwargs: orion,
+    )
+
+    code = run_direction_main(argv=[])
+
+    assert code == 0
+    log_records = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "direction.log")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    lifecycle_records = [
+        record
+        for record in log_records
+        if record.get("event") in {"run_started", "run_summary"}
+    ]
+    assert [record["event"] for record in lifecycle_records] == [
+        "run_started",
+        "run_summary",
+    ]
+    assert all(record["logger"] == "sendai_pipeline" for record in lifecycle_records)
+    assert db_connection.close_calls == 1
+
+
+def test_main_flock_contention_returns_zero_and_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    set_required_main_env(monkeypatch, tmp_path)
+
+    def raise_contention(_file: Any, flags: int) -> None:
+        assert flags == fcntl.LOCK_EX | fcntl.LOCK_NB
+        raise BlockingIOError
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("downstream dependencies must not be constructed")
+
+    monkeypatch.setattr(run_direction_module, "load_dotenv", lambda: None)
+    monkeypatch.setattr(run_direction_module.fcntl, "flock", raise_contention)
+    monkeypatch.setattr(run_direction_module, "configure_logging", fail)
+    monkeypatch.setattr(run_direction_module.FilterSettings, "from_env", fail)
+    monkeypatch.setattr(run_direction_module.auth, "AuthClient", fail)
+    monkeypatch.setattr(run_direction_module.db, "connect", fail)
+
+    with caplog.at_level(logging.DEBUG, logger="sendai_pipeline"):
+        code = run_direction_main(argv=[])
+
+    assert code == 0
+    assert (
+        "[sendai-pipeline] direction run skipped: lock held by another process"
+        in capsys.readouterr().err
+    )
+    assert caplog.records == []

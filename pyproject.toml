@@ -28,6 +28,8 @@ notebook = [
 ]
 
 [tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+filterwarnings = ["error"]
 pythonpath = ["."]
 testpaths = ["tests"]
 

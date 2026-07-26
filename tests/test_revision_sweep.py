@@ -40,6 +40,21 @@ def test_split_discovered_revisions_keeps_cursor_second_together() -> None:
     assert deferred == discovered[2:]
 
 
+def test_split_discovered_revisions_keeps_final_cursor_second_together() -> None:
+    first_second = datetime(2026, 7, 24, 12, 0, 1, tzinfo=JST)
+    final_second = datetime(2026, 7, 24, 12, 0, 2, tzinfo=JST)
+    discovered = [
+        _item("20260724_0900", first_second),
+        _item("20260724_1000", final_second),
+        _item("20260724_1100", final_second),
+    ]
+
+    selected, deferred = split_discovered_revisions(discovered, 2)
+
+    assert selected == discovered
+    assert deferred == []
+
+
 def test_split_discovered_revisions_returns_all_below_cap() -> None:
     discovered = [
         _item(
@@ -112,14 +127,46 @@ def test_revision_retry_items_stops_at_limit(tmp_path: Path) -> None:
 
 
 def test_revision_retry_items_returns_empty_when_limit_is_zero(tmp_path: Path) -> None:
-    store = WindowStateStore(tmp_path / "state.json")
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=JST)
+    store = WindowStateStore(tmp_path / "state.json", now=lambda: now)
+    store.begin_window_attempt(
+        "per3600/20260720_0900",
+        interval_min=60,
+        expected_target_ids=["target"],
+    )
 
     assert (
         revision_retry_items(
             store,
-            startdate_upper_by_interval={},
+            startdate_upper_by_interval={
+                60: datetime(2026, 7, 21, 0, 0, tzinfo=JST),
+            },
             excluded_window_keys=set(),
             limit=0,
+        )
+        == []
+    )
+
+
+def test_revision_retry_items_excludes_window_at_startdate_upper(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=JST)
+    startdate_upper = datetime(2026, 7, 20, 9, 0, tzinfo=JST)
+    store = WindowStateStore(tmp_path / "state.json", now=lambda: now)
+    store.begin_window_attempt(
+        "per3600/20260720_0900",
+        interval_min=60,
+        source_window_start=startdate_upper,
+        expected_target_ids=["target"],
+    )
+
+    assert (
+        revision_retry_items(
+            store,
+            startdate_upper_by_interval={60: startdate_upper},
+            excluded_window_keys=set(),
+            limit=1,
         )
         == []
     )

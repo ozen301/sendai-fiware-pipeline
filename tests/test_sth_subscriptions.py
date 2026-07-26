@@ -7,6 +7,8 @@ import pytest
 import requests
 
 from sendai_pipeline.logging_setup import _ALLOWED_EXTRA_KEYS
+from sendai_pipeline.metadata import SensorPlace
+from sendai_pipeline.run_direction import RunDirectionSettings
 from sendai_pipeline.sth_subscriptions import (
     PRODUCT_A_HISTORY_ATTRS,
     PRODUCT_A_TRIGGER_ATTRS,
@@ -25,6 +27,7 @@ from sendai_pipeline.sth_subscriptions import (
     redacted_product_b_subscription_json,
     redacted_subscription_json,
 )
+from sendai_pipeline.transform_flow import transform_flow_rows
 
 JST = timezone(timedelta(hours=9))
 AGGREGATE_ENTITY_ID = "custom.aggregate.entity"
@@ -319,6 +322,59 @@ def test_build_product_a_subscription_preserves_shape_without_throttling() -> No
 def test_product_a_shared_constants_equal_exact_ten_attribute_contract() -> None:
     assert PRODUCT_A_HISTORY_ATTRS == PRODUCT_A_ATTRS
     assert PRODUCT_A_TRIGGER_ATTRS == PRODUCT_A_ATTRS
+
+
+def test_product_a_transformed_attrs_match_subscription_contract() -> None:
+    place = SensorPlace(
+        place_number=10,
+        batch="2026",
+        expected_device_type="M5Stack",
+        interval_min=60,
+        entity_type="Blesensor.per3600",
+        entity_id="jp.sendai.Blesensor.per3600.10",
+        identifcation="10",
+        active=True,
+    )
+    payloads = transform_flow_rows(
+        [
+            {
+                "startdate": "20260715_0900",
+                "group_place_id": "sendai202603.10",
+                "device_type": "M5Stack",
+                "interval_min": 60,
+                "flow_gt_m60": 8,
+                "flow_gt_m80": 6,
+                "flow_gt_m120": 4,
+                "stay_gt_m60": 3.5,
+                "stay_gt_m80": 2.5,
+                "stay_gt_m120": 1.5,
+            }
+        ],
+        {(10, 60): place},
+        transformed_at=datetime(2026, 7, 15, 12, 0, tzinfo=JST),
+    )
+
+    assert len(payloads) == 1
+    attr_names = set(payloads[0]["attrs"])
+    assert attr_names == set(PRODUCT_A_HISTORY_ATTRS)
+    assert attr_names == set(PRODUCT_A_TRIGGER_ATTRS)
+
+
+def test_product_b_runner_and_subscription_defaults_match() -> None:
+    run_settings = RunDirectionSettings()
+    subscription_settings = StHSubscriptionSettings(
+        base_url="https://example.test",
+        comet_notify_url=COMET_NOTIFY_URL,
+    )
+
+    assert (
+        run_settings.product_b_aggregate_entity_id
+        == subscription_settings.product_b_aggregate_entity_id
+    )
+    assert (
+        run_settings.product_b_aggregate_entity_type
+        == subscription_settings.product_b_aggregate_entity_type
+    )
 
 
 def test_product_a_trigger_covers_people_occupancy_near_only_correction_gap() -> None:
